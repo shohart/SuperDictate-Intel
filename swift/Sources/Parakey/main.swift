@@ -5350,6 +5350,7 @@ actor TranscriptionWorker {
 
     fileprivate func transcribe(samples: [Float],
                                language: DictationLanguage? = nil,
+                               resolveViaKeyboard: Bool = true,
                                requestedAt: TimeInterval) async throws -> TranscriptionWorkerResult {
         let workerEnteredAt = ProcessInfo.processInfo.systemUptime
         guard let engine else { throw NSError(domain: "Parakey", code: -2) }
@@ -5362,14 +5363,23 @@ actor TranscriptionWorker {
         defer { inFlight = false }
         switch engine {
         case .whisperLargeV3Turbo(let whisper):
-            let engineCallStartedAt = ProcessInfo.processInfo.systemUptime
             // `TranscriptionWorker` is an actor, so this method runs on its
             // executor, not the main thread — hop explicitly for the Carbon
             // TIS call, which (like the rest of AppKit/Carbon) is only
-            // main-thread-safe.
-            let effectiveLanguage = await MainActor.run {
-                resolveEffectiveWhisperLanguage(setting: language ?? .auto)
+            // main-thread-safe. `resolveViaKeyboard` is false for recovered
+            // (previous-session) audio: the *current* keyboard layout has no
+            // bearing on what language a stale recording was spoken in, so
+            // those call sites keep today's plain nil-passthrough behavior
+            // for `.auto` instead of forcing whatever layout is active now.
+            let effectiveLanguage: String?
+            if resolveViaKeyboard {
+                effectiveLanguage = await MainActor.run {
+                    resolveEffectiveWhisperLanguage(setting: language ?? .auto)
+                }
+            } else {
+                effectiveLanguage = language?.whisperLanguageCode
             }
+            let engineCallStartedAt = ProcessInfo.processInfo.systemUptime
             let result = try await whisper.transcribe(
                 samples: samples,
                 languageCode: effectiveLanguage
@@ -10190,6 +10200,13 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 let transcription = try await asr.transcribe(
                     samples: samples,
                     language: settings.dictationLanguage,
+                    // Recovered audio is from a *previous* session — the
+                    // keyboard layout active right now at recovery time has
+                    // no bearing on what language that stale recording was
+                    // spoken in, so keep today's plain nil-passthrough
+                    // behavior for `.auto` instead of forcing the current
+                    // layout.
+                    resolveViaKeyboard: false,
                     requestedAt: requestedAt
                 )
                 let completedAt = ProcessInfo.processInfo.systemUptime
@@ -11783,6 +11800,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 let transcription = try await asr.transcribe(
                     samples: captured.samples,
                     language: settings.dictationLanguage,
+                    // See recoverPendingDictationsAfterStartup(): this is
+                    // also recovering a previous session's audio, so the
+                    // current keyboard layout must not be forced onto it.
+                    resolveViaKeyboard: false,
                     requestedAt: requestedAt
                 )
                 let completedAt = ProcessInfo.processInfo.systemUptime
