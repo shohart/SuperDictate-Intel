@@ -5,13 +5,13 @@
 // default with an opt-in Vulkan GPU backend — see the "Use GPU" setting),
 // paste-at-cursor (`NSPasteboard` + `CGEvent`),
 // system-audio mute (`NSAppleScript`), menu-bar UI, settings,
-// rolling history, in-app updater, TCC self-healing.
+// rolling history, in-app updater, and permission guidance.
 //
 // Section comments (`// MARK: -`) tag every major region; Cmd+Ctrl+Up
 // in Xcode jumps between them. Keep them honest as you edit.
 //
 // Architectural invariants the build relies on are documented in
-// ../../AGENTS.md — read that before refactoring concurrency,
+// ../../../AGENTS.md — read that before refactoring concurrency,
 // resource loading, or codesigning. In particular:
 //   - `AudioCapture` is *not* @MainActor (AVAudioEngine tap fires on
 //     an audio thread; main-actor entry would SIGTRAP under Swift 6
@@ -3706,7 +3706,7 @@ final class Permissions {
         case .microphone:
             let status = AVCaptureDevice.authorizationStatus(for: .audio)
             if status == .denied {
-                openSettingsPane("Privacy_Microphone")
+                openSettings(for: p)
             } else {
                 AVCaptureDevice.requestAccess(for: .audio) { granted in
                     log("Microphone request: granted=\(granted)")
@@ -3723,18 +3723,25 @@ final class Permissions {
             // string literal that matches its documented value.
             let key = "AXTrustedCheckOptionPrompt"
             _ = AXIsProcessTrustedWithOptions([key: kCFBooleanTrue!] as CFDictionary)
-            openSettingsPane("Privacy_Accessibility")
         case .inputMonitoring:
             // CGRequestListenEventAccess is the canonical request
             // path for CGEventTap clients. On macOS 26 it registers
-            // the app in the Input Monitoring list and shows a
-            // prompt OR opens Settings as appropriate.
+            // the app in the Input Monitoring list and shows the
+            // native permission prompt.
             _ = CGRequestListenEventAccess()
-            openSettingsPane("Privacy_ListenEvent")
         }
     }
 
-    private static func openSettingsPane(_ subpath: String) {
+    static func openSettings(for permission: Permission) {
+        let subpath: String
+        switch permission {
+        case .microphone:
+            subpath = "Privacy_Microphone"
+        case .accessibility:
+            subpath = "Privacy_Accessibility"
+        case .inputMonitoring:
+            subpath = "Privacy_ListenEvent"
+        }
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(subpath)") {
             NSWorkspace.shared.open(url)
         }
@@ -4931,25 +4938,8 @@ final class AudioCapture: @unchecked Sendable {
 
         let input = engine.inputNode
         applyInputDevicePreference(inputDevicePreference, to: input)
-        let inputFormat = input.outputFormat(forBus: 0)
-
-        guard let targetFormat = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: SAMPLE_RATE,
-            channels: 1,
-            interleaved: false
-        ) else { throw NSError(domain: "Parakey", code: -1) }
-
-        let sourceFormat = converterSourceFormat(for: inputFormat)
-        let mixToMono = inputFormat.channelCount > 1 && sourceFormat.channelCount == 1
-        let newConverter = AVAudioConverter(from: sourceFormat, to: targetFormat)
-        // Publish the converter trio under the lock — handleTap reads
-        // them on the render thread (see the locking-discipline note
-        // on the class comment).
+        _ = try installCaptureTap(on: input)
         lock.lock()
-        converterInputFormat = sourceFormat
-        manuallyMixInputToMono = mixToMono
-        converter = newConverter
         if recordingImmediately {
             recordingGeneration &+= 1
             samples.removeAll(keepingCapacity: true)
@@ -4959,19 +4949,9 @@ final class AudioCapture: @unchecked Sendable {
             self.recoveryJournal = recoveryJournal
         }
         lock.unlock()
-        let mixLabel = mixToMono ? " via manual mono mix" : ""
-        log("AudioCapture: input \(inputFormat.sampleRate) Hz \(inputFormat.channelCount)ch\(mixLabel) → \(targetFormat.sampleRate) Hz mono")
-
-        // Capture targetFormat by value into the closure. self is
-        // weak so the engine doesn't keep AudioCapture alive past
-        // its owner. The closure runs on AVFoundation's audio
-        // thread — handleTap is non-isolated and uses NSLock for
-        // any shared-state access.
-        input.installTap(onBus: 0, bufferSize: 512, format: inputFormat) { [weak self] buffer, _ in
-            self?.handleTap(buffer: buffer, target: targetFormat)
-        }
 
         do {
+            engine.prepare()
             try engine.start()
         } catch {
             input.removeTap(onBus: 0)
@@ -4995,6 +4975,39 @@ final class AudioCapture: @unchecked Sendable {
         try startEngine(inputDevicePreference: inputDevicePreference,
                         recordingImmediately: true,
                         recoveryJournal: recoveryJournal)
+    }
+
+    /// AVAudioEngine stops and uninitializes its I/O unit when a selected
+    /// device changes sample rate or channel layout. Rebuild the tap and
+    /// converter on the existing engine so its explicitly selected HAL
+    /// device remains attached and an active recording can continue.
+    fileprivate func recoverAfterConfigurationChange() throws -> Bool {
+        guard isEngineStarted else { return false }
+
+        let input = engine.inputNode
+        input.removeTap(onBus: 0)
+        engine.stop()
+
+        var didInstallTap = false
+        do {
+            let inputFormat = try installCaptureTap(on: input)
+            didInstallTap = true
+            engine.prepare()
+            try engine.start()
+            log("AudioCapture: graph recovered at \(inputFormat.sampleRate) Hz \(inputFormat.channelCount)ch")
+            return true
+        } catch {
+            if didInstallTap {
+                input.removeTap(onBus: 0)
+            }
+            lock.lock()
+            converter = nil
+            converterInputFormat = nil
+            manuallyMixInputToMono = false
+            engineStarted = false
+            lock.unlock()
+            throw error
+        }
     }
 
     func stopEngine() {
@@ -5105,6 +5118,58 @@ final class AudioCapture: @unchecked Sendable {
         return _isRunning
             ? (latestLevel, latestLevelSequence)
             : (0, latestLevelSequence)
+    }
+
+    private func installCaptureTap(on input: AVAudioInputNode) throws -> AVAudioFormat {
+        let inputFormat = input.outputFormat(forBus: 0)
+        guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
+            throw NSError(
+                domain: "SuperDictate.AudioCapture",
+                code: -2,
+                userInfo: [NSLocalizedDescriptionKey: "The selected microphone has no active audio stream."]
+            )
+        }
+        guard let targetFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: SAMPLE_RATE,
+            channels: 1,
+            interleaved: false
+        ) else {
+            throw NSError(
+                domain: "SuperDictate.AudioCapture",
+                code: -3,
+                userInfo: [NSLocalizedDescriptionKey: "Could not create the transcription audio format."]
+            )
+        }
+
+        let sourceFormat = converterSourceFormat(for: inputFormat)
+        let mixToMono = inputFormat.channelCount > 1 && sourceFormat.channelCount == 1
+        guard let newConverter = AVAudioConverter(from: sourceFormat, to: targetFormat) else {
+            throw NSError(
+                domain: "SuperDictate.AudioCapture",
+                code: -4,
+                userInfo: [NSLocalizedDescriptionKey: "Could not convert audio from the selected microphone."]
+            )
+        }
+
+        // Publish the converter trio under the lock — handleTap reads
+        // them on the render thread (see the locking-discipline note
+        // on the class comment).
+        lock.lock()
+        converterInputFormat = sourceFormat
+        manuallyMixInputToMono = mixToMono
+        converter = newConverter
+        lock.unlock()
+
+        // Capture targetFormat by value into the closure. self is weak so
+        // the engine does not keep AudioCapture alive past its owner.
+        input.installTap(onBus: 0, bufferSize: 512, format: inputFormat) { [weak self] buffer, _ in
+            self?.handleTap(buffer: buffer, target: targetFormat)
+        }
+
+        let mixLabel = mixToMono ? " via manual mono mix" : ""
+        log("AudioCapture: input \(inputFormat.sampleRate) Hz \(inputFormat.channelCount)ch\(mixLabel) → \(targetFormat.sampleRate) Hz mono")
+        return inputFormat
     }
 
     private func handleTap(buffer: AVAudioPCMBuffer, target: AVAudioFormat) {
@@ -7215,69 +7280,6 @@ func isNewer(_ candidate: String, than current: String) -> Bool {
         if x != y { return x > y }
     }
     return false
-}
-
-// MARK: - TCC recovery
-//
-// macOS's TCC database occasionally ends up with a DENIED entry
-// for our bundle id that the user can't easily clear (typical
-// trigger: an upgrade that changes the signed binary while a
-// previous denial is still cached). On a fresh launch after an
-// upgrade (CFBundleShortVersionString differs from
-// settings.lastSeenVersion), we proactively `tccutil reset` any
-// DENIED entry for `com.local.superdictate`. GRANTED entries stay
-// intact — we never reset away permissions the user gave us.
-//
-// The companion to this is the click-twice-to-reset retry in the
-// permission rows: if the user clicks a ⚠ row, sees the OS dialog
-// say nothing useful, and clicks the same row again, the second
-// click runs `tccutil reset` to clear stuck state and re-request.
-
-enum TCC {
-    /// Maps the human-readable permission name we use in the menu to
-    /// the TCC service identifier `tccutil reset` accepts. Input
-    /// Monitoring is "ListenEvent" internally.
-    static let serviceName: [Permission: String] = [
-        .microphone: "Microphone",
-        .accessibility: "Accessibility",
-        .inputMonitoring: "ListenEvent",
-    ]
-
-    /// Serial so multiple resets (e.g. the upgrade-recovery loop)
-    /// execute in the order they were requested.
-    private static let queue = DispatchQueue(label: "ParakeyTCCReset", qos: .userInitiated)
-
-    /// Runs `tccutil reset` on a background queue. tccutil is usually
-    /// quick but waitUntilExit() on the main thread would run behind
-    /// the session-wide event tap, where any stall delays every
-    /// keystroke system-wide. `completion`, if provided, is invoked
-    /// on the main actor after the reset has finished — callers that
-    /// re-request the permission must do so from the completion, or
-    /// the request would race the scrub it depends on.
-    static func reset(_ p: Permission,
-                      bundleID: String,
-                      completion: (@MainActor @Sendable () -> Void)? = nil) {
-        guard let service = serviceName[p] else {
-            if let completion { Task { @MainActor in completion() } }
-            return
-        }
-        queue.async {
-            let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
-            proc.arguments = ["reset", service, bundleID]
-            proc.environment = systemToolProcessEnvironment()
-            proc.standardOutput = Pipe()
-            proc.standardError = Pipe()
-            do {
-                try proc.run()
-                proc.waitUntilExit()
-                log("  tccutil reset \(service) \(bundleID) → exit \(proc.terminationStatus)")
-            } catch {
-                log("  tccutil reset \(service) failed: \(error)")
-            }
-            if let completion { Task { @MainActor in completion() } }
-        }
-    }
 }
 
 // MARK: - Update check
@@ -9667,6 +9669,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var maxDurationWorkItem: DispatchWorkItem?
     private var audioIdleStopWorkItem: DispatchWorkItem?
     private var isRestartingAudioInput = false
+    private var audioInputPreferenceAtLastEngineStart = ""
+    private var audioConfigurationRecoveryWorkItem: DispatchWorkItem?
     private var pendingAudioRouteRefresh = false
     private var audioConfigurationChangeSuppressedUntil: TimeInterval?
     private var workspacePowerObservers: [NSObjectProtocol] = []
@@ -9728,9 +9732,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         limitedRecentTranscriptEntries(history, limit: settings.recentTranscriptLimit)
     }
 
-    /// In-session click counter per permission. Click #2 onwards
-    /// resets the matching TCC entry before re-requesting — belt
-    /// and braces for stuck DENIED entries macOS occasionally caches.
+    /// In-session click counter per permission. The first click asks
+    /// macOS; later clicks open the matching System Settings pane.
     private var permClickCount: [Permission: Int] = [:]
 
     /// Latest release detected by the periodic check. nil = no update,
@@ -9868,7 +9871,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             log("ASR: reset unsupported saved speech model selection to \(settings.speechModelProfile.shortName)")
         }
 
-        recoverStaleTCCAfterUpgrade()
         _ = previousExitNoticeAction(previousRunWasActive: settings.hasActiveRunMarker)
         recoverStaleSystemAudioMuteIfNeeded()
         settings.hasActiveRunMarker = true
@@ -13432,7 +13434,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         root.addArrangedSubview(makeHotkeySetupRow())
 
         if !setupChecklistIsComplete {
-            let tip = setupLabel("Tip: If clicking 'Grant' doesn't open a prompt or show SuperDictate in System Settings, click 'Try Again' — SuperDictate will reset its macOS privacy permission entry and re-request, which clears stuck macOS state.",
+            let tip = setupLabel("Tip: If macOS does not show a permission prompt, click 'Open Settings' and enable SuperDictate in the displayed privacy section.",
                                  font: .systemFont(ofSize: 11),
                                  color: .secondaryLabelColor)
             tip.preferredMaxLayoutWidth = 476
@@ -13642,16 +13644,13 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         requestPermissionFromMenu(Permission.allCases[sender.tag])
     }
 
-    // MARK: - Permission row + click-twice-to-reset
+    // MARK: - Permission row
 
     private func buildPermissionItem(_ p: Permission) -> NSMenuItem {
         let clicks = permClickCount[p] ?? 0
         let title: String
         if clicks >= 1 {
-            // First click already happened; permission still denied,
-            // so signal explicitly that a second click will reset
-            // any stuck TCC state and re-request.
-            title = "⚠ Grant \(p.rawValue) (try again — will reset stuck state)…"
+            title = "⚠ Open \(p.rawValue) settings…"
         } else {
             title = "⚠ Grant \(p.rawValue) permission…"
         }
@@ -13682,24 +13681,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         log("perm click #\(clicks): \(p.rawValue)")
 
         if clicks >= 2 {
-            // Click #2+: scrub TCC before re-requesting. The most
-            // common cause of "I clicked Grant but nothing happened"
-            // is a stuck TCC entry that survived an upgrade. The
-            // re-request happens in the reset's completion — issuing
-            // it before tccutil finished would race the scrub it
-            // depends on.
-            log("  resetting TCC for \(p.rawValue) before retry")
-            TCC.reset(p, bundleID: Bundle.main.bundleIdentifier ?? "com.local.superdictate") { [weak self] in
-                guard let self, !self.isTerminating else { return }
-                Permissions.request(p)
-                self.startPermissionReadinessMonitor(reason: "permission grant")
-                self.updateSetupChecklist()
-                self.rebuildMenu()
-            }
-            rebuildMenu()
-            return
+            Permissions.openSettings(for: p)
+        } else {
+            Permissions.request(p)
         }
-        Permissions.request(p)
         startPermissionReadinessMonitor(reason: "permission grant")
         updateSetupChecklist()
         rebuildMenu()
@@ -14051,6 +14036,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func stopAudioEngineImmediately() {
         cancelAudioIdleStop()
+        audioConfigurationRecoveryWorkItem?.cancel()
+        audioConfigurationRecoveryWorkItem = nil
         if audio.isEngineStarted {
             suppressAudioConfigurationChangesFromAppEngineUpdate()
         }
@@ -14068,7 +14055,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func handleAudioConfigurationChange() {
         if shouldIgnoreAppOwnedAudioConfigurationChange() {
-            log("AudioCapture: app-owned audio configuration change ignored")
+            scheduleAppOwnedAudioConfigurationRecovery()
             return
         }
 
@@ -14093,6 +14080,32 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             rebuildMenu()
             restartAudioInput(reason: "audio configuration change")
         }
+    }
+
+    private func scheduleAppOwnedAudioConfigurationRecovery() {
+        audioConfigurationRecoveryWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, !self.isTerminating else { return }
+            self.audioConfigurationRecoveryWorkItem = nil
+            do {
+                if try self.audio.recoverAfterConfigurationChange() {
+                    log("AudioCapture: app-owned audio configuration change recovered")
+                }
+            } catch {
+                log("AudioCapture: configuration recovery failed: \(error.localizedDescription)")
+                self.pendingAudioRouteRefresh = true
+                if self.isRecording || self.audio.isRunning {
+                    self.cancelActiveRecording(reason: "audio configuration recovery failed")
+                } else {
+                    self.restartAudioInput(reason: "audio configuration recovery failed")
+                }
+            }
+        }
+        audioConfigurationRecoveryWorkItem = work
+        // AVAudioEngine posts the notification while it is tearing down its
+        // I/O unit. Recover on the next run-loop turn instead of mutating the
+        // graph from inside that notification callback.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: work)
     }
 
     @discardableResult
@@ -15865,30 +15878,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    // MARK: - TCC stale-state recovery on upgrade
-
-    private func recoverStaleTCCAfterUpgrade() {
-        let last = settings.lastSeenVersion
-        let current = currentBundleVersion()
-        guard !last.isEmpty else {
-            // First-ever launch — just record the version. No state
-            // to recover.
-            settings.lastSeenVersion = current
-            return
-        }
-        guard last != current else { return }
-        log("upgrade detected: \(last) → \(current); checking for stale TCC state")
-        let bundleID = Bundle.main.bundleIdentifier ?? "com.local.superdictate"
-        for p in Permission.allCases {
-            if Permissions.isGranted(p) { continue }
-            // Fire-and-forget on TCC's serial queue: these resets are
-            // best-effort scrubbing of stale DENIED entries, nothing
-            // at launch depends on their completion, and the user's
-            // first Grant click has its own reset-and-retry path.
-            TCC.reset(p, bundleID: bundleID)
-        }
-        settings.lastSeenVersion = current
-    }
 }
 
 // MARK: - Entry point
@@ -21015,7 +21004,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let title = panelLabel(permissionTitle(permission), size: 11.5, weight: .medium)
         title.toolTip = permissionDetail(permission)
         let buttonTitle = (permissionClickCount[permission] ?? 0) >= 1
-            ? t("Повторить", "Try Again") : t("Разрешить", "Grant")
+            ? t("Открыть настройки", "Open Settings") : t("Разрешить", "Grant")
         let button = panelButton(buttonTitle,
                                  action: #selector(grantPermissionClicked(_:)),
                                  enabled: serviceOperation == nil,
@@ -22171,11 +22160,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let clicks = (permissionClickCount[permission] ?? 0) + 1
         permissionClickCount[permission] = clicks
         if clicks >= 2 {
-            TCC.reset(permission, bundleID: Bundle.main.bundleIdentifier ?? SETTINGS_SUITE) { [weak self] in
-                guard let self else { return }
-                Permissions.request(permission)
-                self.refresh(force: true)
-            }
+            Permissions.openSettings(for: permission)
         } else {
             Permissions.request(permission)
         }
