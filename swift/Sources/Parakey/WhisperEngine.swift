@@ -34,9 +34,9 @@ actor WhisperEngine {
     // the compiler what's already true.
     private nonisolated(unsafe) let context: OpaquePointer
 
-    init(modelPath: String) throws {
+    init(modelPath: String, useGPU: Bool) throws {
         var params = whisper_context_default_params()
-        params.use_gpu = false
+        params.use_gpu = useGPU
         guard let ctx = whisper_init_from_file_with_params(modelPath, params) else {
             throw WhisperEngineError.modelLoadFailed(path: modelPath)
         }

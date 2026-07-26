@@ -2625,6 +2625,7 @@ final class Settings: @unchecked Sendable {
     private static let keySpeechModelProfile = "speech_model_profile"
     private static let keyInitialSpeechModelChoiceRequired = "initial_speech_model_choice_required"
     private static let keyRemoveFillerWords = "remove_filler_words"
+    private static let keyUseGPU = "use_gpu"
     private static let keyEnterDelayMilliseconds = "enter_delay_milliseconds_v1"
     private static let keyActiveRunMarker = "active_run_marker"
     private static let keyAgentEnabled = "agent_enabled"
@@ -3264,6 +3265,14 @@ final class Settings: @unchecked Sendable {
     var removeFillerWords: Bool {
         get { defaults.bool(forKey: Self.keyRemoveFillerWords) }
         set { defaults.set(newValue, forKey: Self.keyRemoveFillerWords) }
+    }
+
+    // Opt-in Metal GPU backend for whisper.cpp. Defaults to `false` (CPU+BLAS)
+    // via `defaults.bool(forKey:)`'s standard "unset key reads as false"
+    // behavior — never force this on by default, see task brief.
+    var useGPU: Bool {
+        get { defaults.bool(forKey: Self.keyUseGPU) }
+        set { defaults.set(newValue, forKey: Self.keyUseGPU) }
     }
 
     var hasActiveRunMarker: Bool {
@@ -5308,6 +5317,7 @@ private struct CompletedTranscriptionWorkerResult: Sendable {
 actor TranscriptionWorker {
     private var engine: LoadedSpeechEngine?
     private var loadedProfile: SpeechModelProfile?
+    private var loadedUseGPU: Bool?
     private(set) var ready = false
     /// Reentrancy backstop — see the comment above. True for the full
     /// duration of transcribe(), including across its await.
@@ -5319,7 +5329,8 @@ actor TranscriptionWorker {
         if requestedProfile != profile {
             log("ASR: ignoring unsupported speech model \(requestedProfile.shortName); using \(profile.shortName)")
         }
-        if ready, engine != nil, loadedProfile == profile {
+        let useGPU = Settings.shared.useGPU
+        if ready, engine != nil, loadedProfile == profile, loadedUseGPU == useGPU {
             log("ASR: \(profile.shortName) already ready")
             return
         }
@@ -5334,18 +5345,19 @@ actor TranscriptionWorker {
             log("ASR: downloading + verifying + loading \(profile.shortName) weights…")
         }
         let t0 = Date()
-        engine = .whisperLargeV3Turbo(try await loadWhisperEngine(progressHandler: progressHandler))
+        engine = .whisperLargeV3Turbo(try await loadWhisperEngine(useGPU: useGPU, progressHandler: progressHandler))
         loadedProfile = profile
+        loadedUseGPU = useGPU
         ready = true
         log("ASR: \(profile.shortName) ready in \(String(format: "%.2f", Date().timeIntervalSince(t0))) s")
     }
 
-    private func loadWhisperEngine(progressHandler: WhisperDownloadProgressHandler?) async throws -> WhisperEngine {
+    private func loadWhisperEngine(useGPU: Bool, progressHandler: WhisperDownloadProgressHandler?) async throws -> WhisperEngine {
         if !speechModelCacheExists(for: .multilingualV3) {
             try assertSufficientDiskSpaceForSpeechModelDownload(profile: .multilingualV3)
         }
         let modelPath = try await downloadWhisperModelIfNeeded()
-        return try WhisperEngine(modelPath: modelPath.path)
+        return try WhisperEngine(modelPath: modelPath.path, useGPU: useGPU)
     }
 
     fileprivate func transcribe(samples: [Float],
@@ -5410,6 +5422,7 @@ actor TranscriptionWorker {
     func unload() async {
         engine = nil
         loadedProfile = nil
+        loadedUseGPU = nil
         ready = false
         log("ASR: unloaded")
     }
@@ -13795,6 +13808,14 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         dock.state = settings.showInDock ? .on : .off
         sub.addItem(dock)
 
+        let useGPU = NSMenuItem(title: "Use GPU (Metal) — experimental",
+                                action: #selector(toggleUseGPU(_:)),
+                                keyEquivalent: "")
+        useGPU.target = self
+        useGPU.state = settings.useGPU ? .on : .off
+        useGPU.toolTip = "Runs whisper.cpp's Metal backend instead of CPU+BLAS. Opt-in; reloads the speech model."
+        sub.addItem(useGPU)
+
         parent.submenu = sub
         return parent
     }
@@ -15184,6 +15205,22 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         settings.showInDock.toggle()
         sender.state = settings.showInDock ? .on : .off
         refreshActivationPolicy()
+    }
+
+    @objc private func toggleUseGPU(_ sender: NSMenuItem) {
+        settings.useGPU.toggle()
+        let profile = settings.speechModelProfile
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await self.asr.load(profile: profile)
+                log("ASR: reloaded after GPU setting change (useGPU=\(self.settings.useGPU))")
+            } catch {
+                log("ASR: failed to reload after GPU setting change: \(error)")
+            }
+            self.rebuildMenu()
+        }
+        rebuildMenu()
     }
 
     @objc private func toggleLaunchAtLogin(_ sender: NSMenuItem) {
