@@ -5363,9 +5363,16 @@ actor TranscriptionWorker {
         switch engine {
         case .whisperLargeV3Turbo(let whisper):
             let engineCallStartedAt = ProcessInfo.processInfo.systemUptime
+            // `TranscriptionWorker` is an actor, so this method runs on its
+            // executor, not the main thread — hop explicitly for the Carbon
+            // TIS call, which (like the rest of AppKit/Carbon) is only
+            // main-thread-safe.
+            let effectiveLanguage = await MainActor.run {
+                resolveEffectiveWhisperLanguage(setting: language ?? .auto)
+            }
             let result = try await whisper.transcribe(
                 samples: samples,
-                languageCode: language?.whisperLanguageCode
+                languageCode: effectiveLanguage
             )
             let engineCallCompletedAt = ProcessInfo.processInfo.systemUptime
             return TranscriptionWorkerResult(
@@ -17977,6 +17984,42 @@ private enum ParakeySelfTest {
             DictationLanguage.russian.whisperLanguageCode,
             equals: "ru",
             "a specific language selection should pass its ISO-639-1 code through unchanged"
+        )
+        try expect(
+            resolveEffectiveWhisperLanguage(setting: .russian),
+            equals: "ru",
+            "an explicit language selection should bypass keyboard resolution unchanged"
+        )
+        // resolveEffectiveWhisperLanguage(setting: .auto) itself depends on
+        // the live Carbon keyboard input source, which is unavailable/unset
+        // over SSH with no GUI session — so it can only be asserted here to
+        // not crash. The actual tag → whisper-code mapping it delegates to
+        // is a pure function and is fully exercised below.
+        _ = resolveEffectiveWhisperLanguage(setting: .auto)
+        try expect(
+            whisperLanguageCode(forKeyboardLanguageTag: "en-US"),
+            equals: "en",
+            "a region-qualified BCP-47 tag should resolve to its primary subtag's whisper code"
+        )
+        try expect(
+            whisperLanguageCode(forKeyboardLanguageTag: "RU"),
+            equals: "ru",
+            "keyboard language tags should be matched case-insensitively"
+        )
+        try expect(
+            whisperLanguageCode(forKeyboardLanguageTag: "zh-Hans"),
+            equals: nil,
+            "a keyboard language with no matching DictationLanguage should fall through to whisper auto-detect"
+        )
+        try expect(
+            whisperLanguageCode(forKeyboardLanguageTag: ""),
+            equals: nil,
+            "an empty keyboard language tag should fall through to whisper auto-detect"
+        )
+        try expect(
+            whisperLanguageCode(forKeyboardLanguageTag: "auto"),
+            equals: nil,
+            "a keyboard tag literally matching DictationLanguage.auto's rawValue must not be treated as a forced language"
         )
         try expect(
             speechModelStartupStatusTitle(0),
