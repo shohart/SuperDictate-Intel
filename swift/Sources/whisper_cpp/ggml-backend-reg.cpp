@@ -30,8 +30,20 @@
 #include "ggml-cpu.h"
 #endif
 
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+
+#ifdef GGML_USE_METAL
+#include "ggml-metal.h"
+#endif
+
 #ifdef GGML_USE_SYCL
 #include "ggml-sycl.h"
+#endif
+
+#ifdef GGML_USE_VULKAN
+#include "ggml-vulkan.h"
 #endif
 
 #ifdef GGML_USE_WEBGPU

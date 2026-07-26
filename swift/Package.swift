@@ -40,12 +40,34 @@ let package = Package(
                 .define("GGML_BLAS_USE_ACCELERATE"),
                 .define("ACCELERATE_NEW_LAPACK"),
                 .define("ACCELERATE_LAPACK_ILP64"),
+                // Metal backend is REGISTERED here so it shows up in
+                // ggml_backend_reg_count()/whisper_print_system_info(),
+                // but it is NOT enabled by default: WhisperEngine.init
+                // hardcodes params.use_gpu = false, so ggml never
+                // actually schedules work on it until a later task adds
+                // a user-facing toggle. GGML_METAL_EMBED_LIBRARY matches
+                // the pre-generated ggml-metal-embed.cpp checked in by
+                // scripts/vendor-whisper-cpp.sh (see that script for why
+                // the shader is embedded as a C string instead of a
+                // SwiftPM resource/build step).
+                .define("GGML_USE_METAL"),
+                .define("GGML_METAL_EMBED_LIBRARY"),
                 .define("GGML_VERSION", to: "\"080bbbe8\""),
                 .define("GGML_COMMIT", to: "\"080bbbe85230f624f0b52127f1ae1218247989f9\""),
                 .define("WHISPER_VERSION", to: "\"080bbbe8\""),
                 .headerSearchPath("."),
                 .headerSearchPath("ggml-cpu"),
-                .unsafeFlags(["-mavx2", "-mfma", "-mf16c", "-mbmi2", "-msse4.2"]),
+                // ggml-metal-context.m/ggml-metal-device.m are upstream
+                // Objective-C written for manual retain/release (they
+                // guard their explicit `release` calls with
+                // `#if !__has_feature(objc_arc)` and cast raw `void *`
+                // Metal handles to `id<...>` without `__bridge`).
+                // SwiftPM compiles .m sources under ARC by default, which
+                // makes both of those patterns compile errors, so ARC is
+                // disabled for the whole target to match upstream's own
+                // (non-ARC) build. Harmless no-op for the plain C/C++
+                // sources also built with these flags.
+                .unsafeFlags(["-mavx2", "-mfma", "-mf16c", "-mbmi2", "-msse4.2", "-fno-objc-arc"]),
             ],
             cxxSettings: [
                 .define("GGML_USE_ACCELERATE"),
@@ -54,6 +76,9 @@ let package = Package(
                 .define("GGML_BLAS_USE_ACCELERATE"),
                 .define("ACCELERATE_NEW_LAPACK"),
                 .define("ACCELERATE_LAPACK_ILP64"),
+                // See the matching comment in cSettings above.
+                .define("GGML_USE_METAL"),
+                .define("GGML_METAL_EMBED_LIBRARY"),
                 .define("GGML_VERSION", to: "\"080bbbe8\""),
                 .define("GGML_COMMIT", to: "\"080bbbe85230f624f0b52127f1ae1218247989f9\""),
                 .define("WHISPER_VERSION", to: "\"080bbbe8\""),
@@ -63,6 +88,9 @@ let package = Package(
             ],
             linkerSettings: [
                 .linkedFramework("Accelerate"),
+                .linkedFramework("Metal"),
+                .linkedFramework("MetalKit"),
+                .linkedFramework("Foundation"),
             ]
         ),
         .executableTarget(
