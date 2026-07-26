@@ -2322,12 +2322,40 @@ enum SuperDictateControlPanelRegistry {
         return true
     }
 
-    static func claimCurrentPanel() {
-        do {
-            try "\(getpid())\n".write(to: url, atomically: true, encoding: .utf8)
-        } catch {
-            log("control panel pid write failed: \(error.localizedDescription)")
+    static func claimCurrentPanel() -> Bool {
+        for _ in 0..<2 {
+            let fd = Darwin.open(
+                url.path,
+                O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                mode_t(S_IRUSR | S_IWUSR)
+            )
+            if fd >= 0 {
+                do {
+                    try writeAllData(Data("\(getpid())\n".utf8), to: fd)
+                    guard Darwin.close(fd) == 0 else {
+                        _ = Darwin.unlink(url.path)
+                        log("control panel pid close failed")
+                        return false
+                    }
+                    return true
+                } catch {
+                    _ = Darwin.close(fd)
+                    _ = Darwin.unlink(url.path)
+                    log("control panel pid write failed: \(error.localizedDescription)")
+                    return false
+                }
+            }
+
+            guard errno == EEXIST else {
+                log("control panel pid claim failed: \(currentPOSIXError().localizedDescription)")
+                return false
+            }
+            if currentPanelPID() != nil {
+                return false
+            }
+            _ = Darwin.unlink(url.path)
         }
+        return false
     }
 
     static func clearCurrentPanel() {
@@ -2377,7 +2405,13 @@ enum SuperDictateAgentService {
         try writeLaunchAgentPlist()
         _ = runLaunchctl(["bootstrap", launchDomain, launchAgentURL.path])
         _ = runLaunchctl(["enable", launchService])
-        let kick = runLaunchctl(["kickstart", "-k", launchService])
+        if isAgentRunning() {
+            return
+        }
+        // Never use `kickstart -k` here: opening the control panel while
+        // CoreML is still loading must not kill the healthy agent and make
+        // Neural Engine preparation start over.
+        let kick = runLaunchctl(["kickstart", launchService])
         if kick.status != 0 && !isAgentRunning() {
             throw NSError(domain: "SuperDictateAgentService",
                           code: Int(kick.status),
@@ -2406,6 +2440,10 @@ enum SuperDictateAgentService {
             return true
         }
         return !agentProcessIDs().isEmpty
+    }
+
+    static func isAgentLoadedOrRunning() -> Bool {
+        isAgentRunning() || runLaunchctl(["print", launchService]).status == 0
     }
 
     static func agentProcessIDs() -> [Int32] {
@@ -9724,6 +9762,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var statisticsOverlayPresented = false
     private var statisticsOverlayGlobalDismissMonitor: Any?
     private var statisticsOverlayLocalDismissMonitor: Any?
+    private var controlPanelLaunchInProgress = false
+    private var controlPanelProcess: Process?
 
     /// Local transcript archive, newest first. UI applies the user's visible limit.
     private var history: [TranscriptHistoryEntry] = []
@@ -9921,6 +9961,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             log("control panel activated from agent")
             return
         }
+        guard !controlPanelLaunchInProgress else {
+            log("control panel open coalesced while launch is in progress")
+            return
+        }
         guard let executablePath = Bundle.main.executablePath else {
             log("control panel open failed: missing executable path")
             return
@@ -9929,10 +9973,23 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         process.executableURL = URL(fileURLWithPath: executablePath)
         process.arguments = []
         process.environment = systemToolProcessEnvironment()
+        controlPanelLaunchInProgress = true
+        controlPanelProcess = process
+        process.terminationHandler = { [weak self] terminatedProcess in
+            Task { @MainActor in
+                guard let self else { return }
+                if self.controlPanelProcess === terminatedProcess {
+                    self.controlPanelProcess = nil
+                    self.controlPanelLaunchInProgress = false
+                }
+            }
+        }
         do {
             try process.run()
             log("control panel opened from agent")
         } catch {
+            controlPanelProcess = nil
+            controlPanelLaunchInProgress = false
             log("control panel open failed: \(error.localizedDescription)")
         }
     }
@@ -9943,6 +10000,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         isTerminating = true
+        controlPanelProcess = nil
+        controlPanelLaunchInProgress = false
         hotkeyRecorder?.cancel()
         hotkeyRecorder = nil
         publishAgentState(status: "stopping", detail: "Dictation service is stopping.")
@@ -20480,16 +20539,16 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private var language: InterfaceLanguage { settings.interfaceLanguage }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.regular)
-        if SuperDictateControlPanelRegistry.activateExistingPanelIfPresent() {
+        guard SuperDictateControlPanelRegistry.claimCurrentPanel() else {
+            _ = SuperDictateControlPanelRegistry.activateExistingPanelIfPresent()
             NSApp.terminate(nil)
             return
         }
-        SuperDictateControlPanelRegistry.claimCurrentPanel()
+        NSApp.setActivationPolicy(.regular)
         showWindow()
         startRefreshTimer()
         checkForUpdates()
-        if settings.agentEnabled && !SuperDictateAgentService.isAgentRunning() {
+        if settings.agentEnabled && !SuperDictateAgentService.isAgentLoadedOrRunning() {
             beginServiceOperation(.starting)
         }
     }
