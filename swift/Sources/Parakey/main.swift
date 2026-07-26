@@ -2221,6 +2221,30 @@ func audioInputPreferenceDidChange(saved: String, activeAtLastEngineStart: Strin
     normalizedInputDevicePreference(saved) != normalizedInputDevicePreference(activeAtLastEngineStart)
 }
 
+/// Pure decision helper, ported from upstream, for whether a settings
+/// change to the microphone preference should trigger an audio-only
+/// restart of a *running* agent process, given whether that process's
+/// core runtime is ready. Not currently wired to anything in this
+/// fork: the settings window and its "Save" button run in
+/// `SuperDictateControlPanelApp`, a separate OS process from
+/// `ParakeyApp` (the `--agent` process where audio capture actually
+/// runs), so this fork cannot call this from the settings-save path
+/// and reach the running agent directly. Instead, saving the
+/// microphone preference here goes through the existing full-relaunch
+/// path shared by every other setting
+/// (`beginServiceOperation(.applyingSettings)`), and the relaunched
+/// agent reads `settings.inputDevice` fresh from `UserDefaults` at its
+/// own startup (see `startAudioInputWithRetries`) — no live-reload
+/// call needed for correctness. Kept here (exercised only by the
+/// self-test below) so a later, in-scope addition of a cross-process
+/// bridge (mirroring the `HOTKEY_CAPTURE_BEGIN/END_NOTIFICATION`
+/// precedent) can reuse this decision logic instead of duplicating it.
+func shouldRestartAudioInputForSettingsChange(previousPreference: String,
+                                               nextPreference: String,
+                                               isCoreRuntimeReady: Bool) -> Bool {
+    isCoreRuntimeReady && previousPreference != nextPreference
+}
+
 // MARK: - Logger
 //
 // All output goes to stderr (line-buffered, so we don't lose lines
@@ -2687,8 +2711,8 @@ final class Settings: @unchecked Sendable {
 
     static let shared = Settings()
 
-    init() {
-        self.defaults = .standard
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
     }
 
     @discardableResult
@@ -14098,13 +14122,16 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// and never touches `TranscriptionWorker` or the whisper.cpp
     /// engine/model.
     ///
-    /// Today this is wired into the mic-selection menu item above,
-    /// the only place in this fork that currently changes
-    /// `settings.inputDevice`. It exists as a standalone entry point
-    /// so a future settings-window microphone picker (see the next
-    /// task in this batch) can call it too — from the settings-save
-    /// path, alongside whatever full-service-restart decision that
-    /// path already makes for non-audio settings, not replacing it.
+    /// Wired into the mic-selection menu item above, which is the
+    /// only place *inside this process* (`ParakeyApp`, the `--agent`
+    /// process) that changes `settings.inputDevice`. The settings
+    /// window's microphone picker lives in `SuperDictateControlPanelApp`,
+    /// a separate OS process, so it cannot call this directly; saving
+    /// a microphone there instead goes through the existing
+    /// full-relaunch settings-save path shared by every other
+    /// setting, and the relaunched agent picks up the new
+    /// `settings.inputDevice` at its own startup (see
+    /// `startAudioInputWithRetries`) without needing this function.
     ///
     /// This is deliberately NOT a general settings-live-reload
     /// mechanism — contrast upstream's broader, out-of-scope
@@ -16057,6 +16084,8 @@ private enum ParakeySelfTest {
             return runSuite("audio-conversion", testAudioConversion)
         case "audio-input":
             return runSuite("audio-input", testAudioInputDeviceFiltering)
+        case "audio-input-live":
+            return runSuite("audio-input-live", testLiveAudioInputEnumeration)
         case "model-status":
             return runSuite("model-status", testSpeechModelStartupStatus)
         case "audio-route":
@@ -18186,6 +18215,99 @@ private enum ParakeySelfTest {
             equals: true,
             "switching between two named devices should count as a change"
         )
+
+        let sameName = AudioInputDevice(id: 3,
+                                        uid: "another-yeti-nano",
+                                        name: "Yeti Nano")
+        try expect(
+            audioInputDevice(matching: sameName.uid, in: [real, sameName])?.id,
+            equals: sameName.id,
+            "stable device UIDs should win even when microphone names are duplicated"
+        )
+        try expect(
+            audioInputDevice(matching: "missing-device", in: [real]),
+            equals: nil,
+            "a disconnected saved microphone should resolve to system default"
+        )
+        try expect(
+            shouldRestartAudioInputForSettingsChange(previousPreference: "",
+                                                     nextPreference: real.uid,
+                                                     isCoreRuntimeReady: true),
+            equals: true,
+            "changing microphones should restart only the audio input when runtime is ready"
+        )
+        try expect(
+            shouldRestartAudioInputForSettingsChange(previousPreference: real.uid,
+                                                     nextPreference: real.uid,
+                                                     isCoreRuntimeReady: true),
+            equals: false,
+            "saving the same microphone should not restart audio"
+        )
+        try expect(
+            shouldRestartAudioInputForSettingsChange(previousPreference: "",
+                                                     nextPreference: real.uid,
+                                                     isCoreRuntimeReady: false),
+            equals: false,
+            "startup should pick up a microphone change without an extra audio restart"
+        )
+
+        let suiteName = "com.local.superdictate.self-test.input.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            throw SelfTestFailure.failed("could not create isolated input-device defaults")
+        }
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let isolatedSettings = Settings(defaults: defaults)
+        try expect(isolatedSettings.inputDevice, equals: "",
+                   "microphone settings should default to the macOS system input")
+        isolatedSettings.inputDevice = " \(real.uid)\n"
+        try expect(isolatedSettings.inputDevice, equals: real.uid,
+                   "microphone settings should persist a normalized stable UID")
+        isolatedSettings.inputDevice = pseudo.uid
+        try expect(isolatedSettings.inputDevice, equals: "",
+                   "pseudo aggregate inputs should reset the preference to system default")
+    }
+
+    private static func testLiveAudioInputEnumeration() throws {
+        let devices = availableAudioInputDevices()
+        guard !devices.isEmpty else {
+            throw SelfTestFailure.failed("CoreAudio reported no selectable input devices")
+        }
+        var seenUIDs = Set<String>()
+        for device in devices {
+            guard !device.uid.isEmpty, !device.name.isEmpty else {
+                throw SelfTestFailure.failed("CoreAudio returned an input with an empty UID or name")
+            }
+            guard audioDeviceHasInputChannels(device.id) else {
+                throw SelfTestFailure.failed("\(device.name) has no input channels")
+            }
+            guard !isDefaultAggregateAudioInputDevice(device) else {
+                throw SelfTestFailure.failed("a temporary CoreAudio aggregate leaked into the picker")
+            }
+            guard seenUIDs.insert(device.uid).inserted else {
+                throw SelfTestFailure.failed("CoreAudio returned duplicate input UID \(device.uid)")
+            }
+            print("AUDIO INPUT: \(device.name) [\(device.uid)]")
+        }
+
+        let engine = AVAudioEngine()
+        guard let unit = engine.inputNode.audioUnit else {
+            throw SelfTestFailure.failed("AVAudioEngine did not expose an input audio unit")
+        }
+        for device in devices {
+            var deviceID = device.id
+            let status = AudioUnitSetProperty(unit,
+                                              kAudioOutputUnitProperty_CurrentDevice,
+                                              kAudioUnitScope_Global,
+                                              0,
+                                              &deviceID,
+                                              UInt32(MemoryLayout<AudioDeviceID>.size))
+            guard status == noErr else {
+                throw SelfTestFailure.failed(
+                    "CoreAudio rejected \(device.name): \(formattedOSStatus(status))"
+                )
+            }
+            print("AUDIO SELECT: \(device.name) OK")
+        }
     }
 
     private static func testSpeechModelStartupStatus() throws {
@@ -20594,6 +20716,7 @@ private struct ControlPanelSettingsDraft: Equatable {
     var primaryCompletionBehavior: DictationCompletionBehavior
     var alternateCompletionEnabled: Bool
     var enterDelayMilliseconds: Int
+    var inputDevicePreference: String
     var recordingColor: RecordingHUDAccentColor
     var transcribingColor: RecordingHUDAccentColor
     var backgroundStyle: RecordingHUDBackgroundStyle
@@ -20606,6 +20729,8 @@ private struct ControlPanelSettingsDraft: Equatable {
         primaryCompletionBehavior = settings.primaryCompletionBehavior
         alternateCompletionEnabled = settings.alternateCompletionEnabled
         enterDelayMilliseconds = settings.enterDelayMilliseconds
+        let savedInput = settings.inputDevice
+        inputDevicePreference = audioInputDevice(matching: savedInput)?.uid ?? savedInput
         recordingColor = settings.recordingHUDRecordingColor
         transcribingColor = settings.recordingHUDTranscribingColor
         backgroundStyle = settings.recordingHUDBackgroundStyle
@@ -20772,6 +20897,11 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private func renderFingerprint() -> String {
         let state = AgentRuntimeStateStore.read()
         let permissions = Permission.allCases.map { Permissions.isGranted($0) ? "1" : "0" }.joined()
+        let inputDevices = settingsWindow?.isVisible == true
+            ? availableAudioInputDevices()
+                .map { "\($0.uid)=\($0.name)" }
+                .joined(separator: "|")
+            : ""
         let stateToken: String
         if serviceOperation != nil {
             stateToken = "operation"
@@ -20793,6 +20923,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 settings.configuredHotkey.name,
                 settings.configuredEnterHotkey.name,
                 settings.configuredHistoryHotkey.name,
+                settings.inputDevice,
+                inputDevices,
                 settings.primaryCompletionBehavior.rawValue,
                 settings.alternateCompletionEnabled ? "alternate-on" : "alternate-off",
                 settings.triggerMode.rawValue,
@@ -20881,6 +21013,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             toolTip: t("Открыть или закрыть последние транскрипции.",
                        "Open or close recent transcriptions.")
         ))
+        root.addArrangedSubview(separator())
+        root.addArrangedSubview(microphoneSettingsRow(draft))
         root.addArrangedSubview(separator())
         root.addArrangedSubview(popupRow(
             title: t("Размер капсулы", "Capsule size"),
@@ -21698,6 +21832,86 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         )
     }
 
+    private func microphoneSettingsRow(_ draft: ControlPanelSettingsDraft) -> NSView {
+        let devices = availableAudioInputDevices()
+        let preference = draft.inputDevicePreference
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let selectedDevice = audioInputDevice(matching: preference, in: devices)
+        let unavailable = !preference.isEmpty && selectedDevice == nil
+
+        let detailText: String
+        if unavailable {
+            detailText = t(
+                "Устройство сейчас недоступно — временно используется системный микрофон.",
+                "The device is unavailable; the system microphone is used temporarily."
+            )
+        } else if let selectedDevice {
+            detailText = t(
+                "Выбран: \(selectedDevice.name). Применится без перезапуска модели.",
+                "Selected: \(selectedDevice.name). Applies without restarting the model."
+            )
+        } else {
+            detailText = t(
+                "Следовать выбору входа в настройках macOS.",
+                "Follow the input selected in macOS settings."
+            )
+        }
+
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 14
+
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        text.addArrangedSubview(panelLabel(t("Микрофон", "Microphone"),
+                                           size: 13,
+                                           weight: .semibold))
+        let detail = panelLabel(detailText, size: 12, color: .secondaryLabelColor)
+        detail.maximumNumberOfLines = 2
+        detail.lineBreakMode = .byWordWrapping
+        text.addArrangedSubview(detail)
+
+        let popup = NSPopUpButton()
+        popup.target = self
+        popup.action = #selector(selectInputDeviceDraft(_:))
+        popup.toolTip = t(
+            "Выберите микрофон для диктовки. Отключённое устройство автоматически заменяется системным до его возвращения.",
+            "Choose the dictation microphone. A disconnected device falls back to the system input until it returns."
+        )
+        popup.addItem(withTitle: t("Системный по умолчанию", "System default"))
+        popup.lastItem?.representedObject = ""
+
+        if unavailable {
+            popup.addItem(withTitle: t("Недоступен: \(preference)", "Unavailable: \(preference)"))
+            popup.lastItem?.representedObject = preference
+            popup.lastItem?.isEnabled = false
+        }
+        if !devices.isEmpty {
+            popup.menu?.addItem(.separator())
+        }
+        for device in devices {
+            popup.addItem(withTitle: device.name)
+            popup.lastItem?.representedObject = device.uid
+            popup.lastItem?.toolTip = device.uid
+        }
+
+        let selectedValue = selectedDevice?.uid ?? (unavailable ? preference : "")
+        if let item = popup.itemArray.first(where: {
+            ($0.representedObject as? String) == selectedValue
+        }) {
+            popup.select(item)
+        }
+        popup.setContentHuggingPriority(.required, for: .horizontal)
+
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(popup)
+        return row
+    }
+
     private func popupRow(title: String,
                           detail: String,
                           selectedValue: String,
@@ -22129,14 +22343,14 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         settingsDraft = ControlPanelSettingsDraft(settings: settings)
 
         let settingsWindow = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 680, height: 590),
+            contentRect: NSRect(x: 0, y: 0, width: 680, height: 660),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
         settingsWindow.title = t("Настройки SuperDictate", "SuperDictate Settings")
-        settingsWindow.contentMinSize = NSSize(width: 680, height: 590)
-        settingsWindow.contentMaxSize = NSSize(width: 680, height: 590)
+        settingsWindow.contentMinSize = NSSize(width: 680, height: 660)
+        settingsWindow.contentMaxSize = NSSize(width: 680, height: 660)
         settingsWindow.isReleasedWhenClosed = false
         settingsWindow.delegate = self
         settingsWindow.contentView = makeSettingsContentView()
@@ -22283,6 +22497,14 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         refreshSettingsWindow()
     }
 
+    @objc private func selectInputDeviceDraft(_ sender: NSPopUpButton) {
+        guard let preference = sender.selectedItem?.representedObject as? String else { return }
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.inputDevicePreference = preference
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
     @objc private func selectRecordingHUDSize(_ sender: NSPopUpButton) {
         guard let raw = sender.selectedItem?.representedObject as? String,
               let size = RecordingHUDSize(rawValue: raw) else { return }
@@ -22306,6 +22528,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         settings.primaryCompletionBehavior = draft.primaryCompletionBehavior
         settings.alternateCompletionEnabled = draft.alternateCompletionEnabled
         settings.enterDelayMilliseconds = draft.enterDelayMilliseconds
+        settings.inputDevice = draft.inputDevicePreference
         settings.recordingHUDRecordingColor = draft.recordingColor
         settings.recordingHUDTranscribingColor = draft.transcribingColor
         settings.recordingHUDBackgroundStyle = draft.backgroundStyle
