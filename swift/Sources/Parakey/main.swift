@@ -18042,6 +18042,42 @@ private enum ParakeySelfTest {
             equals: nil,
             "a keyboard tag literally matching DictationLanguage.auto's rawValue must not be treated as a forced language"
         )
+        // A 2s clip (32_000 samples @ 16kHz) needs only 2 * 50fps * 2x margin
+        // = 200 frames, which is below the 256 floor, so it clamps there —
+        // this is exercised separately below. A 5s clip (80_000 samples)
+        // needs 5 * 50fps * 2x margin = 500 frames, comfortably between the
+        // floor and the model max, which is what this pair of assertions
+        // checks.
+        try expect(
+            WhisperEngine.audioContextFrames(forSampleCount: 80_000, modelMaxAudioCtx: 1500) > 256,
+            equals: true,
+            "a 5s clip should size the encoder context above the floor"
+        )
+        try expect(
+            WhisperEngine.audioContextFrames(forSampleCount: 80_000, modelMaxAudioCtx: 1500) < 1500,
+            equals: true,
+            "a 5s clip should size the encoder context well below the full 30s window"
+        )
+        try expect(
+            WhisperEngine.audioContextFrames(forSampleCount: 32_000, modelMaxAudioCtx: 1500),
+            equals: 256,
+            "a 2s clip's naive requirement (200 frames) is below the floor, so it should clamp to 256"
+        )
+        try expect(
+            WhisperEngine.audioContextFrames(forSampleCount: 560_000, modelMaxAudioCtx: 1500),
+            equals: 1500,
+            "a 35s clip (longer than the model's max window) must clamp to modelMaxAudioCtx, never exceed it"
+        )
+        try expect(
+            WhisperEngine.audioContextFrames(forSampleCount: 0, modelMaxAudioCtx: 1500),
+            equals: 256,
+            "a zero-length clip must still return the floor, never 0 or negative"
+        )
+        try expect(
+            WhisperEngine.audioContextFrames(forSampleCount: 320, modelMaxAudioCtx: 1500),
+            equals: 256,
+            "a near-zero sample count must still return the floor, never 0 or negative"
+        )
         try expect(
             speechModelStartupStatusTitle(0),
             equals: "Checking speech model files…",

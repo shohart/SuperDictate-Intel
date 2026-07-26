@@ -68,6 +68,20 @@ actor WhisperEngine {
         defer { free(languageCString) }
         params.language = UnsafePointer(languageCString)
 
+        // Only trim the encoder window when a concrete language is being
+        // forced — never when whisper.cpp itself will auto-detect the
+        // language (the literal "auto" string set above). Trimming during
+        // auto-detect was found on real hardware to silently mistranslate/
+        // garble non-English audio. See `audioContextFrames` doc comment
+        // for the hard-assert constraint this must respect.
+        if let languageCString, String(cString: languageCString) != "auto" {
+            let modelMaxAudioCtx = whisper_n_audio_ctx(context)
+            params.audio_ctx = Self.audioContextFrames(
+                forSampleCount: samples.count,
+                modelMaxAudioCtx: modelMaxAudioCtx
+            )
+        }
+
         let encodeStartedAt = ProcessInfo.processInfo.systemUptime
         let result = Self.runWhisperFull(context: context, params: params, samples: samples)
         let encodeCompletedAt = ProcessInfo.processInfo.systemUptime
@@ -92,6 +106,34 @@ actor WhisperEngine {
 
     deinit {
         whisper_free(context)
+    }
+
+    /// whisper.cpp encodes a fixed 1500-frame (30s) window by default
+    /// regardless of real audio length — the dominant cost for short
+    /// dictation clips. `audio_ctx` lets us request a smaller window, cutting
+    /// encode time roughly proportionally, but two hard constraints from
+    /// whisper.cpp itself bound how small we can safely go:
+    ///   1. `whisper_full` rejects (recoverable error) any audio_ctx above
+    ///      the model's max (`whisper_n_audio_ctx`, 1500 for large-v3-turbo).
+    ///   2. whisper.cpp *hard-asserts* (crashes the process) if the real mel
+    ///      frame count exceeds `audio_ctx * 2` — so audio_ctx must always
+    ///      generously cover the real audio length, never just barely.
+    /// This is ONLY safe to use when the language is being explicitly forced
+    /// (non-nil `languageCode`, resolved either from an explicit user
+    /// selection or from the keyboard-layout signal in KeyboardLanguage.swift)
+    /// — trimming the context while asking whisper to auto-detect the
+    /// language itself was found to silently mistranslate/garble non-English
+    /// audio into English on real hardware.
+    static func audioContextFrames(forSampleCount sampleCount: Int, modelMaxAudioCtx: Int32) -> Int32 {
+        let framesPerSecond = 50.0 // 1500 frames / 30s
+        // WHISPER_SAMPLE_RATE (whisper.h:33) is a simple integer #define and
+        // is bridged into Swift by the Clang importer, so it's usable directly.
+        let durationSeconds = Double(sampleCount) / Double(WHISPER_SAMPLE_RATE)
+        // Generous margin: double the naive requirement, since the hard
+        // assert triggers at audio_ctx * 2 real frames — this keeps real
+        // usage far from that boundary even for imprecise duration estimates.
+        let neededFrames = Int32((durationSeconds * framesPerSecond * 2.0).rounded(.up))
+        return min(modelMaxAudioCtx, max(neededFrames, 256))
     }
 
     /// A `static` (hence non-actor-isolated) helper so the `withUnsafeBufferPointer`
