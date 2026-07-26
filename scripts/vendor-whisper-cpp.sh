@@ -116,29 +116,111 @@ sed -e "/__embed_ggml-common.h__/r $COMMON_H" -e "/__embed_ggml-common.h__/d" \
     echo '} // extern "C"'
 } > "$DEST/ggml-metal-embed.cpp"
 
-# Patch the one spot in ggml-metal-device.m that assumes the upstream
-# start/end-pointer-subtraction embedding; everything else is untouched.
+# Patch two spots in ggml-metal-device.m. Everything else in the file,
+# including all the `#if GGML_METAL_EMBED_LIBRARY` branching, is untouched.
 python3 - "$DEST/ggml-metal-device.m" <<'PYEOF'
 import sys
 path = sys.argv[1]
 with open(path) as fh:
     text = fh.read()
-old = (
-    "        extern const char ggml_metallib_start[];\n"
-    "        extern const char ggml_metallib_end[];\n"
-    "\n"
-    "        src = [[NSString alloc] initWithBytes:ggml_metallib_start length:(ggml_metallib_end-ggml_metallib_start) encoding:NSUTF8StringEncoding];\n"
+
+def patch(text, old, new, what):
+    if old not in text:
+        sys.exit(
+            "vendor-whisper-cpp.sh: expected snippet for '%s' not found in "
+            "ggml-metal-device.m — upstream layout changed, update the patch "
+            "in scripts/vendor-whisper-cpp.sh" % what
+        )
+    return text.replace(old, new)
+
+# Patch 1: consume ggml_metallib_size instead of the upstream
+# start/end-pointer-subtraction embedding (see the embedding comment above).
+text = patch(
+    text,
+    (
+        "        extern const char ggml_metallib_start[];\n"
+        "        extern const char ggml_metallib_end[];\n"
+        "\n"
+        "        src = [[NSString alloc] initWithBytes:ggml_metallib_start length:(ggml_metallib_end-ggml_metallib_start) encoding:NSUTF8StringEncoding];\n"
+    ),
+    (
+        "        extern const char ggml_metallib_start[];\n"
+        "        extern const size_t ggml_metallib_size;\n"
+        "\n"
+        "        src = [[NSString alloc] initWithBytes:ggml_metallib_start length:ggml_metallib_size encoding:NSUTF8StringEncoding];\n"
+    ),
+    "metallib start/end -> size",
 )
-new = (
-    "        extern const char ggml_metallib_start[];\n"
-    "        extern const size_t ggml_metallib_size;\n"
-    "\n"
-    "        src = [[NSString alloc] initWithBytes:ggml_metallib_start length:ggml_metallib_size encoding:NSUTF8StringEncoding];\n"
+
+# Patch 2: defer the full embedded-shader-library compile (~30s on this
+# project's Intel Mac Pro target) out of ggml_metal_device_init(), which
+# runs unconditionally and eagerly for every compiled-in backend as part
+# of ggml-backend-reg.cpp's function-local-static registry singleton —
+# i.e. on *every* whisper_init_from_file*() call (whisper_backend_init()
+# touches ggml_backend_dev_count()/ggml_backend_init_by_type(), which
+# construct that singleton), regardless of whether GPU use is requested.
+# Compare ggml-cuda.cu's ggml_backend_cuda_reg(): it only queries cheap
+# per-device properties (cudaGetDeviceProperties/cudaDeviceGetPCIBusId) at
+# registration time and defers real context/module init — this pinned
+# commit's ggml-metal.cpp has no equivalent lazy split at the device level
+# (ggml_metal_device_init() unconditionally calls ggml_metal_library_init()
+# inline), so it's reproduced here: `dev->library` is left NULL at device
+# construction and only compiled on first real access, i.e. the first time
+# a Metal *context* is actually created (ggml-metal-context.m calls
+# ggml_metal_device_get_library() at context-init time, which upstream's
+# own code only reaches when a backend is scheduled for compute — normal
+# CPU-only `whisper_init_from_file*()`/registry construction never reaches
+# it). This keeps GPU support strictly opt-in / zero-cost-when-unused, per
+# the parent plan's binding constraint, without touching anything else in
+# ggml_metal_device_init()'s device/property probing.
+text = patch(
+    text,
+    (
+        "            dev->library = ggml_metal_library_init(dev);\n"
+        "            if (!dev->library) {\n"
+        "                GGML_LOG_ERROR(\"%s: error: failed to create library\\n\", __func__);\n"
+        "            }\n"
+    ),
+    (
+        "            // Deferred (see the lazy-library-init comment in\n"
+        "            // scripts/vendor-whisper-cpp.sh): compiled lazily by\n"
+        "            // ggml_metal_device_get_library() on first real use,\n"
+        "            // not eagerly here at device/registry construction time.\n"
+        "            dev->library = NULL;\n"
+    ),
+    "eager library init in ggml_metal_device_init",
 )
-if old not in text:
-    sys.exit("vendor-whisper-cpp.sh: expected embedded-library snippet not found in ggml-metal-device.m — upstream layout changed, update the patch in scripts/vendor-whisper-cpp.sh")
+text = patch(
+    text,
+    (
+        "ggml_metal_library_t ggml_metal_device_get_library(ggml_metal_device_t dev) {\n"
+        "    return dev->library;\n"
+        "}\n"
+    ),
+    (
+        "ggml_metal_library_t ggml_metal_device_get_library(ggml_metal_device_t dev) {\n"
+        "    // Lazy: this is the first point at which Metal compute is\n"
+        "    // actually about to happen (a context is being created), so this\n"
+        "    // is where the one-time embedded-shader-library compile cost is\n"
+        "    // paid — never at mere backend registration/enumeration time.\n"
+        "    // Not thread-safe against concurrent first-callers by construction\n"
+        "    // (matches upstream's own lack of per-device locking elsewhere in\n"
+        "    // this file); whisper.cpp only ever creates one context per device.\n"
+        "    if (dev->library == NULL) {\n"
+        "        dev->library = ggml_metal_library_init(dev);\n"
+        "        if (!dev->library) {\n"
+        "            GGML_LOG_ERROR(\"%s: error: failed to create library\\n\", __func__);\n"
+        "        }\n"
+        "    }\n"
+        "\n"
+        "    return dev->library;\n"
+        "}\n"
+    ),
+    "lazy accessor in ggml_metal_device_get_library",
+)
+
 with open(path, "w") as fh:
-    fh.write(text.replace(old, new))
+    fh.write(text)
 PYEOF
 
 # ggml CPU backend only — no cuda/vulkan/etc. (Metal handled above.)

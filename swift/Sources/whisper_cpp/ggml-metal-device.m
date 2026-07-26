@@ -858,10 +858,11 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
             snprintf(dev->props.name, sizeof(dev->props.name), "%s%d", "MTL", device);
             snprintf(dev->props.desc, sizeof(dev->props.desc), "%s", [[dev->mtl_device name] UTF8String]);
 
-            dev->library = ggml_metal_library_init(dev);
-            if (!dev->library) {
-                GGML_LOG_ERROR("%s: error: failed to create library\n", __func__);
-            }
+            // Deferred (see the lazy-library-init comment in
+            // scripts/vendor-whisper-cpp.sh): compiled lazily by
+            // ggml_metal_device_get_library() on first real use,
+            // not eagerly here at device/registry construction time.
+            dev->library = NULL;
 
             if (dev->props.use_residency_sets) {
                 dev->rsets = ggml_metal_rsets_init();
@@ -947,6 +948,20 @@ void * ggml_metal_device_get_queue(ggml_metal_device_t dev) {
 }
 
 ggml_metal_library_t ggml_metal_device_get_library(ggml_metal_device_t dev) {
+    // Lazy: this is the first point at which Metal compute is
+    // actually about to happen (a context is being created), so this
+    // is where the one-time embedded-shader-library compile cost is
+    // paid — never at mere backend registration/enumeration time.
+    // Not thread-safe against concurrent first-callers by construction
+    // (matches upstream's own lack of per-device locking elsewhere in
+    // this file); whisper.cpp only ever creates one context per device.
+    if (dev->library == NULL) {
+        dev->library = ggml_metal_library_init(dev);
+        if (!dev->library) {
+            GGML_LOG_ERROR("%s: error: failed to create library\n", __func__);
+        }
+    }
+
     return dev->library;
 }
 
