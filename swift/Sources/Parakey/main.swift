@@ -2221,6 +2221,39 @@ func audioInputPreferenceDidChange(saved: String, activeAtLastEngineStart: Strin
     normalizedInputDevicePreference(saved) != normalizedInputDevicePreference(activeAtLastEngineStart)
 }
 
+func currentAudioInputDeviceID(for unit: AudioUnit) -> AudioDeviceID? {
+    var deviceID = AudioDeviceID(0)
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    let status = AudioUnitGetProperty(unit,
+                                      kAudioOutputUnitProperty_CurrentDevice,
+                                      kAudioUnitScope_Global,
+                                      0,
+                                      &deviceID,
+                                      &size)
+    guard status == noErr, size == UInt32(MemoryLayout<AudioDeviceID>.size) else {
+        return nil
+    }
+    return deviceID
+}
+
+func audioInputDeviceNominalSampleRate(_ deviceID: AudioDeviceID) -> Double? {
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyNominalSampleRate,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var sampleRate = Float64(0)
+    var size = UInt32(MemoryLayout<Float64>.size)
+    let status = AudioObjectGetPropertyData(deviceID,
+                                            &address,
+                                            0,
+                                            nil,
+                                            &size,
+                                            &sampleRate)
+    guard status == noErr, sampleRate > 0 else { return nil }
+    return sampleRate
+}
+
 /// Pure decision helper, ported from upstream, for whether a settings
 /// change to the microphone preference should trigger an audio-only
 /// restart of a *running* agent process, given whether that process's
@@ -5013,7 +5046,10 @@ final class AudioCapture: @unchecked Sendable {
         }
 
         let input = engine.inputNode
-        applyInputDevicePreference(inputDevicePreference, to: input)
+        let selectedDevice = applyInputDevicePreference(inputDevicePreference, to: input)
+        if let selectedDevice {
+            waitForSelectedInputDevice(selectedDevice, on: input)
+        }
         _ = try installCaptureTap(on: input)
         lock.lock()
         if recordingImmediately {
@@ -5197,7 +5233,13 @@ final class AudioCapture: @unchecked Sendable {
     }
 
     private func installCaptureTap(on input: AVAudioInputNode) throws -> AVAudioFormat {
-        let inputFormat = input.outputFormat(forBus: 0)
+        // On macOS, changing kAudioOutputUnitProperty_CurrentDevice updates
+        // the input scope immediately while AVAudioInputNode's output scope
+        // can keep the previous device's sample rate indefinitely. Passing
+        // that stale output format to installTap raises an Objective-C
+        // exception instead of returning an error. The input-scope format is
+        // the actual hardware stream delivered by the selected device.
+        let inputFormat = input.inputFormat(forBus: 0)
         guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
             throw NSError(
                 domain: "SuperDictate.AudioCapture",
@@ -5363,18 +5405,24 @@ final class AudioCapture: @unchecked Sendable {
         return out
     }
 
-    private func applyInputDevicePreference(_ preference: String, to input: AVAudioInputNode) {
+    private func applyInputDevicePreference(_ preference: String,
+                                            to input: AVAudioInputNode) -> AudioInputDevice? {
         let trimmed = preference.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        guard !isDefaultAggregateAudioInputPreference(trimmed) else { return }
+        guard !trimmed.isEmpty else { return nil }
+        guard !isDefaultAggregateAudioInputPreference(trimmed) else { return nil }
 
         guard let device = audioInputDevice(matching: trimmed) else {
             log("AudioCapture: saved input device unavailable, using system default")
-            return
+            return nil
         }
         guard let unit = input.audioUnit else {
             log("AudioCapture: input audio unit unavailable, using system default")
-            return
+            return nil
+        }
+
+        if currentAudioInputDeviceID(for: unit) == device.id {
+            log("AudioCapture: selected input \(device.name) already active")
+            return device
         }
 
         var deviceID = device.id
@@ -5386,9 +5434,39 @@ final class AudioCapture: @unchecked Sendable {
                                           UInt32(MemoryLayout<AudioDeviceID>.size))
         guard status == noErr else {
             log("AudioCapture: input device switch failed (\(formattedOSStatus(status))), using system default")
-            return
+            return nil
         }
         log("AudioCapture: selected input \(device.name)")
+        return device
+    }
+
+    private func waitForSelectedInputDevice(_ device: AudioInputDevice,
+                                            on input: AVAudioInputNode) {
+        guard let unit = input.audioUnit else { return }
+
+        let expectedRate = audioInputDeviceNominalSampleRate(device.id)
+        let deadline = ProcessInfo.processInfo.systemUptime + 3
+        var lastDeviceID = currentAudioInputDeviceID(for: unit)
+        var lastFormat = input.inputFormat(forBus: 0)
+
+        while ProcessInfo.processInfo.systemUptime < deadline {
+            lastDeviceID = currentAudioInputDeviceID(for: unit)
+            lastFormat = input.inputFormat(forBus: 0)
+            let rateIsReady = expectedRate.map {
+                abs(lastFormat.sampleRate - $0) < 0.5
+            } ?? (lastFormat.sampleRate > 0)
+
+            if lastDeviceID == device.id,
+               lastFormat.channelCount > 0,
+               rateIsReady {
+                log("AudioCapture: selected input ready at \(lastFormat.sampleRate) Hz \(lastFormat.channelCount)ch")
+                return
+            }
+            Thread.sleep(forTimeInterval: 0.025)
+        }
+
+        let expected = expectedRate.map { "\($0) Hz" } ?? "an active format"
+        log("AudioCapture: selected input route still settling; device=\(lastDeviceID ?? 0), format=\(lastFormat.sampleRate) Hz \(lastFormat.channelCount)ch, expected \(expected)")
     }
 }
 
@@ -18306,6 +18384,23 @@ private enum ParakeySelfTest {
                     "CoreAudio rejected \(device.name): \(formattedOSStatus(status))"
                 )
             }
+            guard currentAudioInputDeviceID(for: unit) == device.id else {
+                throw SelfTestFailure.failed(
+                    "CoreAudio did not make \(device.name) the current input"
+                )
+            }
+            let captureFormat = engine.inputNode.inputFormat(forBus: 0)
+            guard captureFormat.sampleRate > 0, captureFormat.channelCount > 0 else {
+                throw SelfTestFailure.failed(
+                    "\(device.name) did not expose an active capture format"
+                )
+            }
+            if let expectedRate = audioInputDeviceNominalSampleRate(device.id),
+               abs(captureFormat.sampleRate - expectedRate) >= 0.5 {
+                throw SelfTestFailure.failed(
+                    "\(device.name) capture format \(captureFormat.sampleRate) did not match \(expectedRate)"
+                )
+            }
             print("AUDIO SELECT: \(device.name) OK")
         }
     }
@@ -22573,9 +22668,49 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 }
 
+private func runAudioCaptureDiagnostic(arguments: [String]) -> Int32? {
+    guard arguments.first == "--diagnose-audio-capture" else { return nil }
+    guard arguments.count == 3,
+          let duration = TimeInterval(arguments[2]),
+          duration > 0,
+          duration <= 15 else {
+        fputs("usage: SuperDictate --diagnose-audio-capture <device-uid|default> <seconds>\n",
+              stderr)
+        return EXIT_FAILURE
+    }
+
+    let preference = arguments[1] == "default" ? "" : arguments[1]
+    let capture = AudioCapture()
+    do {
+        try capture.startRecording(inputDevicePreference: preference)
+        Thread.sleep(forTimeInterval: duration)
+        let recording = capture.endRecording()
+        capture.stopEngine()
+
+        let capturedSeconds = Double(recording.samples.count) / SAMPLE_RATE
+        let peak = recording.samples.reduce(Float(0)) { max($0, abs($1)) }
+        print(
+            String(
+                format: "AUDIO CAPTURE: requested=%.2fs captured=%.3fs samples=%d peak=%.6f",
+                duration,
+                capturedSeconds,
+                recording.samples.count,
+                peak
+            )
+        )
+        return capturedSeconds >= duration * 0.75 ? EXIT_SUCCESS : EXIT_FAILURE
+    } catch {
+        capture.stopEngine()
+        fputs("AUDIO CAPTURE FAILED: \(error.localizedDescription)\n", stderr)
+        return EXIT_FAILURE
+    }
+}
+
 let app = NSApplication.shared
 let launchArguments = Array(CommandLine.arguments.dropFirst())
-if launchArguments.first == RECORDING_HUD_EXPORT_ARGUMENT {
+if let diagnosticResult = runAudioCaptureDiagnostic(arguments: launchArguments) {
+    exit(diagnosticResult)
+} else if launchArguments.first == RECORDING_HUD_EXPORT_ARGUMENT {
     guard launchArguments.count == 2 else {
         fputs("usage: SuperDictate --export-hud-animation <frames-directory>\n", stderr)
         exit(EXIT_FAILURE)
