@@ -21847,8 +21847,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             )
         } else if let selectedDevice {
             detailText = t(
-                "Выбран: \(selectedDevice.name). Применится без перезапуска модели.",
-                "Selected: \(selectedDevice.name). Applies without restarting the model."
+                "Выбран: \(selectedDevice.name). Применится после перезапуска сервиса.",
+                "Selected: \(selectedDevice.name). Applies after the service restarts."
             )
         } else {
             detailText = t(
