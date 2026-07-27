@@ -10451,6 +10451,13 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         rebuildMenu()
     }
 
+    // Precondition: every call site must reach this with `audio.isEngineStarted
+    // == false` (i.e. after `stopAudioEngineImmediately()`), because
+    // `AudioCapture.startEngine` early-returns without applying
+    // `inputDevicePreference` when the engine is already started — if that
+    // ever isn't true, the `audioInputPreferenceAtLastEngineStart` assignment
+    // below would record a preference that was never actually applied,
+    // silently desyncing reloadAudioInputIfNeeded()'s change detection.
     private func startAudioInputWithRetries(reason: String,
                                             initialStatusTitle: String) async throws {
         let totalAttempts = AUDIO_START_RETRY_DELAYS_SECONDS.count + 1
