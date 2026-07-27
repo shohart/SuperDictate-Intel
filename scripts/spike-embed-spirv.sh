@@ -18,7 +18,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SPIKE_DIR="$ROOT_DIR/swift/Sources/VulkanSpike"
+SPIKE_DIR="$ROOT_DIR/vulkan-spike/Sources/VulkanSpike"
 OUT_HEADER="$SPIKE_DIR/spirv_embed.h"
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT

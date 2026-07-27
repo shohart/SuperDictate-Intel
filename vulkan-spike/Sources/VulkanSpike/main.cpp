@@ -1,5 +1,6 @@
-// VulkanSpike — throwaway SwiftPM executable target proving the two
-// unknowns from the intel-mac-vulkan-backend spike:
+// VulkanSpike — throwaway SwiftPM package (vulkan-spike/, fully separate
+// from swift/Package.swift — see that file's header comment for why)
+// proving the two unknowns from the intel-mac-vulkan-backend spike:
 //
 //   Unknown 1 (shader build step): a GLSL compute shader compiled to
 //   SPIR-V with glslc and embedded as a checked-in C++ byte array
@@ -8,7 +9,7 @@
 //   at vendor time" strategy as ggml-metal-embed.cpp.
 //
 //   Unknown 2 (no-Homebrew-at-runtime distribution): this binary links
-//   libMoltenVK.a STATICALLY (see Package.swift VulkanSpike target
+//   libMoltenVK.a STATICALLY (see vulkan-spike/Package.swift
 //   linkerSettings) and calls Vulkan entry points (vkCreateInstance,
 //   etc.) that resolve directly into the statically-linked MoltenVK
 //   code — NOT through libvulkan.1.dylib / the Vulkan loader / an ICD
@@ -17,10 +18,9 @@
 //   statically is sufficient. `otool -L` on the built binary should
 //   show only system frameworks (Metal, IOSurface, IOKit, AppKit,
 //   QuartzCore, Foundation, CoreFoundation, CoreGraphics, libobjc,
-//   libc++, libSystem) — no /usr/local/... Homebrew paths. See
-//   docs/spike-notes... (none written — see the vendoring-agent's final
-//   report / commit message for the write-up) for how this was verified
-//   by hiding the Homebrew Vulkan install and re-running the binary.
+//   libc++, libSystem) — no /usr/local/... Homebrew paths. Verified by
+//   hiding the Homebrew Vulkan install and re-running the binary; see
+//   the spike's commit message for the full write-up.
 //
 // This is NOT wired into the real whisper_cpp/Parakey targets and does
 // not affect them. It is a standalone proof of mechanism only.
