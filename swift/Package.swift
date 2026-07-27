@@ -107,6 +107,21 @@ let package = Package(
                 // SwiftPM resource/build step).
                 .define("GGML_USE_METAL"),
                 .define("GGML_METAL_EMBED_LIBRARY"),
+                // Vulkan backend define (Task 3 of the intel-mac-vulkan-backend
+                // plan). This is what ggml-backend-reg.cpp's #ifdef
+                // GGML_USE_VULKAN gates registration on (calling
+                // ggml_backend_vk_reg(), declared in ggml-vulkan.h and defined
+                // in ggml-vulkan.cpp). ggml-vulkan.cpp itself is still excluded
+                // above as of this task, so registration will fail to link
+                // until Task 5 removes that exclude — building this target
+                // alone (a static archive, not a final executable) does not
+                // require every symbol to resolve, so that's expected and
+                // fine at this stage. The header search path below points at
+                // Homebrew's vulkan-headers package (vulkan/vulkan_core.h,
+                // vulkan/vulkan.hpp) that ggml-vulkan.cpp/.h include; see
+                // vulkan-spike/Package.swift for the proven-working reference
+                // this was transcribed from.
+                .define("GGML_USE_VULKAN"),
                 .define("GGML_VERSION", to: "\"080bbbe8\""),
                 .define("GGML_COMMIT", to: "\"080bbbe85230f624f0b52127f1ae1218247989f9\""),
                 .define("WHISPER_VERSION", to: "\"080bbbe8\""),
@@ -121,8 +136,16 @@ let package = Package(
                 // makes both of those patterns compile errors, so ARC is
                 // disabled for the whole target to match upstream's own
                 // (non-ARC) build. Harmless no-op for the plain C/C++
-                // sources also built with these flags.
-                .unsafeFlags(["-mavx2", "-mfma", "-mf16c", "-mbmi2", "-msse4.2", "-fno-objc-arc"]),
+                // sources also built with these flags. The vulkan-headers
+                // -I flag is Task 3's addition (see the GGML_USE_VULKAN
+                // comment above). Uses Homebrew's `opt/` symlink (not the
+                // versioned Cellar path the throwaway vulkan-spike package
+                // used) so this doesn't break on the next `brew upgrade`;
+                // resolves to the same files the spike proved work.
+                .unsafeFlags([
+                    "-mavx2", "-mfma", "-mf16c", "-mbmi2", "-msse4.2", "-fno-objc-arc",
+                    "-I/usr/local/opt/vulkan-headers/include",
+                ]),
             ],
             cxxSettings: [
                 .define("GGML_USE_ACCELERATE"),
@@ -134,18 +157,57 @@ let package = Package(
                 // See the matching comment in cSettings above.
                 .define("GGML_USE_METAL"),
                 .define("GGML_METAL_EMBED_LIBRARY"),
+                // See the GGML_USE_VULKAN comment in cSettings above.
+                .define("GGML_USE_VULKAN"),
                 .define("GGML_VERSION", to: "\"080bbbe8\""),
                 .define("GGML_COMMIT", to: "\"080bbbe85230f624f0b52127f1ae1218247989f9\""),
                 .define("WHISPER_VERSION", to: "\"080bbbe8\""),
                 .headerSearchPath("."),
                 .headerSearchPath("ggml-cpu"),
-                .unsafeFlags(["-mavx2", "-mfma", "-mf16c", "-mbmi2", "-msse4.2"]),
+                .unsafeFlags([
+                    "-mavx2", "-mfma", "-mf16c", "-mbmi2", "-msse4.2",
+                    "-I/usr/local/opt/vulkan-headers/include",
+                ]),
             ],
             linkerSettings: [
                 .linkedFramework("Accelerate"),
                 .linkedFramework("Metal"),
                 .linkedFramework("MetalKit"),
                 .linkedFramework("Foundation"),
+                // Vulkan/MoltenVK (Task 3 of the intel-mac-vulkan-backend
+                // plan). Frameworks + libraries below are the exact set
+                // vulkan-spike/Package.swift proved sufficient for
+                // statically-linked MoltenVK on this machine: `otool -L`
+                // on the spike's built binary showed only these system
+                // frameworks plus libc++/libobjc/libSystem — no Homebrew
+                // dylib paths — and the binary ran correctly with
+                // Homebrew's Vulkan install hidden, confirming no runtime
+                // dependency on it. IOSurface/IOKit/AppKit/QuartzCore/
+                // CoreFoundation/CoreGraphics are additional to the
+                // Metal/Foundation frameworks already linked above for the
+                // Metal backend.
+                .linkedFramework("IOSurface"),
+                .linkedFramework("IOKit"),
+                .linkedFramework("AppKit"),
+                .linkedFramework("QuartzCore"),
+                .linkedFramework("CoreFoundation"),
+                .linkedFramework("CoreGraphics"),
+                .linkedLibrary("objc"),
+                .linkedLibrary("c++"),
+                // Statically link MoltenVK itself (the actual Vulkan
+                // implementation) rather than -lMoltenVK/-lvulkan, which
+                // would resolve to Homebrew's dylibs and the Vulkan
+                // loader/ICD mechanism at runtime. Passing the .a path
+                // directly avoids any ambiguity between the .a and .dylib
+                // Homebrew installs side by side in the same lib dir. Uses
+                // Homebrew's `opt/` symlink rather than the versioned
+                // Cellar path vulkan-spike/Package.swift used, for the same
+                // brew-upgrade-resilience reason as the cSettings -I flag
+                // above; resolves to the identical file the spike proved
+                // works (confirmed via `ls -l`/`lipo -info` on the real Mac).
+                .unsafeFlags([
+                    "/usr/local/opt/molten-vk/lib/libMoltenVK.a",
+                ]),
             ]
         ),
         .executableTarget(
