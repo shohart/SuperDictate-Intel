@@ -10009,6 +10009,12 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             hotkey.resetToggleState()
             hotkey.stop()
             log("readiness failed (\(reason)): hotkey listener unavailable")
+            // Counterpart to concealMenuBarIcon() in applicationDidFinishLaunching —
+            // without this the icon stays invisible forever even though we're
+            // now showing an error state the user should be able to see/click.
+            statusItem.length = NSStatusItem.squareLength
+            statusItem.button?.isHidden = false
+            statusItem.button?.toolTip = "Parakey"
             setMenuBarState(.error)
             if missingPermissions().isEmpty {
                 startupFailure = StartupFailure(stage: .hotkeyListener,
@@ -10024,6 +10030,12 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         startupStatusTitle = "Ready"
         startupFailure = nil
         stopPermissionReadinessMonitor()
+        // Counterpart to concealMenuBarIcon() in applicationDidFinishLaunching —
+        // that call hides the icon during startup; this is the only place that
+        // ever reveals it again once we're actually ready.
+        statusItem.length = NSStatusItem.squareLength
+        statusItem.button?.isHidden = false
+        statusItem.button?.toolTip = "Parakey"
         setMenuBarState(.idle)
         refreshActivationPolicy()
 
@@ -10546,6 +10558,12 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let detail = startupFailureDetail(stage: stage, error: error)
         startupFailure = StartupFailure(stage: stage, detail: detail)
         log("startup failed (\(reason), \(stage)): \(startupFailureLogDetail(stage: stage, error: error))")
+        // Counterpart to concealMenuBarIcon() in applicationDidFinishLaunching —
+        // without this the icon stays invisible forever on a startup failure,
+        // instead of showing an error state the user can click for details.
+        statusItem.length = NSStatusItem.squareLength
+        statusItem.button?.isHidden = false
+        statusItem.button?.toolTip = "Parakey"
         setMenuBarState(.error)
         if !missingPermissions().isEmpty {
             startPermissionReadinessMonitor(reason: reason)
