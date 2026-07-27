@@ -76,10 +76,18 @@ const std::string & resolve_dir_locked() {
     if (g_dir_resolved) {
         return g_resolved_dir;
     }
-    if (!g_configured_dir.empty()) {
-        g_resolved_dir = g_configured_dir;
-    } else if (const char * env = std::getenv("SUPERDICTATE_VULKAN_SHADER_DIR")) {
+    // SUPERDICTATE_VULKAN_SHADER_DIR wins even over an explicitly
+    // configured directory: it exists specifically so a developer can
+    // redirect a *real, already-configured* shipped app at an alternate
+    // shader corpus for debugging (e.g. a locally rebuilt .spv, or a
+    // corpus with debug info) without rebuilding — the one scenario where
+    // ggml_vk_shaders_set_directory() has already run and a lower-priority
+    // env var would otherwise be permanently unreachable for the rest of
+    // the process's lifetime.
+    if (const char * env = std::getenv("SUPERDICTATE_VULKAN_SHADER_DIR")) {
         g_resolved_dir = env;
+    } else if (!g_configured_dir.empty()) {
+        g_resolved_dir = g_configured_dir;
     } else {
         g_resolved_dir = source_relative_shader_dir();
     }

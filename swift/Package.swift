@@ -60,6 +60,20 @@ let package = Package(
                 // excluded below and already compile as part of this
                 // target today (verified via `swift build -c debug` on
                 // the real Mac).
+                //
+                // Task 5, when wiring Vulkan into WhisperEngine: call
+                // ggml_vk_shaders_set_directory() (declared in
+                // include/ggml-vulkan-shaders-runtime.h) with the
+                // resolved Contents/Resources/vulkan-shaders/ bundle path
+                // BEFORE ggml_backend_vk_init() / any Vulkan backend init
+                // — this is not optional. Skipping it does not gracefully
+                // fall back to CPU: every one of the ~1785 shader
+                // symbols silently resolves to a null pointer + zero
+                // length (logged to stderr, not thrown), which flows
+                // straight into vk::ShaderModuleCreateInfo and will most
+                // likely surface as a Vulkan/MoltenVK-level crash or
+                // validation error deep inside ggml-vulkan.cpp instead of
+                // a clean, catchable failure at the Swift boundary.
                 "ggml-vulkan.cpp",
                 // Raw .spv binaries (48MB, 1785 files) pre-compiled by
                 // scripts/vendor-whisper-cpp.sh. Excluded (not source,
