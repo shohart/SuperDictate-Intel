@@ -1,7 +1,8 @@
 // Parakey — push-to-talk dictation for macOS.
 //
 // Swift menu-bar app. The runtime covers hotkey capture (`CGEventTap`), audio capture
-// (`AVAudioEngine`), transcription (vendored `whisper.cpp`, CPU-only),
+// (`AVAudioEngine`), transcription (vendored `whisper.cpp`, CPU+BLAS by
+// default with an opt-in Vulkan GPU backend — see the "Use GPU" setting),
 // paste-at-cursor (`NSPasteboard` + `CGEvent`),
 // system-audio mute (`NSAppleScript`), menu-bar UI, settings,
 // rolling history, in-app updater, TCC self-healing.
@@ -3267,9 +3268,10 @@ final class Settings: @unchecked Sendable {
         set { defaults.set(newValue, forKey: Self.keyRemoveFillerWords) }
     }
 
-    // Opt-in Metal GPU backend for whisper.cpp. Defaults to `false` (CPU+BLAS)
-    // via `defaults.bool(forKey:)`'s standard "unset key reads as false"
-    // behavior — never force this on by default, see task brief.
+    // Opt-in Vulkan GPU backend for whisper.cpp (Metal originally, replaced
+    // by Vulkan per the intel-mac-vulkan-backend plan). Defaults to `false`
+    // (CPU+BLAS) via `defaults.bool(forKey:)`'s standard "unset key reads
+    // as false" behavior — never force this on by default, see task brief.
     var useGPU: Bool {
         get { defaults.bool(forKey: Self.keyUseGPU) }
         set { defaults.set(newValue, forKey: Self.keyUseGPU) }
@@ -13808,12 +13810,12 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         dock.state = settings.showInDock ? .on : .off
         sub.addItem(dock)
 
-        let useGPU = NSMenuItem(title: "Use GPU (Metal) — experimental",
+        let useGPU = NSMenuItem(title: "Use GPU (Vulkan) — experimental",
                                 action: #selector(toggleUseGPU(_:)),
                                 keyEquivalent: "")
         useGPU.target = self
         useGPU.state = settings.useGPU ? .on : .off
-        useGPU.toolTip = "Runs whisper.cpp's Metal backend instead of CPU+BLAS. Opt-in; reloads the speech model."
+        useGPU.toolTip = "Runs whisper.cpp's Vulkan backend instead of CPU+BLAS. Opt-in; reloads the speech model."
         sub.addItem(useGPU)
 
         parent.submenu = sub

@@ -35,12 +35,69 @@ actor WhisperEngine {
     private nonisolated(unsafe) let context: OpaquePointer
 
     init(modelPath: String, useGPU: Bool) throws {
+        // Must happen before whisper_init_from_file_with_params below, which
+        // is this project's single entry point into whisper.cpp's backend
+        // machinery (whisper_backend_init -> ggml-backend-reg.cpp's registry
+        // singleton -> ggml_backend_vk_reg()). Registration itself only
+        // creates a VkInstance and enumerates physical devices — it does
+        // NOT touch any shader — but the first *pipeline* a Vulkan device
+        // actually creates (reachable only once a GPU device is selected,
+        // i.e. only when useGPU is true) resolves every shader by name
+        // through the runtime loader in ggml-vulkan-shaders-runtime.h. If
+        // that loader hasn't been pointed at a real directory by then, every
+        // shader silently resolves to a null pointer + zero length instead
+        // of failing cleanly — see the Package.swift comment above the
+        // (now-removed) ggml-vulkan.cpp exclude entry and
+        // include/ggml-vulkan-shaders-runtime.h's doc comment for why this
+        // call is not optional. Calling it unconditionally (not just when
+        // useGPU is true) is deliberate and cheap: it only stores a string
+        // for the loader to consult later, matching the doc comment's
+        // "safe to call more than once, most recent call wins" contract.
+        WhisperEngine.configureVulkanShaderDirectory()
+
         var params = whisper_context_default_params()
         params.use_gpu = useGPU
         guard let ctx = whisper_init_from_file_with_params(modelPath, params) else {
             throw WhisperEngineError.modelLoadFailed(path: modelPath)
         }
         context = ctx
+    }
+
+    /// Resolves `Contents/Resources/vulkan-shaders/` in the running app
+    /// bundle (the canonical .app layout scripts/build-app.sh copies the
+    /// shader corpus into per Task 4 of the intel-mac-vulkan-backend plan —
+    /// same `Bundle.main`-relative pattern `configureStatusItemImage()` in
+    /// main.swift uses for the menubar PNGs) and hands it to the C++ shader
+    /// loader — but ONLY if that directory actually exists on disk.
+    ///
+    /// This existence check is not optional, and was added after an
+    /// on-device test proved the naive "always call down, let the C++ side
+    /// sort it out" version wrong: `ggml-vulkan-shaders-runtime.cpp`'s
+    /// 3-tier fallback (env var, then the explicitly configured directory,
+    /// then a source-relative dev path) treats "configured" and "exists"
+    /// as the same thing — once `ggml_vk_shaders_set_directory()` has been
+    /// called with ANY non-empty string, that string permanently outranks
+    /// tier 3's source-relative fallback for the rest of the process,
+    /// even if the path doesn't exist. In a `swift run`/`swift build` dev
+    /// build (no real .app bundle yet), `Bundle.main.resourceURL` still
+    /// resolves to *something* (the build products directory), just not
+    /// one containing `vulkan-shaders/` — calling down with that path
+    /// unconditionally silently defeated the dev-build fallback entirely:
+    /// measured on real hardware, every one of the 1785 shaders failed to
+    /// load (logged to stderr) and `useGPU: true` model init went from the
+    /// expected ~2s to 37.6s. Checking existence here keeps the shipped-app
+    /// path (where the directory genuinely exists, copied in by
+    /// scripts/build-app.sh) working exactly as before, while leaving dev
+    /// builds to fall through to the source-relative fallback as intended.
+    private static func configureVulkanShaderDirectory() {
+        guard let resourceURL = Bundle.main.resourceURL else { return }
+        let shaderDir = resourceURL.appendingPathComponent("vulkan-shaders", isDirectory: true)
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: shaderDir.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            return
+        }
+        shaderDir.path.withCString { ggml_vk_shaders_set_directory($0) }
     }
 
     /// `languageCode` is `nil` for auto-detect (i.e. `DictationLanguage.auto`).

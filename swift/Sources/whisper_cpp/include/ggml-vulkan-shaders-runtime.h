@@ -41,8 +41,18 @@
 //      corpus without any configuration.
 #pragma once
 
-#include <cstddef>
-#include <cstdint>
+// <cstddef>/<cstdint> are C++ headers and don't exist in this project's C
+// modulemap context: Task 5 (intel-mac-vulkan-backend plan) added this
+// header to whisper_cpp_module.h's umbrella header so
+// ggml_vk_shaders_set_directory() is reachable from Swift, and Swift's
+// Clang importer parses that umbrella header as plain C (matching every
+// other header already in it, e.g. ggml-backend.h), not C++ — `swift
+// build` failed with "'cstddef' file not found" before this fix. The
+// plain-C headers below are available in both languages and cover
+// everything this file actually needs (NULL-checked pointers, no
+// std:: types used outside the __cplusplus-only block below).
+#include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
