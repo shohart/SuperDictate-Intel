@@ -32,6 +32,31 @@ let package = Package(
                 "ggml-cpu/arch/wasm",
                 "ggml-cpu/arch/loongarch",
                 "ggml-cpu/spacemit",
+                // Vendored by scripts/vendor-whisper-cpp.sh (Task 1 of the
+                // intel-mac-vulkan-backend plan) but not yet buildable:
+                // this target has no `sources:` allowlist, so SwiftPM
+                // implicitly compiles every .cpp under the target
+                // directory, and ggml-vulkan.cpp #includes
+                // "ggml-vulkan-shaders.hpp" — the upstream CMake-generated
+                // byte-array-embedding header this project deliberately
+                // does not produce (see the vendoring script's SPIR-V
+                // section for why). Task 2 replaces that include with the
+                // file-path .spv loader and Task 5 wires up the rest of
+                // this target's Vulkan build settings (defines, MoltenVK
+                // linkage); Task 5 removes this exclude entry.
+                "ggml-vulkan.cpp",
+                // Raw .spv binaries (48MB, 1785 files) pre-compiled by
+                // scripts/vendor-whisper-cpp.sh. Excluded (not source,
+                // not Swift) so SwiftPM neither tries to compile them nor
+                // auto-bundles them as a resource — this project loads
+                // them by explicit file path at runtime instead (see the
+                // vendoring script's SPIR-V section; per the parent
+                // plan's global constraints, `resources:` must never
+                // reference this directory). Same rationale as the
+                // menubar-PNG precedent in the Parakey target below: keep
+                // SwiftPM's own resource-bundling mechanism out of it
+                // entirely. This entry is permanent, unlike the one above.
+                "vulkan-shaders",
             ],
             cSettings: [
                 .define("GGML_USE_ACCELERATE"),
