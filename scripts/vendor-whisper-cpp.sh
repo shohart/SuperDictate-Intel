@@ -1,7 +1,13 @@
 #!/bin/bash
 # scripts/vendor-whisper-cpp.sh — refresh the vendored whisper.cpp/ggml
 # CPU-only sources. Re-run this and commit the result to update the pin;
-# never hand-edit files under swift/Sources/whisper_cpp/.
+# never hand-edit files under swift/Sources/whisper_cpp/ — this script
+# wipes and regenerates that whole directory (see `rm -rf "$DEST"` below),
+# including copying in the two hand-authored (not from upstream) runtime
+# SPIR-V loader files this script's Vulkan section maintains permanently at
+# scripts/vulkan-shader-runtime/ for exactly that reason: edit them there,
+# not under swift/Sources/whisper_cpp/, or a re-vendor will silently
+# discard the edit.
 #
 # Prerequisite for the Vulkan section below (see "Pre-compiling the
 # Vulkan SPIR-V shader corpus"): `glslc` must be on PATH. On the real
@@ -341,6 +347,43 @@ cp "$VULKAN_SPV_OUT"/*.spv "$DEST/vulkan-shaders/"
 spv_count=$(find "$DEST/vulkan-shaders" -name '*.spv' | wc -l | tr -d ' ')
 spv_size=$(du -sh "$DEST/vulkan-shaders" | cut -f1)
 echo "Compiled $spv_count SPIR-V shaders ($spv_size) into $DEST/vulkan-shaders"
+
+# --- Generating the runtime SPIR-V loader's symbol table (Task 2) ---
+#
+# ggml-vulkan.cpp #includes "ggml-vulkan-shaders.hpp" expecting upstream's
+# generated per-shader `<name>_data`/`<name>_len` extern declarations (see
+# the "Pre-compiling..." comment above for why this project doesn't ship
+# upstream's compiled-in-byte-array version of that header). Reuse the same
+# $VULKAN_GEN_BIN this script just built — with the exact same
+# GGML_VULKAN_*_GLSLC_SUPPORT defines probed above, so the symbol set
+# matches the .spv corpus this run just produced — in its aggregate mode
+# (no --source: per string_to_spv()'s `input_filepath == ""` branch, this
+# only emits extern declarations, no glslc/Vulkan-SDK dependency, see
+# scripts/gen-vulkan-shader-runtime.py's module docstring for the full
+# explanation) to get the ground-truth identifier list, then hand it to
+# gen-vulkan-shader-runtime.py to turn into this project's runtime-loaded
+# replacement header + .cpp.
+VULKAN_GROUND_TRUTH_HPP="$WORK_DIR/ggml-vulkan-shaders-ground-truth.hpp"
+VULKAN_GROUND_TRUTH_CPP="$WORK_DIR/ggml-vulkan-shaders-ground-truth.cpp"
+"$VULKAN_GEN_BIN" \
+    --output-dir "$VULKAN_SPV_OUT" \
+    --target-hpp "$VULKAN_GROUND_TRUTH_HPP" \
+    --target-cpp "$VULKAN_GROUND_TRUTH_CPP"
+
+python3 "$ROOT_DIR/scripts/gen-vulkan-shader-runtime.py" \
+    "$VULKAN_GROUND_TRUTH_HPP" \
+    "$DEST/ggml-vulkan-shaders.hpp" \
+    "$DEST/ggml-vulkan-shaders.cpp"
+
+# The loader implementation these generated files depend on
+# (ggml_vk_shaders_detail::get_data/get_len, ggml_vk_shaders_set_directory)
+# is hand-authored, not derived from upstream or from vulkan-shaders-gen's
+# output — permanently maintained at scripts/vulkan-shader-runtime/ (see
+# this script's header comment) specifically so it survives this script's
+# `rm -rf "$DEST"` at the top. Copy it into place same as every other
+# $DEST file this script produces.
+cp "$ROOT_DIR/scripts/vulkan-shader-runtime/ggml-vulkan-shaders-runtime.h" "$DEST/include/"
+cp "$ROOT_DIR/scripts/vulkan-shader-runtime/ggml-vulkan-shaders-runtime.cpp" "$DEST/"
 
 # ggml CPU backend only — no cuda/vulkan/etc. (Metal handled above.)
 cp -R "$WORK_DIR/src/ggml/src/ggml-cpu/." "$DEST/ggml-cpu/"
