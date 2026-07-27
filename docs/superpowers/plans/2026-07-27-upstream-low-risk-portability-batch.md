@@ -215,3 +215,43 @@ codesign --verify --deep --strict ./dist/SuperDictate.app
 ```
 
 - [ ] **Step 4: Commit any final cleanup if needed, otherwise this task is verification-only**
+
+---
+
+### Task 7: Fix the menu bar status icon never being revealed after startup
+
+**Files:**
+- Modify: `swift/Sources/Parakey/main.swift`
+
+**Interfaces:**
+- Modifies: the `ParakeyApp` (`--agent` process) startup/ready path — the same class that owns `statusItem`, `configureStatusItemImage()`, `concealMenuBarIcon()`, `setMenuBarState(_:)`.
+
+**Context:** A real-hardware investigation (not a hypothesis — confirmed by exhaustively grepping the whole file, and cross-checking against `upstream/main`'s current version of the same code, which has the identical bug) found: `applicationDidFinishLaunching` in `ParakeyApp` calls `concealMenuBarIcon()` once at startup (`statusItem.length = 0`, `statusItem.button?.isHidden = true`), and `setMenuBarState(.loading)`. Later, once startup succeeds, `isReady = true` is set and `setMenuBarState(.idle)` runs — but `setMenuBarState(_:)`'s implementation only ever touches `button.image`/`button.contentTintColor` per-case; it never restores `statusItem.length` or `button.isHidden`. Confirmed via `grep -n "\.length" swift/Sources/Parakey/main.swift | grep -i status` that `statusItem.length` is assigned exactly ONCE in the entire file — the concealment. There is no code path anywhere that reveals the icon again. This means the menu bar status icon is permanently invisible after the app reaches its ready state, on real hardware, confirmed by the plan owner directly (not visible in the menu bar, not in the Control Center overflow chevron either — ruling out a macOS menu-bar-crowding false lead).
+
+- [ ] **Step 1: Locate the exact ready-state transition**
+
+Find where `isReady = true` is set together with the call to `setMenuBarState(.idle)` (search near `isReady = true` in `ParakeyApp` — as of this plan's writing it's around the point where `startStartup`'s success path finishes, calling `clearSpeechModelStartupProgress()`, `stopPermissionReadinessMonitor()`, `setMenuBarState(.idle)`, `refreshActivationPolicy()`, `rebuildMenu()`, `startUpdateCheckLoop()`, in that order — exact line numbers will have shifted from Tasks 1-6 landing first, re-locate by searching for these symbol names together).
+
+- [ ] **Step 2: Add the reveal**
+
+Immediately before or after the `setMenuBarState(.idle)` call in that same success path, add:
+```swift
+statusItem.length = NSStatusItem.squareLength
+statusItem.button?.isHidden = false
+```
+Match the existing code's comment style — add a short comment explaining this is the counterpart to `concealMenuBarIcon()` (which this fix does not rename or remove), since a future reader needs to understand these two calls are a matched pair now, not one-directional.
+
+- [ ] **Step 3: Consider the failure path too**
+
+Check `startStartup`'s FAILURE path (search for where `startupFailure` gets set to non-nil, or `setMenuBarState(.error)` gets called) — decide whether the icon should also be revealed there (showing an error-state icon the user can click for details) rather than staying invisible forever on a startup failure too. If `setMenuBarState(.error)` is already reachable from a path where the icon was never revealed, apply the same two-line reveal there as well, so a startup failure is at least visible/clickable instead of silently invisible.
+
+- [ ] **Step 4: Build, self-test, and verify on the real Mac**
+
+Fresh scratch build (never `/Applications`), `swift build --package-path swift`, `swift run --package-path swift Parakey --self-test all` → PASS. Since this is a real UI-visibility bug that a headless self-test cannot directly observe (no way to screenshot the actual menu bar over SSH), also do a direct runtime check: launch the built binary with `--agent` in the scratch dir, `tail`/inspect its log output through to the `ASR: ... ready` line (matching the pattern already seen in this project's production logs), and if any way exists to introspect `NSStatusItem.length`/`isHidden` state at runtime (e.g. a temporary debug log line printing `statusItem.length` right after the fix's new code runs, removed before committing, or via a `--self-test` addition that constructs a `ParakeyApp`-equivalent status item path and asserts the post-ready state) — use your judgment on the most reliable way to get real evidence this fix works, given the self-test suite's existing patterns in this file for similar non-trivially-observable state. Do NOT just assert "the two lines are there" — get some form of runtime confirmation given the history of this exact class of claim ("should work by inspection") being wrong for this exact icon-visibility bug at least once already in this project.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add swift/Sources/Parakey/main.swift
+git commit -m "Reveal the menu bar status icon once startup completes"
+```
