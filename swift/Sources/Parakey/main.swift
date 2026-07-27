@@ -10009,12 +10009,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             hotkey.resetToggleState()
             hotkey.stop()
             log("readiness failed (\(reason)): hotkey listener unavailable")
-            // Counterpart to concealMenuBarIcon() in applicationDidFinishLaunching —
-            // without this the icon stays invisible forever even though we're
+            // Without this the icon stays invisible forever even though we're
             // now showing an error state the user should be able to see/click.
-            statusItem.length = NSStatusItem.squareLength
-            statusItem.button?.isHidden = false
-            statusItem.button?.toolTip = "Parakey"
+            revealMenuBarIcon()
             setMenuBarState(.error)
             if missingPermissions().isEmpty {
                 startupFailure = StartupFailure(stage: .hotkeyListener,
@@ -10030,12 +10027,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         startupStatusTitle = "Ready"
         startupFailure = nil
         stopPermissionReadinessMonitor()
-        // Counterpart to concealMenuBarIcon() in applicationDidFinishLaunching —
-        // that call hides the icon during startup; this is the only place that
-        // ever reveals it again once we're actually ready.
-        statusItem.length = NSStatusItem.squareLength
-        statusItem.button?.isHidden = false
-        statusItem.button?.toolTip = "Parakey"
+        // This is the normal-path counterpart to concealMenuBarIcon() —
+        // hides the icon during startup; this reveals it again once ready.
+        revealMenuBarIcon()
         setMenuBarState(.idle)
         refreshActivationPolicy()
 
@@ -10558,12 +10552,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let detail = startupFailureDetail(stage: stage, error: error)
         startupFailure = StartupFailure(stage: stage, detail: detail)
         log("startup failed (\(reason), \(stage)): \(startupFailureLogDetail(stage: stage, error: error))")
-        // Counterpart to concealMenuBarIcon() in applicationDidFinishLaunching —
-        // without this the icon stays invisible forever on a startup failure,
+        // Without this the icon stays invisible forever on a startup failure,
         // instead of showing an error state the user can click for details.
-        statusItem.length = NSStatusItem.squareLength
-        statusItem.button?.isHidden = false
-        statusItem.button?.toolTip = "Parakey"
+        revealMenuBarIcon()
         setMenuBarState(.error)
         if !missingPermissions().isEmpty {
             startPermissionReadinessMonitor(reason: reason)
@@ -10797,6 +10788,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         logPermissionReadinessWait(missing)
         startPermissionReadinessMonitor(reason: reason)
+        // Without this the icon stays invisible forever whenever permissions
+        // (Accessibility/Input Monitoring) are missing on first launch, which
+        // is the most common real-world path a brand-new user hits. The user
+        // needs the icon visible to click it and see what's blocking them.
+        revealMenuBarIcon()
         setMenuBarState(.loading)
         rebuildMenu()
     }
@@ -10913,6 +10909,18 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         statusItem.length = 0
         statusItem.button?.isHidden = true
         statusItem.button?.toolTip = nil
+    }
+
+    /// Counterpart to concealMenuBarIcon() — restores the icon to exactly
+    /// the state configureStatusItemImage() left it in before the startup
+    /// conceal. Called from every place that can be reached after
+    /// concealMenuBarIcon() (ready, and every startup-failure/blocked
+    /// state) so the icon never stays invisible once there is something
+    /// (idle, error, or a permission prompt) the user should see or click.
+    private func revealMenuBarIcon() {
+        statusItem.length = NSStatusItem.squareLength
+        statusItem.button?.isHidden = false
+        statusItem.button?.toolTip = "Parakey"
     }
 
     private func tintedCopy(of source: NSImage, with color: NSColor) -> NSImage {
