@@ -2207,6 +2207,20 @@ func audioInputDevice(matching preference: String,
         ?? devices.first { $0.name.caseInsensitiveCompare(trimmed) == .orderedSame }
 }
 
+/// Whether a saved audio-input preference differs meaningfully from
+/// the preference audio capture is currently running with, once both
+/// are normalized the same way `applyInputDevicePreference` and
+/// `audioInputDevice(matching:)` already normalize preferences
+/// elsewhere in this file (trimmed, with any spelling of "system
+/// default" — including CoreAudio default-aggregate UIDs/names —
+/// collapsed to the same value). Two preferences that both normalize
+/// to "system default" are not a change even if their raw strings
+/// differ (e.g. "" vs a stale aggregate UID left over from a previous
+/// save), so this never reports a spurious change for that case.
+func audioInputPreferenceDidChange(saved: String, activeAtLastEngineStart: String) -> Bool {
+    normalizedInputDevicePreference(saved) != normalizedInputDevicePreference(activeAtLastEngineStart)
+}
+
 // MARK: - Logger
 //
 // All output goes to stderr (line-buffered, so we don't lose lines
@@ -9707,6 +9721,15 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var maxDurationWorkItem: DispatchWorkItem?
     private var audioIdleStopWorkItem: DispatchWorkItem?
     private var isRestartingAudioInput = false
+    /// The `settings.inputDevice` value passed to the most recent
+    /// successful `AudioCapture.startEngine(inputDevicePreference:)`
+    /// call (set in `startAudioInputWithRetries`). Used only by
+    /// `reloadAudioInputIfNeeded()` to detect whether a freshly saved
+    /// preference actually changed; a later `startRecording` call can
+    /// also start the engine with a since-changed `settings.inputDevice`
+    /// without going through that path, which can leave this value
+    /// briefly stale — harmless here, since the only effect is a
+    /// redundant restart on the next check, never a missed one.
     private var audioInputPreferenceAtLastEngineStart = ""
     private var audioConfigurationRecoveryWorkItem: DispatchWorkItem?
     private var pendingAudioRouteRefresh = false
@@ -10432,6 +10455,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                             initialStatusTitle: String) async throws {
         let totalAttempts = AUDIO_START_RETRY_DELAYS_SECONDS.count + 1
         var lastError: Error?
+        let inputDevicePreference = settings.inputDevice
 
         for attempt in 1...totalAttempts {
             try Task.checkCancellation()
@@ -10445,7 +10469,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             do {
                 didTouchAudioEngine = true
                 suppressAudioConfigurationChangesFromAppEngineUpdate()
-                try audio.startEngine(inputDevicePreference: settings.inputDevice)
+                try audio.startEngine(inputDevicePreference: inputDevicePreference)
+                // Tracks the preference audio capture last (re)started
+                // with, so reloadAudioInputIfNeeded() can tell whether a
+                // freshly saved preference is actually a change.
+                audioInputPreferenceAtLastEngineStart = inputDevicePreference
                 stopAudioEngineImmediately()
                 return
             } catch {
@@ -14050,11 +14078,55 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             ? "system default"
             : (audioInputDevice(matching: preference)?.name ?? preference)
         log("input device selected: \(label)")
-        restartAudioForInputDeviceChange()
+        reloadAudioInputIfNeeded()
     }
 
-    private func restartAudioForInputDeviceChange() {
-        restartAudioInput(reason: "input device change")
+    /// Fork-native, narrowly-scoped live-reload hook for the
+    /// audio-input device only. Compares the currently saved
+    /// `settings.inputDevice` preference against whatever preference
+    /// audio capture is actually running with and, only if they
+    /// differ after normalization, restarts JUST the AVAudioEngine
+    /// capture layer via `restartAudioInput(reason:)` — which reuses
+    /// `installCaptureTap()` / `recoverAfterConfigurationChange()`
+    /// and never touches `TranscriptionWorker` or the whisper.cpp
+    /// engine/model.
+    ///
+    /// Today this is wired into the mic-selection menu item above,
+    /// the only place in this fork that currently changes
+    /// `settings.inputDevice`. It exists as a standalone entry point
+    /// so a future settings-window microphone picker (see the next
+    /// task in this batch) can call it too — from the settings-save
+    /// path, alongside whatever full-service-restart decision that
+    /// path already makes for non-audio settings, not replacing it.
+    ///
+    /// This is deliberately NOT a general settings-live-reload
+    /// mechanism — contrast upstream's broader, out-of-scope
+    /// `SETTINGS_CHANGED_NOTIFICATION` / `reloadSettingsWhenIdle`
+    /// (tied to FluidAudio-specific download-telemetry fields this
+    /// fork's whisper.cpp rewrite doesn't have). This function only
+    /// ever looks at the microphone preference.
+    ///
+    /// Reads `settings.inputDevice` as it stands in memory right now;
+    /// a caller whose preference change may have been written by a
+    /// different process (e.g. a future settings-window save from the
+    /// control-panel process) is responsible for calling
+    /// `settings.refreshFromDisk()` first.
+    ///
+    /// Returns `true` if a restart was triggered, `false` if the
+    /// preference was unchanged or a restart could not be safely
+    /// started right now (already restarting, mid-recording, busy, or
+    /// terminating — `restartAudioInput(reason:)` separately handles
+    /// the case where the core runtime isn't ready yet).
+    @discardableResult
+    private func reloadAudioInputIfNeeded() -> Bool {
+        guard !isRestartingAudioInput, !isRecording, !isBusy, !isTerminating else { return false }
+        guard audioInputPreferenceDidChange(saved: settings.inputDevice,
+                                            activeAtLastEngineStart: audioInputPreferenceAtLastEngineStart) else {
+            return false
+        }
+        log("AudioCapture: input device preference changed; reloading audio input only")
+        restartAudioInput(reason: "settings save: audio input changed")
+        return true
     }
 
     private func suppressAudioConfigurationChangesFromAppEngineUpdate() {
@@ -18071,6 +18143,41 @@ private enum ParakeySelfTest {
             audioInputDevice(matching: "Yeti Nano", in: [real])?.uid,
             equals: "real-yeti-nano",
             "named microphone preferences should still resolve by display name"
+        )
+
+        // reloadAudioInputIfNeeded()'s change-detection must treat any
+        // spelling of "system default" (empty string, whitespace-only,
+        // or a stale CoreAudio default-aggregate UID) as equivalent, so
+        // a settings save doesn't trigger a spurious audio-only restart.
+        try expect(
+            audioInputPreferenceDidChange(saved: "real-yeti-nano", activeAtLastEngineStart: ""),
+            equals: true,
+            "switching from system default to a named device should count as a change"
+        )
+        try expect(
+            audioInputPreferenceDidChange(saved: "real-yeti-nano", activeAtLastEngineStart: "real-yeti-nano"),
+            equals: false,
+            "reselecting the already-active device should not count as a change"
+        )
+        try expect(
+            audioInputPreferenceDidChange(saved: "", activeAtLastEngineStart: "  "),
+            equals: false,
+            "empty and whitespace-only preferences should both normalize to system default"
+        )
+        try expect(
+            audioInputPreferenceDidChange(saved: "", activeAtLastEngineStart: pseudo.uid),
+            equals: false,
+            "a stale default-aggregate UID and an empty preference should both mean system default"
+        )
+        try expect(
+            audioInputPreferenceDidChange(saved: " Yeti Nano\n", activeAtLastEngineStart: "Yeti Nano"),
+            equals: false,
+            "untrimmed and trimmed spellings of the same device should not count as a change"
+        )
+        try expect(
+            audioInputPreferenceDidChange(saved: "real-yeti-nano", activeAtLastEngineStart: "other-device"),
+            equals: true,
+            "switching between two named devices should count as a change"
         )
     }
 
