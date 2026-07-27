@@ -19,6 +19,7 @@ let package = Package(
     ],
     products: [
         .executable(name: "Parakey", targets: ["Parakey"]),
+        .executable(name: "VulkanSpike", targets: ["VulkanSpike"]),
     ],
     dependencies: [],
     targets: [
@@ -91,6 +92,60 @@ let package = Package(
                 .linkedFramework("Metal"),
                 .linkedFramework("MetalKit"),
                 .linkedFramework("Foundation"),
+            ]
+        ),
+        // VulkanSpike — throwaway target for the intel-mac-vulkan-backend
+        // spike (see that branch's task description / commit messages).
+        // NOT wired into Parakey or whisper_cpp; safe to delete wholesale
+        // once the spike's findings are folded into a real implementation
+        // plan. Proves two things a full ggml-vulkan SwiftPM integration
+        // would need:
+        //   1. SPIR-V shaders can be compiled+embedded as a checked-in
+        //      C++ byte array at vendor time (scripts/spike-embed-spirv.sh
+        //      generates spirv_embed.h — analogous to
+        //      ggml-metal-embed.cpp for Metal), with no build-time glslc
+        //      dependency.
+        //   2. Vulkan (via MoltenVK) can be statically linked
+        //      (libMoltenVK.a) so the resulting binary does not depend on
+        //      Homebrew's libvulkan.1.dylib/ICD loader at runtime.
+        //
+        // Header/lib search paths below point at this dev machine's
+        // Homebrew Cellar (vulkan-headers, molten-vk) — that is a
+        // BUILD-TIME convenience only, matching how whisper_cpp's own
+        // Metal/Accelerate work already assumes a full Xcode/SDK dev
+        // environment. It does not create a runtime dependency: libMoltenVK
+        // is linked statically (see linkerSettings), not loaded from
+        // Homebrew's dylib at launch. A real implementation should vendor
+        // the small set of needed Vulkan headers under
+        // swift/Sources/whisper_cpp/include (same as ggml's own headers)
+        // instead of reaching into /usr/local/Cellar at build time.
+        .executableTarget(
+            name: "VulkanSpike",
+            cxxSettings: [
+                .unsafeFlags([
+                    "-I/usr/local/Cellar/vulkan-headers/1.4.350.1/include",
+                ]),
+            ],
+            linkerSettings: [
+                .linkedFramework("Metal"),
+                .linkedFramework("IOSurface"),
+                .linkedFramework("IOKit"),
+                .linkedFramework("AppKit"),
+                .linkedFramework("QuartzCore"),
+                .linkedFramework("Foundation"),
+                .linkedFramework("CoreFoundation"),
+                .linkedFramework("CoreGraphics"),
+                .linkedLibrary("objc"),
+                .linkedLibrary("c++"),
+                // Statically link MoltenVK itself (the actual Vulkan
+                // implementation) rather than -lMoltenVK/-lvulkan, which
+                // would resolve to Homebrew's dylibs and the Vulkan
+                // loader/ICD mechanism at runtime. Passing the .a path
+                // directly avoids any ambiguity between the .a and .dylib
+                // Homebrew installs side by side in the same lib dir.
+                .unsafeFlags([
+                    "/usr/local/Cellar/molten-vk/1.4.2/lib/libMoltenVK.a",
+                ]),
             ]
         ),
         .executableTarget(
