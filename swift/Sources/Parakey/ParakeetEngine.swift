@@ -1,11 +1,14 @@
 import Foundation
 import parakeet_cpp
 
-/// CPU-only in this phase (Phase 3 of the parakeet.cpp migration plan) —
-/// `.vulkan` exists so `ParakeetEngine.init` and the native bridge already
-/// have a stable shape for Phase 5, but requesting it today fails
-/// deterministically (`ParakeetEngineError.vulkanUnavailable`) rather than
-/// silently running on CPU while claiming GPU use.
+/// `.vulkan` requests parakeet.cpp's ggml Vulkan/MoltenVK backend (Phase 5).
+/// Requesting it does NOT guarantee it's what actually ends up running:
+/// `ParakeetEngine.init` calls `sd_parakeet_vulkan_available()` (a
+/// side-effect-free probe of ggml's own device registry) before even
+/// attempting a load, and `warmUp()` performs the mandatory post-init check
+/// (parakeet.cpp's own actual selected device name must start with
+/// "Vulkan") — either failing means `ParakeetEngineError.vulkanUnavailable`
+/// / `.vulkanFellBackToCPU`, never a silent CPU run reported as GPU success.
 enum ParakeetDevice: Sendable {
     case cpu
     case vulkan
@@ -22,6 +25,14 @@ enum ParakeetEngineError: LocalizedError {
     case modelNotFound(path: String)
     case modelLoadFailed(String)
     case vulkanUnavailable
+    /// Distinct from `.vulkanUnavailable` (no device registered at all):
+    /// this means a Vulkan device WAS enumerated and requested, but
+    /// parakeet.cpp's own post-init check (bridge `sd_parakeet_warm_up`)
+    /// found the actual selected backend was CPU anyway — upstream's own
+    /// silent-fallback behavior, turned into a hard typed error here per
+    /// the "never report Vulkan success merely because it was requested"
+    /// contract.
+    case vulkanFellBackToCPU(String)
     case warmUpFailed(String)
     case inferenceFailed(String)
     case invalidUTF8
@@ -37,6 +48,8 @@ enum ParakeetEngineError: LocalizedError {
             return "Failed to load Parakeet model: \(detail)"
         case .vulkanUnavailable:
             return "Vulkan GPU was not detected. Parakeet will use CPU."
+        case .vulkanFellBackToCPU(let detail):
+            return "Vulkan was requested but the native runtime silently selected CPU: \(detail)"
         case .warmUpFailed(let detail):
             return "Parakeet warm-up failed: \(detail)"
         case .inferenceFailed(let detail):
@@ -51,6 +64,21 @@ enum ParakeetEngineError: LocalizedError {
             return "Parakeet native bridge error \(code): \(message)"
         }
     }
+}
+
+/// Side-effect-free capability probe (spec §11.2): does ggml's OWN backend
+/// device registry currently enumerate a usable GPU/IGPU device? Safe to
+/// call before any model is loaded — does not construct parakeet.cpp's
+/// process-global compute backend, does not touch IOKit. Drives the
+/// settings checkbox's enabled/disabled state.
+func parakeetVulkanAvailable() -> Bool {
+    sd_parakeet_vulkan_available() != 0
+}
+
+/// Human-readable description of the first enumerated GPU/IGPU device
+/// (e.g. "AMD Radeon RX 6600 (MoltenVK)"), or "" if none is available.
+func parakeetVulkanDeviceDescription() -> String {
+    String(cString: sd_parakeet_vulkan_device_description())
 }
 
 /// Owns exactly one loaded parakeet.cpp context (`SDParakeetContext`, from
@@ -77,49 +105,75 @@ actor ParakeetEngine {
     // no other references to `self` left to race with it.
     private nonisolated(unsafe) var context: OpaquePointer?
     let device: ParakeetDevice
+    /// Actual selected device name from parakeet.cpp's own backend registry
+    /// (e.g. "cpu", "Vulkan0"), filled in by `warmUp()`. Empty until then.
+    private(set) var actualDeviceName: String = ""
 
     /// `threadCount` should already be resolved by the caller using the
     /// policy in docs/parakeet-intel-backend.md §10:
     /// `max(2, min(8, ProcessInfo.processInfo.activeProcessorCount / 2))`,
     /// with an optional `SUPERDICTATE_ASR_THREADS` override (validated to
     /// `1...32`) — see `TranscriptionWorker.resolvedParakeetThreadCount()`.
+    ///
+    /// A `.vulkan` request that succeeds here is NOT yet proven to actually
+    /// be running on Vulkan — parakeet.cpp's own compute backend is
+    /// constructed lazily on the first inference (see the bridge header's
+    /// doc comments), not at load time. `warmUp()` is what forces that
+    /// construction and performs the mandatory post-init device check;
+    /// callers MUST call `warmUp()` before treating a `.vulkan` engine as
+    /// usable.
     init(modelPath: String, device: ParakeetDevice = .cpu, threadCount: Int) throws {
-        // Device check BEFORE the file-existence check: Vulkan
-        // unavailability is a build/hardware-configuration fact independent
-        // of whether a particular model path happens to exist, and should
-        // be reported as such regardless of model path validity.
-        guard device == .cpu else {
-            // Vulkan is not vendored/compiled into the parakeet_cpp target
-            // this phase (see scripts/vendor-parakeet-cpp.sh and
-            // Package.swift — no PARAKEET_GGML_VULKAN sources yet). The
-            // native bridge itself would also refuse this
-            // (SD_PARAKEET_ERR_VULKAN_UNAVAILABLE), but failing here avoids
-            // even calling down for a mode that can never succeed today.
-            throw ParakeetEngineError.vulkanUnavailable
+        if device == .vulkan {
+            // Cheap, side-effect-free registry probe: fail fast (without
+            // even attempting a model load) if no Vulkan device is
+            // enumerated at all (CPU-only build, or no usable GPU on this
+            // machine). This mirrors the bridge's own early-out in
+            // sd_parakeet_create, kept here too so the error surfaces
+            // before any file-existence/model-load work.
+            guard parakeetVulkanAvailable() else {
+                throw ParakeetEngineError.vulkanUnavailable
+            }
         }
         guard FileManager.default.fileExists(atPath: modelPath) else {
             throw ParakeetEngineError.modelNotFound(path: modelPath)
         }
 
-        var options = SDParakeetOptions(device: SD_PARAKEET_DEVICE_CPU, num_threads: Int32(threadCount))
+        let nativeDevice: SDParakeetDevice = device == .vulkan ? SD_PARAKEET_DEVICE_VULKAN : SD_PARAKEET_DEVICE_CPU
+        var options = SDParakeetOptions(device: nativeDevice, num_threads: Int32(threadCount))
         var outContext: OpaquePointer?
         let status = withUnsafePointer(to: &options) { optionsPtr in
             modelPath.withCString { pathPtr in
                 sd_parakeet_create(pathPtr, optionsPtr, &outContext)
             }
         }
+        if status == SD_PARAKEET_ERR_VULKAN_UNAVAILABLE {
+            throw ParakeetEngineError.vulkanUnavailable
+        }
         guard status == SD_PARAKEET_OK, let created = outContext else {
             throw ParakeetEngineError.modelLoadFailed("bridge status \(status.rawValue)")
         }
         context = created
-        self.device = .cpu
+        self.device = device
     }
 
+    /// Forces one-time native initialization AND, for `.vulkan` engines,
+    /// performs the mandatory post-init device check (spec: never report
+    /// Vulkan success merely because it was requested). Throws
+    /// `.vulkanFellBackToCPU` — NOT a silent success — if parakeet.cpp's
+    /// actual selected backend turned out to be CPU despite Vulkan being
+    /// requested (upstream's own default fallback behavior). Callers MUST
+    /// treat that as a hard failure: destroy this engine and construct a
+    /// fresh `.cpu` one (see `TranscriptionWorker.load`).
     func warmUp() async throws {
         guard let context else {
             throw ParakeetEngineError.warmUpFailed("engine already shut down")
         }
         let status = sd_parakeet_warm_up(context)
+        actualDeviceName = String(cString: sd_parakeet_backend_device_name(context))
+        if status == SD_PARAKEET_ERR_VULKAN_UNAVAILABLE {
+            let message = String(cString: sd_parakeet_last_error_message(context))
+            throw ParakeetEngineError.vulkanFellBackToCPU(message)
+        }
         guard status == SD_PARAKEET_OK else {
             throw ParakeetEngineError.warmUpFailed("bridge status \(status.rawValue)")
         }
@@ -169,12 +223,15 @@ actor ParakeetEngine {
         )
     }
 
-    /// Actual runtime backend, for diagnostics/UI (spec §11.4). CPU-only in
-    /// this phase, so always `.cpu` — kept as a method (not just the stored
-    /// `device` property) so Phase 5 can make this reflect a real fallback
-    /// decision without changing the call sites.
-    nonisolated func backendDescription() -> String {
-        device == .cpu ? "CPU" : "Vulkan"
+    /// Actual runtime backend, for diagnostics/UI (spec §11.4). Reflects
+    /// `actualDeviceName` (set by `warmUp()`), not just the requested
+    /// `device` — an engine constructed with `device == .vulkan` whose
+    /// warm-up hasn't run yet (or that never got past construction) has no
+    /// actual device to report. Callers that need the exact GPU model name
+    /// for a status string like "Vulkan — AMD Radeon RX 6600" should pair
+    /// this with `parakeetVulkanDeviceDescription()`.
+    func backendDescription() -> String {
+        actualDeviceName.isEmpty ? (device == .cpu ? "CPU" : "unknown") : actualDeviceName
     }
 
     /// Deterministic shutdown — the normal path, called from

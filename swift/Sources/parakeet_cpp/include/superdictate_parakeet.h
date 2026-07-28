@@ -59,12 +59,22 @@ typedef struct {
     char *text;              // malloc'd UTF-8, owned by caller; NULL on failure
     double total_seconds;
     double inference_seconds; // native parakeet_capi_transcribe_pcm() wall time
-    int32_t used_gpu;         // always 0 in this phase (CPU-only)
+    int32_t used_gpu;         // 1 iff this context's actual selected backend is Vulkan
 } SDParakeetResult;
 
 // Loads a GGUF model once and returns an owning context, or NULL on failure
 // (see sd_parakeet_last_error_message for the reason). `options` may be NULL
 // to use CPU with the bridge's default thread policy.
+//
+// Device selection itself does not happen here — parakeet.cpp's own
+// pk::Backend is constructed lazily on the FIRST graph compute (not at
+// model load), driven by the process-global PARAKEET_DEVICE environment
+// variable (see upstream/backend.cpp). This function stashes the requested
+// device on the context and sets that environment variable so the backend
+// that gets lazily constructed during the next call (normally
+// sd_parakeet_warm_up) is the one requested. It does NOT by itself prove
+// Vulkan was actually selected — see sd_parakeet_warm_up, which forces
+// backend construction and performs the real post-init check.
 SDParakeetStatus sd_parakeet_create(
     const char *model_path,
     const SDParakeetOptions *options,
@@ -72,9 +82,23 @@ SDParakeetStatus sd_parakeet_create(
 );
 
 // Runs a short synthetic-silence inference to force one-time initialization
-// (thread pool spin-up, first-call allocator warm paths) before real
-// dictation. Never produces a transcript history item; an empty/near-empty
-// result is not an error.
+// (thread pool spin-up, first-call allocator warm paths, and — the first
+// time any context in this process performs an inference — construction of
+// parakeet.cpp's process-global compute backend) before real dictation.
+// Never produces a transcript history item; an empty/near-empty result is
+// not an error.
+//
+// If this context requested SD_PARAKEET_DEVICE_VULKAN, this call ALSO
+// performs the mandatory post-init device check (spec section on GPU
+// checkbox behavior / do not report Vulkan success merely because it was
+// requested): it inspects parakeet.cpp's actual selected compute device
+// name and, if it does not start with "Vulkan" (case-insensitive) —
+// i.e. upstream silently fell back to CPU, which is upstream's own default
+// behavior when a requested device isn't found — this call resets the
+// process-global backend (so a subsequent CPU context in the SAME process
+// can construct a fresh one) and returns SD_PARAKEET_ERR_VULKAN_UNAVAILABLE.
+// The context must be destroyed by the caller in that case; it is not
+// usable for CPU either (create a fresh CPU-device context instead).
 SDParakeetStatus sd_parakeet_warm_up(SDParakeetContext *context);
 
 // Transcribes mono Float32 PCM at `sample_rate` Hz (resampled internally by
@@ -100,8 +124,35 @@ void sd_parakeet_result_destroy(SDParakeetResult *result);
 void sd_parakeet_destroy(SDParakeetContext *context);
 
 // Actual selected backend/device, valid only after a successful
-// sd_parakeet_create. Diagnostic-only, not a promise of upstream behavior.
+// sd_parakeet_create + sd_parakeet_warm_up (before warm-up, this reflects
+// only the REQUESTED device, since parakeet.cpp's backend has not been
+// constructed yet — see sd_parakeet_create's doc comment). Diagnostic-only,
+// not a promise of upstream behavior.
 SDParakeetDevice sd_parakeet_backend_device(const SDParakeetContext *context);
+
+// Actual selected device name from parakeet.cpp's own backend registry
+// (e.g. "cpu", "Vulkan0"), valid only after a successful warm-up. Never
+// NULL (empty string "" before warm-up runs, or if context is NULL).
+// Human-readable device identity for spec 11.4-style runtime status
+// strings ("Vulkan — AMD Radeon RX 6600") — pair this with
+// sd_parakeet_vulkan_device_description() for the marketing/model name.
+const char *sd_parakeet_backend_device_name(const SDParakeetContext *context);
+
+// Capability probe: does ggml's OWN backend device registry (source of
+// truth per the "never infer from IOKit alone" rule) currently enumerate at
+// least one usable GPU/IGPU device? Side-effect-free relative to any model
+// load — safe to call before any context exists (e.g. to decide whether
+// the "Use GPU (Vulkan)" checkbox should be enabled), and does not
+// construct parakeet.cpp's process-global compute backend. Returns 1 if at
+// least one GGML_BACKEND_DEVICE_TYPE_GPU or _IGPU device is registered, 0
+// otherwise (including CPU-only builds, where the Vulkan backend was never
+// compiled in and therefore never registers any device).
+int32_t sd_parakeet_vulkan_available(void);
+
+// Human-readable name of the first enumerated GPU/IGPU device (e.g. "AMD
+// Radeon RX 6600 (MoltenVK)"), or "" if sd_parakeet_vulkan_available()
+// would return 0. Never NULL. Does not require a loaded context.
+const char *sd_parakeet_vulkan_device_description(void);
 
 // Last error message for `context`, or "" if none / context is NULL. Owned
 // by the context; valid until the next call on it or until

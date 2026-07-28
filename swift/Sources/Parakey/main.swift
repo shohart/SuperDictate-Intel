@@ -5633,6 +5633,105 @@ private struct CompletedTranscriptionWorkerResult: Sendable {
     let completedAt: TimeInterval
 }
 
+/// Runtime ASR backend status for diagnostics/UI (spec §11.4). Distinct
+/// from the *setting* (`Settings.shared.useGPU`) — this reflects what is
+/// ACTUALLY running right now.
+enum ParakeetRuntimeStatus: Sendable, Equatable {
+    case cpu
+    /// `deviceDescription` is e.g. "AMD Radeon RX 6600 (MoltenVK)".
+    case vulkan(deviceDescription: String)
+    /// GPU was requested and Vulkan init/warm-up (or a later mid-session
+    /// inference call) failed; this session has fallen back to CPU and will
+    /// not retry Vulkan again until the app restarts.
+    case cpuFallbackAfterVulkanError
+    /// GPU is enabled in the saved preference, but no engine has attempted
+    /// to load it yet in this session (e.g. before the first `load()`
+    /// call) — distinguishes "not yet tried" from an actual fallback.
+    case gpuRequestedNotYetLoaded
+
+    func localizedDescription(language: InterfaceLanguage) -> String {
+        switch self {
+        case .cpu:
+            return localizedText("CPU", "CPU", language: language)
+        case .vulkan(let deviceDescription):
+            return "Vulkan — \(deviceDescription)"
+        case .cpuFallbackAfterVulkanError:
+            return localizedText(
+                "CPU (переключено после ошибки Vulkan)",
+                "CPU fallback after Vulkan error",
+                language: language
+            )
+        case .gpuRequestedNotYetLoaded:
+            return localizedText(
+                "GPU включён в настройках, но используется CPU",
+                "GPU requested, CPU fallback active",
+                language: language
+            )
+        }
+    }
+}
+
+/// Thin `TaskGroup`-based timeout wrapper (spec §11.3: warm-up must
+/// complete within "a defined timeout"). Races `operation` against a sleep
+/// of `seconds`; whichever finishes first wins and the loser is cancelled.
+/// `operation` is expected to be cooperatively cancellable (parakeet.cpp's
+/// bridge calls are synchronous C calls with no internal cancellation
+/// point, so in practice a timeout here means "stop waiting on this Task",
+/// not "abort the native call mid-flight" — the underlying native
+/// transcribe/warm-up call still runs to completion on its own thread; this
+/// is still useful because it bounds how long `TranscriptionWorker.load()`
+/// blocks app startup on a hung driver).
+struct TimedOutError: LocalizedError {
+    var errorDescription: String? { "Operation timed out" }
+}
+
+func withTimeout<T: Sendable>(seconds: TimeInterval, operation: @Sendable @escaping () async throws -> T) async throws -> T {
+    try await withThrowingTaskGroup(of: T.self) { group in
+        group.addTask { try await operation() }
+        group.addTask {
+            try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            throw TimedOutError()
+        }
+        defer { group.cancelAll() }
+        let result = try await group.next()!
+        return result
+    }
+}
+
+/// Thread-safe cache of the last-known ASR runtime status, so synchronous
+/// UI code (menu construction, which cannot `await` across the
+/// `TranscriptionWorker` actor without restructuring the whole menu-build
+/// path) can read a recent snapshot. `TranscriptionWorker` pushes every
+/// `runtimeStatus` change here; this is a diagnostic mirror, never the
+/// source of truth (that's always `TranscriptionWorker.runtimeStatus`
+/// itself, read via `await` wherever an async context is already available,
+/// e.g. `diagnosticsText()`).
+final class ParakeetRuntimeStatusCache: @unchecked Sendable {
+    static let shared = ParakeetRuntimeStatusCache()
+    private let lock = NSLock()
+    private var status: ParakeetRuntimeStatus = .gpuRequestedNotYetLoaded
+
+    func update(_ newStatus: ParakeetRuntimeStatus) {
+        lock.lock()
+        status = newStatus
+        lock.unlock()
+    }
+
+    func current() -> ParakeetRuntimeStatus {
+        lock.lock()
+        defer { lock.unlock() }
+        return status
+    }
+}
+
+/// Synchronous convenience for menu construction: the last-known ASR
+/// backend status, localized. Falls back to
+/// `.gpuRequestedNotYetLoaded`/`.cpu`-equivalent wording before the first
+/// `TranscriptionWorker.load()` call has completed.
+func lastKnownParakeetRuntimeStatusDescription(language: InterfaceLanguage) -> String {
+    ParakeetRuntimeStatusCache.shared.current().localizedDescription(language: language)
+}
+
 actor TranscriptionWorker {
     private var engine: ParakeetEngine?
     private var loadedProfile: SpeechModelProfile?
@@ -5641,6 +5740,27 @@ actor TranscriptionWorker {
     /// Reentrancy backstop — see the comment above. True for the full
     /// duration of transcribe(), including across its await.
     private var inFlight = false
+
+    /// Current actual runtime backend (spec §11.4) — distinct from the
+    /// saved `Settings.shared.useGPU` preference. Updated by `load()` and by
+    /// the mid-session Vulkan-inference-failure fallback in `transcribe()`.
+    /// Every change is mirrored into `ParakeetRuntimeStatusCache` for
+    /// synchronous UI reads (see that type's doc comment).
+    private(set) var runtimeStatus: ParakeetRuntimeStatus = .cpu {
+        didSet { ParakeetRuntimeStatusCache.shared.update(runtimeStatus) }
+    }
+
+    /// Set once per app session the first time a Vulkan attempt fails
+    /// (init/warm-up OR a later mid-session inference call) while GPU is
+    /// enabled in Settings. Per spec §9.3: never retry Vulkan again within
+    /// the same session once this is set, regardless of how many more
+    /// times `load()` is called (e.g. after a settings change unrelated to
+    /// GPU) — only a full app restart may attempt Vulkan again. Reset only
+    /// by `unload()` immediately followed by process exit; NOT reset by a
+    /// normal `load()` call, and never mutates the persisted
+    /// `Settings.shared.useGPU` preference.
+    private var vulkanFailedThisSession = false
+    private var vulkanFailureReason: String?
 
     /// Default thread policy from docs/parakeet-intel-backend.md §10:
     /// `max(2, min(8, activeProcessorCount / 2))`, with an optional
@@ -5664,15 +5784,17 @@ actor TranscriptionWorker {
         if requestedProfile != profile {
             log("ASR: ignoring unsupported speech model \(requestedProfile.shortName); using \(profile.shortName)")
         }
-        // GPU (Vulkan) is not implemented yet (Phase 5 of the parakeet.cpp
-        // migration plan) — always load CPU this phase, but still read the
-        // preference so a user who has it enabled sees an honest log note
-        // instead of a silently-ignored setting.
+        // spec §9.1 loading algorithm: read the GPU preference, and only
+        // actually attempt Vulkan if (a) it's enabled AND (b) Vulkan hasn't
+        // already failed once this session (§9.3 — never retry Vulkan again
+        // within the same session; only a full app restart may attempt it
+        // again, since the persisted preference is never auto-mutated).
         let requestedGPU = Settings.shared.useGPU
-        if requestedGPU {
-            log("ASR: Use GPU (Vulkan) is enabled in Settings, but Vulkan is not yet implemented in this build — using Parakeet CPU")
+        let attemptVulkan = requestedGPU && !vulkanFailedThisSession
+        if requestedGPU && vulkanFailedThisSession {
+            log("ASR: Use GPU (Vulkan) is enabled in Settings, but Vulkan already failed once this session (\(vulkanFailureReason ?? "unknown reason")) — staying on CPU for the rest of this session")
         }
-        let useGPU = false
+        let useGPU = attemptVulkan
         if ready, engine != nil, loadedProfile == profile, loadedUseGPU == useGPU {
             log("ASR: \(profile.shortName) already ready")
             return
@@ -5688,33 +5810,77 @@ actor TranscriptionWorker {
             log("ASR: downloading + verifying + loading \(profile.shortName) weights…")
         }
         let t0 = Date()
-        engine = try await loadParakeetEngine(progressHandler: progressHandler)
+        let loaded = try await loadParakeetEngine(attemptVulkan: attemptVulkan, progressHandler: progressHandler)
+        engine = loaded.engine
         loadedProfile = profile
         loadedUseGPU = useGPU
+        runtimeStatus = loaded.status
         ready = true
         log("ASR: \(profile.shortName) ready in \(String(format: "%.2f", Date().timeIntervalSince(t0))) s")
         log("ASR model: Parakeet TDT 0.6B v3 \(PARAKEET_MODEL_QUANTIZATION)")
         log("ASR runtime: parakeet.cpp \(parakeetRuntimeVersion())")
         log("ASR device requested: \(requestedGPU ? "Vulkan" : "CPU")")
-        log("ASR device selected: CPU")
+        let loadedDeviceIsVulkan = await loaded.engine.device == .vulkan
+        log("ASR device selected: \(loadedDeviceIsVulkan ? "Vulkan" : "CPU")\(loaded.status == .cpuFallbackAfterVulkanError ? " (fallback after Vulkan error)" : "")")
         // Best-effort legacy cleanup, only after Parakeet has itself
         // succeeded (spec §4.3/§4.4) — never blocks readiness on failure.
         removeLegacyWhisperModelFileIfPresent()
     }
 
-    private func loadParakeetEngine(progressHandler: SpeechModelDownloadProgressHandler?) async throws -> ParakeetEngine {
+    private func loadParakeetEngine(
+        attemptVulkan: Bool,
+        progressHandler: SpeechModelDownloadProgressHandler?
+    ) async throws -> (engine: ParakeetEngine, status: ParakeetRuntimeStatus) {
         if !speechModelCacheExists(for: .parakeetTDTv3) {
             try assertSufficientDiskSpaceForSpeechModelDownload(profile: .parakeetTDTv3)
         }
         let modelPath = try await downloadParakeetModelIfNeeded()
         let threadCount = Self.resolvedParakeetThreadCount()
         log("ASR threads: \(threadCount)")
-        let engine = try ParakeetEngine(modelPath: modelPath.path, device: .cpu, threadCount: threadCount)
+
+        if attemptVulkan {
+            do {
+                let vulkanEngine = try ParakeetEngine(modelPath: modelPath.path, device: .vulkan, threadCount: threadCount)
+                // Warm-up with a defined timeout (spec §11.3: warm-up must
+                // complete within "a defined timeout" — no numeric value is
+                // specified upstream; 30s is chosen here as generous
+                // relative to the measured ~1.2s cold Vulkan/MoltenVK
+                // pipeline-compile cost from the Phase 5 pre-spike, while
+                // still bounding a genuinely hung/broken driver rather than
+                // blocking app startup indefinitely).
+                let warmUpStartedAt = ProcessInfo.processInfo.systemUptime
+                try await withTimeout(seconds: 30) {
+                    try await vulkanEngine.warmUp()
+                }
+                let warmUpSeconds = ProcessInfo.processInfo.systemUptime - warmUpStartedAt
+                log("ASR warm-up (Vulkan): \(String(format: "%.2f", warmUpSeconds)) s")
+                let deviceDescription = parakeetVulkanDeviceDescription()
+                log("ASR device: Vulkan — \(deviceDescription.isEmpty ? await vulkanEngine.backendDescription() : deviceDescription)")
+                return (vulkanEngine, .vulkan(deviceDescription: deviceDescription.isEmpty ? await vulkanEngine.backendDescription() : deviceDescription))
+            } catch {
+                // Any failure — init, capability probe, warm-up timeout, or
+                // the post-init "actually selected CPU" check — destroys
+                // the partial Vulkan attempt and falls back to a fresh CPU
+                // engine. Never retried again this session (spec §9.3).
+                log("ASR: Vulkan init/warm-up failed (\(error.localizedDescription)) — falling back to Parakeet CPU for the rest of this session")
+                vulkanFailedThisSession = true
+                vulkanFailureReason = error.localizedDescription
+            }
+        }
+
+        let cpuEngine = try ParakeetEngine(modelPath: modelPath.path, device: .cpu, threadCount: threadCount)
         let warmUpStartedAt = ProcessInfo.processInfo.systemUptime
-        try await engine.warmUp()
+        try await cpuEngine.warmUp()
         let warmUpSeconds = ProcessInfo.processInfo.systemUptime - warmUpStartedAt
-        log("ASR warm-up: \(String(format: "%.2f", warmUpSeconds)) s")
-        return engine
+        log("ASR warm-up (CPU): \(String(format: "%.2f", warmUpSeconds)) s")
+        return (cpuEngine, requestedGPUButFellBackStatus(attemptedVulkan: attemptVulkan))
+    }
+
+    /// `.cpuFallbackAfterVulkanError` iff this CPU load happened AFTER a
+    /// Vulkan attempt just failed in the same call; plain `.cpu` if GPU was
+    /// never requested at all this session.
+    private func requestedGPUButFellBackStatus(attemptedVulkan: Bool) -> ParakeetRuntimeStatus {
+        attemptedVulkan ? .cpuFallbackAfterVulkanError : .cpu
     }
 
     fileprivate func transcribe(samples: [Float],
@@ -5749,7 +5915,45 @@ actor TranscriptionWorker {
         }
 
         let engineCallStartedAt = ProcessInfo.processInfo.systemUptime
-        let result = try await engine.transcribe(samples: samples)
+        let isVulkanEngine = await engine.device == .vulkan
+        let result: ParakeetTranscriptionResult
+        do {
+            result = try await engine.transcribe(samples: samples)
+        } catch where isVulkanEngine {
+            // spec §9.3: a Vulkan engine that initialized fine but fails
+            // DURING a real transcription — retain the captured PCM
+            // (`samples`, already in hand), destroy the Vulkan engine,
+            // create a fresh CPU engine, warm it up, and retry THIS SAME
+            // dictation exactly once on CPU. Never retry Vulkan again this
+            // session; never fall back to Whisper (removed); never mutate
+            // the persisted `useGPU` preference.
+            log("ASR: Vulkan inference failed mid-session (\(error.localizedDescription)) — falling back to CPU and retrying this dictation once")
+            vulkanFailedThisSession = true
+            vulkanFailureReason = error.localizedDescription
+            await engine.shutdown()
+            let threadCount = Self.resolvedParakeetThreadCount()
+            let cpuEngine: ParakeetEngine
+            do {
+                guard let modelPath = try? await downloadParakeetModelIfNeeded() else {
+                    throw ParakeetEngineError.inferenceFailed("model path unavailable during mid-session CPU fallback")
+                }
+                cpuEngine = try ParakeetEngine(modelPath: modelPath.path, device: .cpu, threadCount: threadCount)
+                try await cpuEngine.warmUp()
+            } catch {
+                // The engine is now unusable and no CPU replacement could
+                // be constructed either — leave `self.engine` nil so the
+                // next `load()` call rebuilds from scratch, and surface the
+                // ORIGINAL Vulkan failure (more informative than the
+                // fallback-construction failure) to the caller.
+                self.engine = nil
+                ready = false
+                throw error
+            }
+            self.engine = cpuEngine
+            loadedUseGPU = false
+            runtimeStatus = .cpuFallbackAfterVulkanError
+            result = try await cpuEngine.transcribe(samples: samples)
+        }
         let engineCallCompletedAt = ProcessInfo.processInfo.systemUptime
         return TranscriptionWorkerResult(
             text: result.text,
@@ -13669,6 +13873,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 "Hotkey: \(hotkey.hotkey.name)",
                 "Trigger mode: \(TRIGGER_DISPLAY[settings.triggerMode] ?? settings.triggerMode.rawValue)",
                 "Speech model: \(speechModelProfile.displayName)",
+                "ASR backend: \(lastKnownParakeetRuntimeStatusDescription(language: .english)) (GPU setting: \(settings.useGPU))",
                 "Language: \(languageSettingText)",
                 "Paste behavior: \(PASTE_SUFFIX_DISPLAY[settings.pasteSuffix] ?? settings.pasteSuffix.rawValue)",
                 "Remove filler words: \(settings.removeFillerWords)",
@@ -14173,13 +14378,44 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         dock.state = settings.showInDock ? .on : .off
         sub.addItem(dock)
 
-        let useGPU = NSMenuItem(title: "Use GPU (Vulkan) — experimental",
-                                action: #selector(toggleUseGPU(_:)),
-                                keyEquivalent: "")
+        let gpuLanguage = settings.interfaceLanguage
+        let vulkanAvailable = parakeetVulkanAvailable()
+        let useGPU = NSMenuItem(
+            title: localizedText("Использовать GPU (Vulkan)", "Use GPU (Vulkan)", language: gpuLanguage),
+            action: #selector(toggleUseGPU(_:)),
+            keyEquivalent: ""
+        )
         useGPU.target = self
         useGPU.state = settings.useGPU ? .on : .off
-        useGPU.toolTip = "Runs Parakeet's Vulkan backend instead of CPU. Opt-in; reloads the speech model. Not yet implemented in this build — Parakeet falls back to CPU with a log note when this is enabled."
+        if vulkanAvailable {
+            useGPU.isEnabled = true
+            let deviceDescription = parakeetVulkanDeviceDescription()
+            useGPU.toolTip = localizedText(
+                "Запускает Vulkan-бэкенд Parakeet вместо CPU (обнаружено: \(deviceDescription)). Требует перезагрузки речевой модели.",
+                "Runs Parakeet's Vulkan backend instead of CPU (detected: \(deviceDescription)). Reloads the speech model.",
+                language: gpuLanguage
+            )
+        } else {
+            // spec §11.2: disable with a clear explanation when no Vulkan
+            // device is enumerated, rather than letting the user enable a
+            // setting that can never take effect on this machine.
+            useGPU.isEnabled = false
+            useGPU.state = .off
+            useGPU.toolTip = localizedText(
+                "Vulkan GPU не обнаружен. Parakeet будет использовать CPU.",
+                "Vulkan GPU was not detected. Parakeet will use CPU.",
+                language: gpuLanguage
+            )
+        }
         sub.addItem(useGPU)
+
+        let asrStatus = NSMenuItem(
+            title: localizedText("ASR-бэкенд: ", "ASR backend: ", language: gpuLanguage) + lastKnownParakeetRuntimeStatusDescription(language: gpuLanguage),
+            action: nil,
+            keyEquivalent: ""
+        )
+        asrStatus.isEnabled = false
+        sub.addItem(asrStatus)
 
         parent.submenu = sub
         return parent
@@ -16374,6 +16610,8 @@ private enum ParakeySelfTest {
             return runSuite("parakeet-cpu", testParakeetCPUIntegration)
         case "parakeet-text-repair":
             return runSuite("parakeet-text-repair", testParakeetTranscriptRepair)
+        case "parakeet-vulkan":
+            return runSuite("parakeet-vulkan", testParakeetVulkanIntegration)
         case "all":
             return runSuite("all", testAll)
         default:
@@ -19857,21 +20095,44 @@ private enum ParakeySelfTest {
         try expect(threwModelNotFound, equals: true,
                    "ParakeetEngine should reject a nonexistent model path with .modelNotFound")
 
-        // Requesting Vulkan must fail deterministically this phase (not
-        // vendored/compiled in yet) rather than silently falling back to
-        // CPU while claiming GPU — see ParakeetEngine.init's guard.
-        var threwVulkanUnavailable = false
-        do {
-            _ = try ParakeetEngine(
-                modelPath: "/nonexistent/path/to/model-\(UUID().uuidString).gguf",
-                device: .vulkan,
-                threadCount: 4
-            )
-        } catch ParakeetEngineError.vulkanUnavailable {
-            threwVulkanUnavailable = true
+        // Requesting Vulkan on a nonexistent model path must fail
+        // deterministically and honestly: with NO Vulkan device enumerated
+        // (CPU-only build, or a Vulkan-capable build on hardware with no
+        // usable GPU), ParakeetEngine.init's cheap registry probe rejects
+        // it with .vulkanUnavailable BEFORE even checking the model path —
+        // never silently falls back to CPU while claiming GPU. On a build
+        // where a Vulkan device IS enumerated (e.g. this fork's real Mac
+        // build against the RX 6600), the probe passes and the SAME
+        // nonexistent-path guard used above applies instead (.modelNotFound)
+        // — the point of this assertion either way is "never silently
+        // succeeds/claims GPU for a model path that doesn't exist."
+        if parakeetVulkanAvailable() {
+            var threwModelNotFoundForVulkan = false
+            do {
+                _ = try ParakeetEngine(
+                    modelPath: "/nonexistent/path/to/model-\(UUID().uuidString).gguf",
+                    device: .vulkan,
+                    threadCount: 4
+                )
+            } catch ParakeetEngineError.modelNotFound {
+                threwModelNotFoundForVulkan = true
+            }
+            try expect(threwModelNotFoundForVulkan, equals: true,
+                       "a Vulkan-capable build should still reject a nonexistent model path deterministically")
+        } else {
+            var threwVulkanUnavailable = false
+            do {
+                _ = try ParakeetEngine(
+                    modelPath: "/nonexistent/path/to/model-\(UUID().uuidString).gguf",
+                    device: .vulkan,
+                    threadCount: 4
+                )
+            } catch ParakeetEngineError.vulkanUnavailable {
+                threwVulkanUnavailable = true
+            }
+            try expect(threwVulkanUnavailable, equals: true,
+                       "requesting Vulkan with no device enumerated should fail deterministically, not silently fall back to CPU")
         }
-        try expect(threwVulkanUnavailable, equals: true,
-                   "requesting Vulkan should fail deterministically, not silently fall back to CPU")
 
         // parakeet.cpp's own version string is a native call that needs no
         // loaded model — exercises the bridge/native link itself.
@@ -19979,6 +20240,84 @@ private enum ParakeySelfTest {
         let recreated = try ParakeetEngine(modelPath: modelPath, device: .cpu, threadCount: threadCount)
         try runParakeetEngineSynchronously { try await recreated.warmUp() }
         try runParakeetEngineSynchronously { await recreated.shutdown() }
+    }
+
+    // MARK: - Parakeet Vulkan integration (spec §18.3 — real GPU, opt-in via
+    // env vars; skipped, not failed, when the hardware/model isn't present)
+
+    /// Skipped (not failed) unless BOTH `SUPERDICTATE_TEST_VULKAN=1` and
+    /// `SUPERDICTATE_PARAKEET_MODEL` (an existing GGUF path) are set — spec
+    /// §18.3's "if the environment variable or device is absent, mark the
+    /// integration test skipped, not passed." Real hardware verification
+    /// (device selection, forced-failure fallback, VRAM use) is covered by
+    /// the Phase 5 integration report's manual runs on the actual RX 6600;
+    /// this self-test is the re-runnable regression check for CI/dev boxes
+    /// that DO have Vulkan + the model staged.
+    private static func testParakeetVulkanIntegration() throws {
+        guard ProcessInfo.processInfo.environment["SUPERDICTATE_TEST_VULKAN"] == "1" else {
+            print("SKIP parakeet-vulkan: SUPERDICTATE_TEST_VULKAN=1 not set")
+            return
+        }
+        guard let modelPath = ProcessInfo.processInfo.environment["SUPERDICTATE_PARAKEET_MODEL"],
+              FileManager.default.fileExists(atPath: modelPath) else {
+            print("SKIP parakeet-vulkan: SUPERDICTATE_PARAKEET_MODEL not set to an existing file")
+            return
+        }
+        guard parakeetVulkanAvailable() else {
+            print("SKIP parakeet-vulkan: no Vulkan device enumerated by ggml's backend registry on this machine")
+            return
+        }
+
+        let threadCount = TranscriptionWorker.resolvedParakeetThreadCount()
+        let loadStarted = ProcessInfo.processInfo.systemUptime
+        let engine = try ParakeetEngine(modelPath: modelPath, device: .vulkan, threadCount: threadCount)
+        let loadSeconds = ProcessInfo.processInfo.systemUptime - loadStarted
+
+        // warmUp() is what forces parakeet.cpp's process-global backend
+        // construction and performs the mandatory post-init device check
+        // (see ParakeetEngine.warmUp's doc comment) — a build/environment
+        // where Vulkan silently fell back to CPU must surface here as
+        // .vulkanFellBackToCPU, not a quiet pass.
+        try runParakeetEngineSynchronously { try await engine.warmUp() }
+        let actualDevice = try runParakeetEngineSynchronously { await engine.backendDescription() }
+        try expect(
+            actualDevice.lowercased().hasPrefix("vulkan"),
+            equals: true,
+            "a Vulkan-requested engine must report an actual selected device name starting with \"Vulkan\" after warm-up, got \"\(actualDevice)\""
+        )
+
+        let sampleCount = Int(SAMPLE_RATE * 0.5)
+        let samples = [Float](repeating: 0.0001, count: sampleCount)
+        let inferStarted = ProcessInfo.processInfo.systemUptime
+        let result = try runParakeetEngineSynchronously { try await engine.transcribe(samples: samples) }
+        let inferSeconds = ProcessInfo.processInfo.systemUptime - inferStarted
+        let rtf = inferSeconds / max(0.001, Double(sampleCount) / SAMPLE_RATE)
+        print("PARAKEET VULKAN: load \(String(format: "%.2f", loadSeconds))s, device \(actualDevice), threads \(threadCount), infer \(String(format: "%.3f", inferSeconds))s, RTF \(String(format: "%.3f", rtf)), text=\"\(result.text)\"")
+
+        try runParakeetEngineSynchronously { await engine.shutdown() }
+
+        // Forced-failure fallback check: SD_PARAKEET_TEST_FORCE_DEVICE_NAME
+        // is a test-only bridge hook (see sd_parakeet_create) that requests
+        // a device name guaranteed not to exist, reproducing exactly the
+        // upstream silent-CPU-fallback behavior the Phase 5 pre-spike found
+        // (backend.cpp logs "not found; falling back to CPU" and continues
+        // successfully) — confirms the bridge's post-init check catches it
+        // rather than reporting Vulkan success. Restores the environment
+        // afterward so it doesn't leak into any later test/engine
+        // construction in this process.
+        setenv("SD_PARAKEET_TEST_FORCE_DEVICE_NAME", "Vulkan9-does-not-exist", 1)
+        var threwFellBackToCPU = false
+        do {
+            let bogus = try ParakeetEngine(modelPath: modelPath, device: .vulkan, threadCount: threadCount)
+            try runParakeetEngineSynchronously { try await bogus.warmUp() }
+        } catch ParakeetEngineError.vulkanFellBackToCPU {
+            threwFellBackToCPU = true
+        }
+        unsetenv("SD_PARAKEET_TEST_FORCE_DEVICE_NAME")
+        try expect(
+            threwFellBackToCPU, equals: true,
+            "a bogus forced device name (upstream falls back to CPU silently) must surface as .vulkanFellBackToCPU, never a silent success"
+        )
     }
 
     private static func testAudioRouteChangeDecision() throws {

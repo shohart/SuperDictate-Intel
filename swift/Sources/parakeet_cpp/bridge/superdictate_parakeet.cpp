@@ -9,10 +9,26 @@
 #include "superdictate_parakeet.h"
 #include "parakeet_capi.h"
 #include "parakeet.h"
-#include "ggml_graph.hpp" // pk::set_num_threads — process-global thread override,
-                           // same mechanism examples/cli uses (see PROVENANCE.md).
+#include "ggml_graph.hpp" // pk::set_num_threads, pk::global_backend(),
+                           // pk::shutdown_backend() — process-global backend
+                           // lifecycle. global_backend() is a lazily-created
+                           // singleton (see ggml_graph.cpp): it is constructed
+                           // on the FIRST graph compute performed by ANY
+                           // context in this process, honoring whatever
+                           // PARAKEET_DEVICE was set at that moment, and stays
+                           // alive until shutdown_backend() resets it — after
+                           // which a later compute recreates it fresh from
+                           // the then-current PARAKEET_DEVICE. This is what
+                           // makes an in-process CPU fallback after a failed
+                           // Vulkan attempt possible (see sd_parakeet_warm_up
+                           // below): reset, flip the env var, let the next
+                           // context's first compute rebuild CPU-only.
+#include "backend.hpp"    // pk::Backend::device_name()
+#include "ggml.h"          // ggml_backend_dev_* registry (capability probe)
+#include "ggml-backend.h"
 
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <cstdint>
@@ -23,10 +39,30 @@
 
 struct SDParakeetContext {
     parakeet_ctx *native = nullptr;
-    SDParakeetDevice device = SD_PARAKEET_DEVICE_CPU;
+    SDParakeetDevice device = SD_PARAKEET_DEVICE_CPU; // requested
+    std::string device_name; // actual, filled in by warm-up; "" until then
     std::atomic<bool> busy{false};
     std::string last_error;
 };
+
+namespace {
+
+// Case-insensitive "does `name` start with `prefix`" — used to recognize any
+// Vulkan registry device name ("Vulkan0", "Vulkan1", ...) without hardcoding
+// a single-GPU assumption.
+bool startsWithCaseInsensitive(const std::string &name, const char *prefix) {
+    size_t n = std::strlen(prefix);
+    if (name.size() < n) return false;
+    for (size_t i = 0; i < n; ++i) {
+        if (std::tolower(static_cast<unsigned char>(name[i])) !=
+            std::tolower(static_cast<unsigned char>(prefix[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
 
 namespace {
 
@@ -64,19 +100,40 @@ extern "C" SDParakeetStatus sd_parakeet_create(
     if (!model_path) return SD_PARAKEET_ERR_NULL_ARGUMENT;
 
     SDParakeetDevice device = options ? options->device : SD_PARAKEET_DEVICE_CPU;
-    if (device == SD_PARAKEET_DEVICE_VULKAN) {
-        // Vulkan is not vendored/compiled in this phase (see
-        // scripts/vendor-parakeet-cpp.sh's header comment and Package.swift —
-        // no PARAKEET_GGML_VULKAN sources are part of this target yet).
-        // Fail fast and explicitly rather than silently running on CPU while
-        // claiming Vulkan, per the "never report Vulkan success merely
-        // because the caller asked" bridge requirement.
+    if (device == SD_PARAKEET_DEVICE_VULKAN && sd_parakeet_vulkan_available() == 0) {
+        // No Vulkan device is registered at all (CPU-only build, or a build
+        // with the Vulkan backend compiled in but no usable device on this
+        // machine) — fail fast via the cheap, side-effect-free registry
+        // probe rather than paying for a full model load + warm-up compute
+        // just to discover the same thing later.
         return SD_PARAKEET_ERR_VULKAN_UNAVAILABLE;
     }
 
     try {
         int32_t threads = clampThreadCount(options ? options->num_threads : 0);
         pk::set_num_threads(threads);
+
+        // parakeet.cpp's process-global compute backend (pk::global_backend())
+        // is constructed lazily on the FIRST graph compute performed by any
+        // context in this process (see the ggml_graph.hpp include comment
+        // above), driven entirely by the PARAKEET_DEVICE environment
+        // variable at that moment. Set it now so whichever context performs
+        // that first compute (normally this context's own warm-up, called
+        // immediately after create) requests the right device. This does
+        // NOT by itself prove the device was actually selected — that is
+        // sd_parakeet_warm_up's job.
+        // Test-only override: lets a self-test deterministically exercise
+        // the "requested device name not found -> upstream silently falls
+        // back to CPU -> this bridge must turn that into a hard error"
+        // path (see sd_parakeet_warm_up's post-init check) without needing
+        // real hardware failure. Never used by any normal (non-test) call
+        // site — production always requests "Vulkan0"/"cpu".
+        const char *forced_name = std::getenv("SD_PARAKEET_TEST_FORCE_DEVICE_NAME");
+        const char *device_name_to_request =
+            device == SD_PARAKEET_DEVICE_VULKAN
+                ? (forced_name && forced_name[0] != '\0' ? forced_name : "Vulkan0")
+                : "cpu";
+        setenv("PARAKEET_DEVICE", device_name_to_request, 1);
 
         parakeet_ctx *native = parakeet_capi_load(model_path);
         if (!native) {
@@ -89,7 +146,7 @@ extern "C" SDParakeetStatus sd_parakeet_create(
             return SD_PARAKEET_ERR_NATIVE_EXCEPTION;
         }
         ctx->native = native;
-        ctx->device = SD_PARAKEET_DEVICE_CPU;
+        ctx->device = device;
         *out_context = ctx;
         return SD_PARAKEET_OK;
     } catch (...) {
@@ -109,10 +166,12 @@ extern "C" SDParakeetStatus sd_parakeet_warm_up(SDParakeetContext *context) {
     try {
         // A short (0.5s) synthetic silence buffer at 16 kHz — enough to
         // exercise the real mel front end + encoder + decoder graph paths
-        // once (forcing allocator/thread-pool warm paths) without a real
-        // recording. An empty/near-empty transcript is expected and NOT an
-        // error (spec §11.3): parakeet.cpp legitimately returns "" for
-        // silence.
+        // once (forcing allocator/thread-pool warm paths, and — critically
+        // — the process-global pk::Backend's construction, which is what
+        // actually reads PARAKEET_DEVICE and does device selection; see
+        // backend.cpp) without a real recording. An empty/near-empty
+        // transcript is expected and NOT an error (spec §11.3):
+        // parakeet.cpp legitimately returns "" for silence.
         std::vector<float> silence(8000, 0.0f);
         char *text = parakeet_capi_transcribe_pcm(
             context->native, silence.data(),
@@ -123,6 +182,45 @@ extern "C" SDParakeetStatus sd_parakeet_warm_up(SDParakeetContext *context) {
             status = SD_PARAKEET_ERR_INFERENCE_FAILED;
         } else {
             parakeet_capi_free_string(text);
+        }
+
+        if (status == SD_PARAKEET_OK) {
+            // Post-init device check. pk::global_backend() is now guaranteed
+            // constructed (the compute above forced it). Record the actual
+            // selected device name regardless of what was requested — it is
+            // always useful diagnostics.
+            context->device_name = pk::global_backend().device_name();
+
+            if (context->device == SD_PARAKEET_DEVICE_VULKAN &&
+                !startsWithCaseInsensitive(context->device_name, "Vulkan")) {
+                // Upstream's own default behavior (backend.cpp,
+                // Backend::Backend()) is to log
+                // "PARAKEET_DEVICE=... not found; falling back to CPU" and
+                // then continue with a successful-looking CPU init — no
+                // error return, nothing a caller not watching stderr would
+                // ever see. That is the opposite of this bridge's contract
+                // ("must fail initialization if the actual selected backend
+                // is CPU-only when Vulkan was requested — never report
+                // Vulkan success merely because the user asked for it").
+                // Turn it into a hard, typed error here instead of trusting
+                // upstream's silent fallback.
+                context->last_error =
+                    "Vulkan was requested but the actual selected backend is '" +
+                    context->device_name +
+                    "' (CPU fallback) — parakeet.cpp's own device selection "
+                    "silently fell back; treating this as a Vulkan "
+                    "initialization failure per this bridge's device-safety "
+                    "contract";
+                status = SD_PARAKEET_ERR_VULKAN_UNAVAILABLE;
+
+                // Reset the process-global backend so a FRESH context
+                // created afterward (with PARAKEET_DEVICE=cpu) gets a clean
+                // CPU-only construction rather than reusing whatever partial
+                // state this failed attempt left behind. Safe / intended
+                // per ggml_graph.hpp's own doc comment: "a later
+                // global_backend() call recreates it."
+                pk::shutdown_backend();
+            }
         }
     } catch (...) {
         context->last_error = "native exception during warm-up";
@@ -191,7 +289,8 @@ extern "C" SDParakeetStatus sd_parakeet_transcribe(
             } else {
                 out_result->total_seconds = seconds;
                 out_result->inference_seconds = seconds;
-                out_result->used_gpu = 0;
+                out_result->used_gpu =
+                    startsWithCaseInsensitive(context->device_name, "Vulkan") ? 1 : 0;
             }
         }
     } catch (...) {
@@ -222,6 +321,57 @@ extern "C" void sd_parakeet_destroy(SDParakeetContext *context) {
 extern "C" SDParakeetDevice sd_parakeet_backend_device(const SDParakeetContext *context) {
     if (!context) return SD_PARAKEET_DEVICE_CPU;
     return context->device;
+}
+
+extern "C" const char *sd_parakeet_backend_device_name(const SDParakeetContext *context) {
+    if (!context) return "";
+    return context->device_name.c_str();
+}
+
+extern "C" int32_t sd_parakeet_vulkan_available(void) {
+    // ggml's own backend device registry is the source of truth (never
+    // infer from IOKit/product-name sniffing). This walks the registry
+    // exactly like pk::Backend::Backend() does for auto-select (see
+    // backend.cpp), but read-only: it does not call ggml_backend_dev_init
+    // on anything and does not touch parakeet.cpp's process-global compute
+    // backend, so it is safe to call before any model is loaded (e.g. to
+    // decide whether the settings checkbox should be enabled) with zero
+    // side effects. In a CPU-only build (no PARAKEET_GGML_VULKAN), the
+    // Vulkan backend never registers a device at all, so this naturally
+    // returns 0 without any #ifdef here.
+    try {
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+            if (type == GGML_BACKEND_DEVICE_TYPE_GPU ||
+                type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                return 1;
+            }
+        }
+    } catch (...) {
+        return 0;
+    }
+    return 0;
+}
+
+extern "C" const char *sd_parakeet_vulkan_device_description(void) {
+    static thread_local std::string description;
+    description.clear();
+    try {
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+            if (type == GGML_BACKEND_DEVICE_TYPE_GPU ||
+                type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                const char *desc = ggml_backend_dev_description(dev);
+                description = desc ? desc : "";
+                break;
+            }
+        }
+    } catch (...) {
+        description.clear();
+    }
+    return description.c_str();
 }
 
 extern "C" const char *sd_parakeet_last_error_message(const SDParakeetContext *context) {
