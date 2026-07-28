@@ -611,12 +611,18 @@ UI control, hidden fallback, or unresolved production TODO remains.
 This report, `scripts/benchmark-parakeet.sh`, the new
 `--benchmark-transcribe` diagnostic, `README.md`, and `NOTICE.md` updates
 are committed to `agent/parakeet-intel-backend-architecture` in this
-worktree. **No draft PR exists and none was opened** — per the task
-owner's explicit instruction for this phase, nothing is pushed to
-`origin` and nothing is merged into `main`. The final commit hash for this
-phase is recorded in the commit message history of this branch (see `git
-log` — this report is committed alongside the plan-file status-note update
-described in §18/§21).
+worktree, across two Phase 7 commits:
+
+- `6942af9` — adds the permanent `scripts/benchmark-parakeet.sh` +
+  `--benchmark-transcribe` diagnostic hook.
+- `c0f3143` — full validation suite results, the real benchmark run, this
+  report, `NOTICE.md`/`README.md` updates, and the plan-doc status note
+  (§18/§21).
+
+**`c0f3143` is this phase's — and the whole migration's — final commit at
+the time of writing.** **No draft PR exists and none was opened** — per
+the task owner's explicit instruction for this phase, nothing is pushed to
+`origin` and nothing is merged into `main`.
 
 ## 21. What happens next (not part of this phase's scope)
 
