@@ -1,8 +1,8 @@
 // Parakey — push-to-talk dictation for macOS.
 //
 // Swift menu-bar app. The runtime covers hotkey capture (`CGEventTap`), audio capture
-// (`AVAudioEngine`), transcription (vendored `whisper.cpp`, CPU+BLAS by
-// default with an opt-in Vulkan GPU backend — see the "Use GPU" setting),
+// (`AVAudioEngine`), transcription (vendored `parakeet.cpp`, CPU by
+// default with an opt-in Vulkan GPU backend planned — see the "Use GPU" setting),
 // paste-at-cursor (`NSPasteboard` + `CGEvent`),
 // system-audio mute (`NSAppleScript`), menu-bar UI, settings,
 // rolling history, in-app updater, and permission guidance.
@@ -374,12 +374,18 @@ let PASTE_SUFFIX_DISPLAY: [PasteSuffix: String] = [
     .appendNewline: "Append newline",
 ]
 
-/// User-visible language choice for the whisper.cpp decoder's language hint.
-/// `.auto` passes no hint and lets whisper.cpp detect the language freely —
-/// the right default for almost everyone. Selecting a specific language
-/// biases decoding toward that language, which prevents occasional
-/// cross-script bleed-through. Raw values are ISO-639-1 codes, matching
-/// whisper.cpp's own language table directly (see `whisperLanguageCode`).
+/// User-visible language choice. `.auto` is the default and lets Parakeet's
+/// own multilingual decoder detect the language freely — parakeet.cpp's
+/// plain PCM transcription entry point (`parakeet_capi_transcribe_pcm`,
+/// wrapped by `sd_parakeet_transcribe`) does not accept a forced-language
+/// parameter, so this app does not force a decoder language onto native
+/// code (see docs/parakeet-intel-backend.md §12: "do not pretend to force a
+/// decoder language unless the pinned model/runtime truly supports it" —
+/// documented as a known limitation in the Phase 3 report). Raw values are
+/// ISO-639-1 codes (`isoLanguageCode` below); the effective language is
+/// still resolved (from the setting or the active keyboard layout, see
+/// KeyboardLanguage.swift) and used for deterministic post-processing —
+/// specifically `ParakeetTranscriptRepair`'s Russian/`ё` handling.
 enum DictationLanguage: String, CaseIterable {
     case auto
     case english = "en"
@@ -401,9 +407,10 @@ enum DictationLanguage: String, CaseIterable {
     case bulgarian = "bg"
     case serbian = "sr"
 
-    /// whisper.cpp identifies languages by ISO-639-1 string, which is
-    /// exactly this enum's raw value; `.auto` passes nil for auto-detect.
-    var whisperLanguageCode: String? {
+    /// ISO-639-1 string, exactly this enum's raw value; `.auto` returns nil.
+    /// Not passed to native code today (see the enum's doc comment) — used
+    /// for deterministic post-processing (`ParakeetTranscriptRepair`).
+    var isoLanguageCode: String? {
         self == .auto ? nil : rawValue
     }
 }
@@ -430,16 +437,22 @@ let DICTATION_LANGUAGE_DISPLAY: [DictationLanguage: String] = [
     .serbian: "Serbian",
 ]
 
+// There is exactly one production speech model (spec §14: "There is one
+// speech model, so do not show a model picker"). This is still a
+// `CaseIterable` enum with a single real case — rather than deleting the
+// type outright — because `productionSpeechModelProfile(rawValue:)` below
+// doubles as the upgrade-migration path: any old persisted raw value
+// (`"multilingual_v3"`, `"english_unified"`, or anything else left over from
+// a pre-Parakeet install) normalizes to `.parakeetTDTv3` the same way it
+// always normalized deprecated/unknown values to the production default
+// before this migration.
 enum SpeechModelProfile: String, CaseIterable {
-    case multilingualV3 = "multilingual_v3"
-    // Deprecated production option. Kept only so old saved preferences
-    // can be read and migrated back to the supported v3 model.
-    case englishUnified = "english_unified"
+    case parakeetTDTv3 = "parakeet_tdt_v3"
 
-    static let productionDefault: SpeechModelProfile = .multilingualV3
+    static let productionDefault: SpeechModelProfile = .parakeetTDTv3
 
     var isProductionSupported: Bool {
-        self == .multilingualV3
+        self == .parakeetTDTv3
     }
 
     var productionProfile: SpeechModelProfile {
@@ -447,30 +460,15 @@ enum SpeechModelProfile: String, CaseIterable {
     }
 
     var displayName: String {
-        switch self {
-        case .multilingualV3:
-            return "Multilingual (Whisper large-v3-turbo)"
-        case .englishUnified:
-            return "English optimized (Parakeet Unified, deprecated)"
-        }
+        "Parakeet TDT 0.6B v3"
     }
 
     var shortName: String {
-        switch self {
-        case .multilingualV3:
-            return "Whisper large-v3-turbo"
-        case .englishUnified:
-            return "Parakeet Unified"
-        }
+        "Parakeet TDT 0.6B v3"
     }
 
     var aboutModelText: String {
-        switch self {
-        case .multilingualV3:
-            return "whisper.cpp · large-v3-turbo multilingual (CPU)"
-        case .englishUnified:
-            return "Parakeet Unified English (deprecated)"
-        }
+        "parakeet.cpp · NVIDIA Parakeet TDT 0.6B v3 multilingual · GGUF q8_0"
     }
 
     var setupReadyDetail: String {
@@ -478,19 +476,15 @@ enum SpeechModelProfile: String, CaseIterable {
     }
 
     var cacheResetDetail: String {
-        // Both cases share one message: `.englishUnified` is deprecated and
-        // always migrated to `.multilingualV3` (see `productionProfile`)
-        // before this is ever shown, so there is only one real model cache
-        // to describe regardless of which case is asked.
-        "Parakey will delete the local Whisper large-v3-turbo model cache, unload the current speech model, and download a fresh verified copy before dictation is available again."
+        "Parakey will delete the local Parakeet TDT 0.6B v3 model cache, unload the current speech model, and download a fresh verified copy before dictation is available again."
     }
 
     var estimatedDownloadBytes: Int64 {
-        WHISPER_MODEL_SIZE_BYTES
+        PARAKEET_MODEL_SIZE_BYTES
     }
 
     var downloadSizeText: String {
-        "about 1.6 GB"
+        "about 940 MB"
     }
 }
 
@@ -876,7 +870,7 @@ func asrTimingTooltip(_ timing: ASRTimingBreakdown?) -> String? {
     guard let timing else { return nil }
     return [
         "ASR total  \(millisecondsLabel(timing.totalSeconds))",
-        "whisper.cpp  \(millisecondsLabel(timing.engineProcessingSeconds))",
+        "parakeet.cpp  \(millisecondsLabel(timing.engineProcessingSeconds))",
         "Decoder setup  \(millisecondsLabel(timing.decoderPreparationSeconds))",
         "Actor + framework  \(millisecondsLabel(timing.workerQueueSeconds + timing.frameworkOverheadSeconds))",
     ].joined(separator: "\n")
@@ -1299,8 +1293,8 @@ func shouldStopCorrectionSync(afterPathValidationError error: Error) -> Bool {
 // MARK: - Model registry hardening
 //
 // These historically overrode the speech-model download base URL for
-// the previous CoreML-based ASR stack. Parakey's whisper.cpp download
-// path (`downloadWhisperModelIfNeeded`) uses a single hardcoded, pinned
+// the previous CoreML-based ASR stack. Parakey's parakeet.cpp download
+// path (`downloadParakeetModelIfNeeded`) uses a single hardcoded, pinned
 // URL and does not consult either variable, but the hardening check
 // stays as defense in depth: a value here still means either
 // (a) a developer is debugging a mirror — uncommon — or (b) a process
@@ -1346,10 +1340,10 @@ func refuseHostileRegistryEnvironmentAndExit() {
 //
 // `ModelIntegrity` originally verified the previous CoreML-based ASR
 // stack's downloaded bundle contents (a multi-file manifest tree) before
-// handing them off to be compiled/loaded. The current whisper.cpp engine
-// downloads a single pinned `.bin` file and verifies it with a plain
-// SHA-256 check (`sha256Hex(ofFileAt:)`/`WHISPER_MODEL_SHA256`) instead —
-// see "Whisper model download + checksum verification" below. This
+// handing them off to be compiled/loaded. The current parakeet.cpp engine
+// downloads a single pinned `.gguf` file and verifies it with a plain
+// SHA-256 check (`sha256Hex(ofFileAt:)`/`PARAKEET_MODEL_SHA256`) instead —
+// see "Parakeet model download + checksum verification" below. This
 // manifest-verification machinery is kept for its self-tests and in case
 // a future model ships as a multi-file bundle again.
 
@@ -1599,40 +1593,55 @@ enum ModelIntegrity {
     }
 }
 
-// MARK: - Whisper model download + checksum verification
+// MARK: - Parakeet model download + checksum verification
 
-/// Replaces the previous CoreML-based ASR stack's download progress-handler
-/// type (dropped along with that dependency in Task 2). `downloadWhisperModelIfNeeded()`
-/// takes no progress callback today, so `TranscriptionWorker.load`'s
-/// `progressHandler` parameter of this type currently goes unused inside it —
-/// this type exists so the call sites keep a progress-handler parameter of
-/// some concrete type, unchanged from before this port.
-typealias WhisperDownloadProgressHandler = @Sendable (Double) -> Void
+/// Progress callback for `TranscriptionWorker.load`. Parakeet-neutral name
+/// per spec §4.2 (renamed from the pre-migration `WhisperDownloadProgressHandler`).
+/// `downloadParakeetModelIfNeeded()` takes no progress callback today (single
+/// `URLSession.shared.download` call, no incremental byte reporting), so this
+/// parameter currently goes unused inside it — kept so call sites retain a
+/// progress-handler parameter of some concrete type.
+typealias SpeechModelDownloadProgressHandler = @Sendable (Double) -> Void
 
-enum WhisperModelDownloadError: LocalizedError {
+enum ParakeetModelDownloadError: LocalizedError {
     case checksumMismatch(expected: String, actual: String)
+    case sizeMismatch(expected: Int64, actual: Int64)
     case downloadFailed(underlying: Error)
     case httpError(statusCode: Int)
+    case unsafeDestination(String)
 
     var errorDescription: String? {
         switch self {
         case .checksumMismatch(let expected, let actual):
-            return "Downloaded whisper model checksum mismatch: expected \(expected), got \(actual)"
+            return "Downloaded Parakeet model checksum mismatch: expected \(expected), got \(actual)"
+        case .sizeMismatch(let expected, let actual):
+            return "Downloaded Parakeet model size mismatch: expected \(expected) bytes, got \(actual) bytes"
         case .downloadFailed(let underlying):
-            return "Failed to download whisper model: \(underlying.localizedDescription)"
+            return "Failed to download Parakeet model: \(underlying.localizedDescription)"
         case .httpError(let statusCode):
-            return "Whisper model download failed with HTTP \(statusCode)"
+            return "Parakeet model download failed with HTTP \(statusCode)"
+        case .unsafeDestination(let detail):
+            return "Refusing unsafe Parakeet model destination: \(detail)"
         }
     }
 }
 
-/// Pinned to a specific Hugging Face revision commit, never `main` — see
-/// Global Constraints in the implementation plan for why.
-private let WHISPER_MODEL_URL = URL(
-    string: "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3-turbo.bin"
+/// Pinned to a specific Hugging Face revision commit, never `main`/`latest` —
+/// see docs/parakeet-intel-backend.md §3. Values verified for real on the
+/// target Intel Mac in Phase 2 of the migration (see
+/// .superpowers/sdd/2026-07-28-parakeet-cpp-migration/phase-2-cpu-spike-report.md):
+/// exact byte size and SHA-256 both computed from the actual downloaded
+/// bytes, not copied from any Hugging Face API metadata response.
+let PARAKEET_MODEL_REPOSITORY = "mudler/parakeet-cpp-gguf"
+let PARAKEET_MODEL_REVISION = "bf0af9f425fa01809cadec671b3cb672709d13e9"
+let PARAKEET_MODEL_FILENAME = "tdt-0.6b-v3-q8_0.gguf"
+let PARAKEET_MODEL_ARCH = "parakeet (TDT, hybrid)"
+let PARAKEET_MODEL_QUANTIZATION = "q8_0"
+private let PARAKEET_MODEL_URL = URL(
+    string: "https://huggingface.co/\(PARAKEET_MODEL_REPOSITORY)/resolve/\(PARAKEET_MODEL_REVISION)/\(PARAKEET_MODEL_FILENAME)"
 )!
-private let WHISPER_MODEL_SHA256 = "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69"
-private let WHISPER_MODEL_SIZE_BYTES: Int64 = 1_624_555_275
+let PARAKEET_MODEL_SHA256 = "4d69a4a6683f4f2d952bad794c1357ca6eb628027695b4699c5a9ad4cd07d757"
+let PARAKEET_MODEL_SIZE_BYTES: Int64 = 940_663_680
 
 /// Computes the SHA-256 digest of a single known file, hex-encoded.
 ///
@@ -1648,48 +1657,100 @@ func sha256Hex(ofFileAt url: URL) throws -> String {
     return hasher.finalize().map { String(format: "%02x", $0) }.joined()
 }
 
+/// Regular-file-only guard (spec §4.2 items 1-2: "Treat the destination as a
+/// known regular file only. Reject symlinks, directories and special
+/// files."). Returns `false` for anything that isn't a plain regular file
+/// (symlink, directory, device node, socket, etc.) — including the
+/// nothing-there case, which callers treat as "no cached file yet", not a
+/// safety violation.
+func isPlainRegularFile(_ path: String) -> Bool {
+    var st = stat()
+    guard lstat(path, &st) == 0 else { return false }
+    return (st.st_mode & S_IFMT) == S_IFREG
+}
+
 @discardableResult
-func downloadWhisperModelIfNeeded() async throws -> URL {
+func downloadParakeetModelIfNeeded() async throws -> URL {
     let destination = speechModelCacheDirectory(for: .productionDefault)
     if FileManager.default.fileExists(atPath: destination.path) {
-        let actual = try sha256Hex(ofFileAt: destination)
-        if actual == WHISPER_MODEL_SHA256 {
-            return destination
+        guard isPlainRegularFile(destination.path) else {
+            throw ParakeetModelDownloadError.unsafeDestination(
+                "existing cache path is not a plain regular file: \(destination.path)"
+            )
         }
-        log("ASR: cached whisper model failed checksum verification; redownloading")
+        let attributes = try? FileManager.default.attributesOfItem(atPath: destination.path)
+        let actualSize = (attributes?[.size] as? Int64) ?? -1
+        if actualSize == PARAKEET_MODEL_SIZE_BYTES {
+            let actualHash = try sha256Hex(ofFileAt: destination)
+            if actualHash == PARAKEET_MODEL_SHA256 {
+                return destination
+            }
+        }
+        log("ASR: cached Parakeet model failed size/checksum verification; redownloading")
         try? FileManager.default.removeItem(at: destination)
     }
 
+    try assertSufficientDiskSpaceForSpeechModelDownload(profile: .productionDefault)
+
+    let destinationDirectory = destination.deletingLastPathComponent()
     try FileManager.default.createDirectory(
-        at: destination.deletingLastPathComponent(),
+        at: destinationDirectory,
         withIntermediateDirectories: true
     )
 
-    let (tempURL, response) = try await URLSession.shared.download(from: WHISPER_MODEL_URL)
+    // Download to a temp file ON THE SAME VOLUME as the destination (spec
+    // §4.2 item 5) so the final move below is a same-volume atomic rename,
+    // never a cross-volume copy that could leave a partial file visible
+    // under a production-looking name. `URLSession.shared.download` itself
+    // already writes to a private temp location; the explicit move to a
+    // sibling temp file here guarantees the same-volume property regardless
+    // of where the system temp directory happens to be mounted.
+    let (systemTempURL, response) = try await URLSession.shared.download(from: PARAKEET_MODEL_URL)
     guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+        try? FileManager.default.removeItem(at: systemTempURL)
         let code = (response as? HTTPURLResponse)?.statusCode ?? -1
-        throw WhisperModelDownloadError.httpError(statusCode: code)
+        throw ParakeetModelDownloadError.httpError(statusCode: code)
     }
 
-    let actual = try sha256Hex(ofFileAt: tempURL)
-    guard actual == WHISPER_MODEL_SHA256 else {
-        try? FileManager.default.removeItem(at: tempURL)
-        throw WhisperModelDownloadError.checksumMismatch(expected: WHISPER_MODEL_SHA256, actual: actual)
+    let sameVolumeTempURL = destinationDirectory.appendingPathComponent(
+        ".\(PARAKEET_MODEL_FILENAME).download-\(UUID().uuidString)", isDirectory: false
+    )
+    try FileManager.default.moveItem(at: systemTempURL, to: sameVolumeTempURL)
+
+    func cleanupTemp() {
+        try? FileManager.default.removeItem(at: sameVolumeTempURL)
     }
 
-    try FileManager.default.moveItem(at: tempURL, to: destination)
+    let attributes = try? FileManager.default.attributesOfItem(atPath: sameVolumeTempURL.path)
+    let actualSize = (attributes?[.size] as? Int64) ?? -1
+    guard actualSize == PARAKEET_MODEL_SIZE_BYTES else {
+        cleanupTemp()
+        throw ParakeetModelDownloadError.sizeMismatch(expected: PARAKEET_MODEL_SIZE_BYTES, actual: actualSize)
+    }
+
+    let actualHash = try sha256Hex(ofFileAt: sameVolumeTempURL)
+    guard actualHash == PARAKEET_MODEL_SHA256 else {
+        cleanupTemp()
+        throw ParakeetModelDownloadError.checksumMismatch(expected: PARAKEET_MODEL_SHA256, actual: actualHash)
+    }
+
+    // Atomic rename into place (spec §4.2 items 6-8): the verified temp file
+    // is only ever exposed under the production filename once fully
+    // verified. `replacingItemAt` performs an atomic swap on the same
+    // volume.
+    _ = try FileManager.default.replaceItemAt(destination, withItemAt: sameVolumeTempURL)
     return destination
 }
 
-private func resolvedWhisperSupportDirectory(_ override: URL?) -> URL? {
+private func resolvedParakeetSupportDirectory(_ override: URL?) -> URL? {
     override
         ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
-            .appendingPathComponent("Whisper", isDirectory: true)
+            .appendingPathComponent("SuperDictate", isDirectory: true)
 }
 
 func isSafeSpeechModelCacheDirectory(_ cacheDir: URL,
-                                     whisperSupportDirectory: URL? = nil) -> Bool {
-    let supportDirectory = resolvedWhisperSupportDirectory(whisperSupportDirectory)
+                                     parakeetSupportDirectory: URL? = nil) -> Bool {
+    let supportDirectory = resolvedParakeetSupportDirectory(parakeetSupportDirectory)
     guard let supportDirectory else { return false }
 
     let cacheURL = cacheDir.standardizedFileURL
@@ -1711,11 +1772,11 @@ func isSafeSpeechModelCacheDirectory(_ cacheDir: URL,
 
 func isExistingSpeechModelCacheDirectorySafeForRemoval(
     _ cacheDir: URL,
-    whisperSupportDirectory: URL? = nil
+    parakeetSupportDirectory: URL? = nil
 ) -> Bool {
     guard isSafeSpeechModelCacheDirectory(cacheDir,
-                                          whisperSupportDirectory: whisperSupportDirectory),
-          let supportDirectory = resolvedWhisperSupportDirectory(whisperSupportDirectory) else {
+                                          parakeetSupportDirectory: parakeetSupportDirectory),
+          let supportDirectory = resolvedParakeetSupportDirectory(parakeetSupportDirectory) else {
         return false
     }
 
@@ -1730,7 +1791,7 @@ func isExistingSpeechModelCacheDirectorySafeForRemoval(
     // Walk every component except the last through the plain-directory
     // check — that confirms the whole parent chain is real directories with
     // no symlink hops. The cache target itself (last component) may be
-    // either a plain file (the whisper `.bin` model) or a plain directory
+    // either a plain file (the Parakeet `.gguf` model) or a plain directory
     // (older cache shapes), so it gets a looser leaf check below rather
     // than being forced through isExistingPlainDirectory.
     for component in components.dropLast() {
@@ -1744,24 +1805,47 @@ func isExistingSpeechModelCacheDirectorySafeForRemoval(
 }
 
 func speechModelCacheBaseDirectory() -> URL {
-    resolvedWhisperSupportDirectory(nil) ?? FileManager.default.temporaryDirectory
+    resolvedParakeetSupportDirectory(nil) ?? FileManager.default.temporaryDirectory
 }
 
-/// The directory whisper model files live under (`~/Library/Application
-/// Support/Whisper/Models`). Consumed by Task 5's `TranscriptionWorker`.
-func whisperModelCacheDirectory() -> URL {
-    resolvedWhisperSupportDirectory(nil)!
+/// The directory Parakeet model files live under (`~/Library/Application
+/// Support/SuperDictate/Models`), per spec §4.1 — a new location, NOT the
+/// legacy `~/Library/Application Support/Whisper` tree (left untouched, spec
+/// §4.4).
+func parakeetModelCacheDirectory() -> URL {
+    resolvedParakeetSupportDirectory(nil)!
         .appendingPathComponent("Models", isDirectory: true)
 }
 
-/// The single whisper model file Parakey downloads and loads. Consumed by
-/// Task 5's `TranscriptionWorker`.
-func whisperModelPath() -> URL {
-    whisperModelCacheDirectory().appendingPathComponent("ggml-large-v3-turbo.bin", isDirectory: false)
+/// The single Parakeet model file Parakey downloads and loads.
+func parakeetModelPath() -> URL {
+    parakeetModelCacheDirectory().appendingPathComponent(PARAKEET_MODEL_FILENAME, isDirectory: false)
 }
 
 func speechModelCacheDirectory(for _: SpeechModelProfile) -> URL {
-    whisperModelPath()
+    parakeetModelPath()
+}
+
+/// Legacy Whisper model cache file this migration leaves behind (spec §4.4).
+/// Never used for Parakeet operation. Optionally removed by
+/// `removeLegacyWhisperModelFileIfPresent()` below, ONLY after Parakeet has
+/// itself successfully downloaded, verified, loaded, and warmed up — and
+/// ONLY this exact known file, never the whole `~/Library/Application
+/// Support/Whisper` directory.
+private func legacyWhisperModelFilePath() -> URL? {
+    FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
+        .appendingPathComponent("Whisper", isDirectory: true)
+        .appendingPathComponent("Models", isDirectory: true)
+        .appendingPathComponent("ggml-large-v3-turbo.bin", isDirectory: false)
+}
+
+/// Best-effort cleanup of the exact legacy Whisper model file. Never throws;
+/// failure to remove it must not prevent application startup (spec §4.4).
+/// Call only after a successful Parakeet warm-up.
+func removeLegacyWhisperModelFileIfPresent() {
+    guard let legacyPath = legacyWhisperModelFilePath() else { return }
+    guard isPlainRegularFile(legacyPath.path) else { return }
+    try? FileManager.default.removeItem(at: legacyPath)
 }
 
 func speechModelDownloadRequiredBytes(for profile: SpeechModelProfile,
@@ -1776,7 +1860,7 @@ func speechModelDiskSpaceFailureDetail(profile: SpeechModelProfile,
         return nil
     }
     return """
-    Parakey needs \(profile.downloadSizeText) of free disk space to download \(profile.shortName), plus room for whisper.cpp to prepare it.
+    Parakey needs \(profile.downloadSizeText) of free disk space to download \(profile.shortName), plus room for parakeet.cpp to prepare it.
 
     Available: \(formattedByteCount(UInt64(availableBytes)))
     Needed: \(formattedByteCount(UInt64(requiredBytes)))
@@ -2735,7 +2819,14 @@ final class Settings: @unchecked Sendable {
     private static let keySpeechModelProfile = "speech_model_profile"
     private static let keyInitialSpeechModelChoiceRequired = "initial_speech_model_choice_required"
     private static let keyRemoveFillerWords = "remove_filler_words"
-    private static let keyUseGPU = "use_gpu"
+    // New key, deliberately NOT the old "use_gpu" (spec §10: "Do not
+    // inherit the old Whisper `useGPU` storage value... the persisted key
+    // must be new so an old installation with Whisper Vulkan enabled starts
+    // Parakeet on CPU after upgrading"). The Swift property below stays
+    // named `useGPU` for minimal call-site churn; only the UserDefaults key
+    // changed. `use_gpu` itself is intentionally left unused/unread from
+    // here on — it is simply abandoned old state, never migrated.
+    private static let keyUseGPU = "parakeet_use_gpu"
     private static let keyEnterDelayMilliseconds = "enter_delay_milliseconds_v1"
     private static let keyActiveRunMarker = "active_run_marker"
     private static let keyAgentEnabled = "agent_enabled"
@@ -3377,10 +3468,14 @@ final class Settings: @unchecked Sendable {
         set { defaults.set(newValue, forKey: Self.keyRemoveFillerWords) }
     }
 
-    // Opt-in Vulkan GPU backend for whisper.cpp (Metal originally, replaced
-    // by Vulkan per the intel-mac-vulkan-backend plan). Defaults to `false`
-    // (CPU+BLAS) via `defaults.bool(forKey:)`'s standard "unset key reads
-    // as false" behavior — never force this on by default, see task brief.
+    // Opt-in Vulkan GPU backend for Parakeet (parakeet.cpp). Not implemented
+    // yet — Vulkan support is Phase 5 of the parakeet.cpp migration plan;
+    // this phase only adds the storage key + default so clean installs and
+    // upgrades both start on CPU (spec §10). Defaults to `false` (CPU) via
+    // `defaults.bool(forKey:)`'s standard "unset key reads as false"
+    // behavior — never force this on by default. Persisted under a NEW key
+    // (`parakeet_use_gpu`, see `keyUseGPU`'s comment), never inherited from
+    // the old Whisper `use_gpu` value.
     var useGPU: Bool {
         get { defaults.bool(forKey: Self.keyUseGPU) }
         set { defaults.set(newValue, forKey: Self.keyUseGPU) }
@@ -5496,21 +5591,24 @@ private final class AudioConverterInputProvider: @unchecked Sendable {
 
 // MARK: - Transcription worker
 //
-// Owns the whisper.cpp WhisperEngine. whisper.cpp's single loaded
-// context doesn't tolerate concurrent `whisper_full` calls — but the
-// actor alone does NOT keep that contract. Actors are reentrant at
-// suspension points: while `await whisper.transcribe(...)` is
-// suspended, a second transcribe() call would enter the actor and
-// start a concurrent inference against the same context. The real
-// guard is ParakeyApp.isBusy, which ensures the app never issues a
-// second transcribe while one is in flight. The `inFlight` flag below
-// is a cheap defensive backstop should that invariant ever break: it
+// Owns the single loaded `ParakeetEngine`. parakeet.cpp's loaded context
+// doesn't tolerate concurrent inference calls — but the actor alone does
+// NOT keep that contract. Actors are reentrant at suspension points: while
+// `await engine.transcribe(...)` is suspended, a second transcribe() call
+// would enter the actor and start a concurrent inference against the same
+// context. The real guard is ParakeyApp.isBusy, which ensures the app never
+// issues a second transcribe while one is in flight. The `inFlight` flag
+// below is a cheap defensive backstop should that invariant ever break: it
 // refuses (and, in DEBUG, asserts on) a re-entrant call instead of
-// corrupting engine state.
-
-private enum LoadedSpeechEngine {
-    case whisperLargeV3Turbo(WhisperEngine)
-}
+// corrupting engine state. (The native bridge itself adds a THIRD,
+// independent guard — see `SD_PARAKEET_ERR_BUSY` in
+// swift/Sources/parakeet_cpp/bridge/superdictate_parakeet.cpp.)
+//
+// Per docs/parakeet-intel-backend.md §9, this is a single `ParakeetEngine?`
+// field, not an engine-picker enum — there is exactly one production ASR
+// engine (spec §2.1), so `LoadedSpeechEngine` (the old
+// `.whisperLargeV3Turbo(WhisperEngine)` single-case enum this replaces) is
+// gone entirely rather than gaining a second case.
 
 private struct TranscriptionWorkerResult: Sendable {
     let text: String
@@ -5536,7 +5634,7 @@ private struct CompletedTranscriptionWorkerResult: Sendable {
 }
 
 actor TranscriptionWorker {
-    private var engine: LoadedSpeechEngine?
+    private var engine: ParakeetEngine?
     private var loadedProfile: SpeechModelProfile?
     private var loadedUseGPU: Bool?
     private(set) var ready = false
@@ -5544,13 +5642,37 @@ actor TranscriptionWorker {
     /// duration of transcribe(), including across its await.
     private var inFlight = false
 
+    /// Default thread policy from docs/parakeet-intel-backend.md §10:
+    /// `max(2, min(8, activeProcessorCount / 2))`, with an optional
+    /// `SUPERDICTATE_ASR_THREADS` diagnostic override validated to `1...32`.
+    /// An out-of-range or non-numeric override is ignored (falls back to the
+    /// computed default) rather than crashing a debug/test run.
+    static func resolvedParakeetThreadCount(
+        activeProcessorCount: Int = ProcessInfo.processInfo.activeProcessorCount,
+        environmentOverride: String? = ProcessInfo.processInfo.environment["SUPERDICTATE_ASR_THREADS"]
+    ) -> Int {
+        let defaultCount = max(2, min(8, activeProcessorCount / 2))
+        guard let environmentOverride, let parsed = Int(environmentOverride), (1...32).contains(parsed) else {
+            return defaultCount
+        }
+        return parsed
+    }
+
     func load(profile requestedProfile: SpeechModelProfile,
-              progressHandler: WhisperDownloadProgressHandler? = nil) async throws {
+              progressHandler: SpeechModelDownloadProgressHandler? = nil) async throws {
         let profile = requestedProfile.productionProfile
         if requestedProfile != profile {
             log("ASR: ignoring unsupported speech model \(requestedProfile.shortName); using \(profile.shortName)")
         }
-        let useGPU = Settings.shared.useGPU
+        // GPU (Vulkan) is not implemented yet (Phase 5 of the parakeet.cpp
+        // migration plan) — always load CPU this phase, but still read the
+        // preference so a user who has it enabled sees an honest log note
+        // instead of a silently-ignored setting.
+        let requestedGPU = Settings.shared.useGPU
+        if requestedGPU {
+            log("ASR: Use GPU (Vulkan) is enabled in Settings, but Vulkan is not yet implemented in this build — using Parakeet CPU")
+        }
+        let useGPU = false
         if ready, engine != nil, loadedProfile == profile, loadedUseGPU == useGPU {
             log("ASR: \(profile.shortName) already ready")
             return
@@ -5566,19 +5688,33 @@ actor TranscriptionWorker {
             log("ASR: downloading + verifying + loading \(profile.shortName) weights…")
         }
         let t0 = Date()
-        engine = .whisperLargeV3Turbo(try await loadWhisperEngine(useGPU: useGPU, progressHandler: progressHandler))
+        engine = try await loadParakeetEngine(progressHandler: progressHandler)
         loadedProfile = profile
         loadedUseGPU = useGPU
         ready = true
         log("ASR: \(profile.shortName) ready in \(String(format: "%.2f", Date().timeIntervalSince(t0))) s")
+        log("ASR model: Parakeet TDT 0.6B v3 \(PARAKEET_MODEL_QUANTIZATION)")
+        log("ASR runtime: parakeet.cpp \(parakeetRuntimeVersion())")
+        log("ASR device requested: \(requestedGPU ? "Vulkan" : "CPU")")
+        log("ASR device selected: CPU")
+        // Best-effort legacy cleanup, only after Parakeet has itself
+        // succeeded (spec §4.3/§4.4) — never blocks readiness on failure.
+        removeLegacyWhisperModelFileIfPresent()
     }
 
-    private func loadWhisperEngine(useGPU: Bool, progressHandler: WhisperDownloadProgressHandler?) async throws -> WhisperEngine {
-        if !speechModelCacheExists(for: .multilingualV3) {
-            try assertSufficientDiskSpaceForSpeechModelDownload(profile: .multilingualV3)
+    private func loadParakeetEngine(progressHandler: SpeechModelDownloadProgressHandler?) async throws -> ParakeetEngine {
+        if !speechModelCacheExists(for: .parakeetTDTv3) {
+            try assertSufficientDiskSpaceForSpeechModelDownload(profile: .parakeetTDTv3)
         }
-        let modelPath = try await downloadWhisperModelIfNeeded()
-        return try WhisperEngine(modelPath: modelPath.path, useGPU: useGPU)
+        let modelPath = try await downloadParakeetModelIfNeeded()
+        let threadCount = Self.resolvedParakeetThreadCount()
+        log("ASR threads: \(threadCount)")
+        let engine = try ParakeetEngine(modelPath: modelPath.path, device: .cpu, threadCount: threadCount)
+        let warmUpStartedAt = ProcessInfo.processInfo.systemUptime
+        try await engine.warmUp()
+        let warmUpSeconds = ProcessInfo.processInfo.systemUptime - warmUpStartedAt
+        log("ASR warm-up: \(String(format: "%.2f", warmUpSeconds)) s")
+        return engine
     }
 
     fileprivate func transcribe(samples: [Float],
@@ -5594,38 +5730,34 @@ actor TranscriptionWorker {
         }
         inFlight = true
         defer { inFlight = false }
-        switch engine {
-        case .whisperLargeV3Turbo(let whisper):
-            // `TranscriptionWorker` is an actor, so this method runs on its
-            // executor, not the main thread — hop explicitly for the Carbon
-            // TIS call, which (like the rest of AppKit/Carbon) is only
-            // main-thread-safe. `resolveViaKeyboard` is false for recovered
-            // (previous-session) audio: the *current* keyboard layout has no
-            // bearing on what language a stale recording was spoken in, so
-            // those call sites keep today's plain nil-passthrough behavior
-            // for `.auto` instead of forcing whatever layout is active now.
-            let effectiveLanguage: String?
-            if resolveViaKeyboard {
-                effectiveLanguage = await MainActor.run {
-                    resolveEffectiveWhisperLanguage(setting: language ?? .auto)
-                }
-            } else {
-                effectiveLanguage = language?.whisperLanguageCode
+
+        // `resolveEffectiveDictationLanguage` is only used for deterministic
+        // post-processing today (see `DictationLanguage`'s doc comment) —
+        // parakeet.cpp's plain PCM entry point this bridge wraps does not
+        // accept a forced-language parameter, unlike whisper.cpp's
+        // `params.language`. `TranscriptionWorker` is an actor, so this
+        // method runs on its executor, not the main thread — hop explicitly
+        // for the Carbon TIS call inside `resolveEffectiveDictationLanguage`,
+        // which (like the rest of AppKit/Carbon) is only main-thread-safe.
+        // `resolveViaKeyboard` is false for recovered (previous-session)
+        // audio: the *current* keyboard layout has no bearing on what
+        // language a stale recording was spoken in.
+        if resolveViaKeyboard {
+            _ = await MainActor.run {
+                resolveEffectiveDictationLanguage(setting: language ?? .auto)
             }
-            let engineCallStartedAt = ProcessInfo.processInfo.systemUptime
-            let result = try await whisper.transcribe(
-                samples: samples,
-                languageCode: effectiveLanguage
-            )
-            let engineCallCompletedAt = ProcessInfo.processInfo.systemUptime
-            return TranscriptionWorkerResult(
-                text: result.text,
-                workerQueueSeconds: workerEnteredAt - requestedAt,
-                decoderPreparationSeconds: 0,
-                engineCallSeconds: engineCallCompletedAt - engineCallStartedAt,
-                engineProcessingSeconds: result.encodeSeconds
-            )
         }
+
+        let engineCallStartedAt = ProcessInfo.processInfo.systemUptime
+        let result = try await engine.transcribe(samples: samples)
+        let engineCallCompletedAt = ProcessInfo.processInfo.systemUptime
+        return TranscriptionWorkerResult(
+            text: result.text,
+            workerQueueSeconds: workerEnteredAt - requestedAt,
+            decoderPreparationSeconds: 0,
+            engineCallSeconds: engineCallCompletedAt - engineCallStartedAt,
+            engineProcessingSeconds: result.inferenceSeconds
+        )
     }
 
     func warmUp() async throws -> ASRTimingBreakdown {
@@ -5641,6 +5773,9 @@ actor TranscriptionWorker {
     }
 
     func unload() async {
+        if let engine {
+            await engine.shutdown()
+        }
         engine = nil
         loadedProfile = nil
         loadedUseGPU = nil
@@ -5656,12 +5791,25 @@ actor TranscriptionWorker {
 // text before paste/history, never to audio, and replacement text is
 // used exactly as the user typed it.
 
-enum SpeechModelTextRepair {
-    /// Parakeet TDT v3 emits `<unk>` for Cyrillic "ё" in Russian text.
-    /// For Russian and auto-detect (the app's default audience) the
-    /// token is replaced with "ё"/"Ё". For every other language the
-    /// token is genuinely unknown and is removed entirely so a stray
-    /// Cyrillic character doesn't appear in English/French/etc. text.
+// Originated as a port of the OLD CoreML/ANE/FluidAudio Parakeet stack's
+// `<unk>`-for-Cyrillic-"ё" repair (a different runtime than parakeet.cpp —
+// NeMo-derived ANE inference, not GGUF/ggml). Re-verified empirically
+// against the REAL parakeet.cpp CPU pipeline during Phase 3 of the
+// parakeet.cpp migration (see
+// .superpowers/sdd/2026-07-28-parakeet-cpp-migration/phase-3-integration-report.md
+// for what was actually observed) rather than assumed to carry over
+// unchanged. The guard at the top of `apply` (`localizedCaseInsensitiveContains("<unk>")`)
+// makes this a no-op whenever the token doesn't appear, so keeping the logic
+// wired into the live post-processing pipeline is safe regardless of how
+// often the real runtime emits it.
+enum ParakeetTranscriptRepair {
+    /// If/when parakeet.cpp emits `<unk>` for Cyrillic "ё" in Russian text
+    /// (a known quirk of NeMo-derived vocabularies more broadly — see the
+    /// Phase 3 report for this build's own empirical finding), replace it
+    /// with "ё"/"Ё" for Russian and auto-detect (the app's default
+    /// audience). For every other language the token is genuinely unknown
+    /// and is removed entirely so a stray Cyrillic character doesn't appear
+    /// in English/French/etc. text.
     static func apply(to text: String,
                       language: DictationLanguage = .auto) -> String {
         guard text.localizedCaseInsensitiveContains("<unk>") else { return text }
@@ -5964,7 +6112,7 @@ private func processedDictationText(rawTranscript: String,
                                     removeFillerWords: Bool,
                                     language: DictationLanguage = .auto) -> DictationTextProcessingResult {
     let trimmed = rawTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
-    let repaired = SpeechModelTextRepair.apply(to: trimmed, language: language)
+    let repaired = ParakeetTranscriptRepair.apply(to: trimmed, language: language)
     let corrected = TranscriptCorrector.apply(to: repaired, corrections: corrections)
 
     guard removeFillerWords else {
@@ -5999,14 +6147,14 @@ func pastedText(from correctedTranscript: String, suffix: PasteSuffix) -> String
     }
 }
 
-/// `fractionCompleted` is the whisper model download's overall progress in
-/// `0...1`, as reported by `WhisperDownloadProgressHandler`. Unlike the
+/// `fractionCompleted` is the Parakeet model download's overall progress in
+/// `0...1`, as reported by `SpeechModelDownloadProgressHandler`. Unlike the
 /// previous CoreML ASR stack's multi-file, multi-phase download (list →
-/// download N files → compile), whisper.cpp downloads and verifies a single
-/// pinned `.bin` file, so there is only one phase to describe: 0 means the
+/// download N files → compile), parakeet.cpp downloads and verifies a single
+/// pinned `.gguf` file, so there is only one phase to describe: 0 means the
 /// download hasn't started yet (or the cached file is being checked), values
 /// strictly between 0 and 1 mean bytes are actively arriving, and 1 means
-/// the file is present and being handed to whisper.cpp for loading.
+/// the file is present and being handed to parakeet.cpp for loading.
 func speechModelStartupStatusTitle(_ fractionCompleted: Double) -> String {
     if fractionCompleted <= 0 {
         return "Checking speech model files…"
@@ -10324,7 +10472,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         // Load ASR FIRST, then audio + hotkey. This ordering carries over
         // from the previous CoreML-based ASR stack, where reversing it made
-        // the first-launch ANE Encoder compile hang; whisper.cpp's CPU-only
+        // the first-launch ANE Encoder compile hang; parakeet.cpp's CPU-only
         // model load has not been observed to have that failure mode, but
         // the safe ordering is kept rather than re-verified. The bench
         // under experiments/swift-bench/ never opens an audio session so
@@ -10350,12 +10498,20 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 guard !Task.isCancelled, !isTerminating else { return }
 
                 do {
+                    // `asr.load` above already runs ParakeetEngine's own
+                    // internal warm-up (a real silence-buffer transcribe
+                    // through the native bridge) before setting `ready`, per
+                    // spec §11.3 ("Warm-up must occur before Ready"). This
+                    // second pass exercises the full TranscriptionWorker
+                    // path end-to-end (including the actor hop and
+                    // reentrancy guard) — belt-and-suspenders, not strictly
+                    // required, cheap relative to model load.
                     let warmUpTiming = try await asr.warmUp()
-                    log("ASR: whisper.cpp warm-up completed in \(millisecondsLabel(warmUpTiming.totalSeconds))")
+                    log("ASR: parakeet.cpp warm-up completed in \(millisecondsLabel(warmUpTiming.totalSeconds))")
                 } catch {
                     // Model loading succeeded, so a failed best-effort warm-up
                     // must not make the dictation service unavailable.
-                    log("ASR: whisper.cpp warm-up skipped: \(error.localizedDescription)")
+                    log("ASR: parakeet.cpp warm-up skipped: \(error.localizedDescription)")
                 }
                 guard !Task.isCancelled, !isTerminating else { return }
 
@@ -11846,7 +12002,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         isBusy = true
 
-        // Start whisper.cpp inference before AppKit/menu work. The UI still
+        // Start parakeet.cpp inference before AppKit/menu work. The UI still
         // transitions immediately, but its disk/menu updates now overlap
         // inference.
         let asrRequestedAt = ProcessInfo.processInfo.systemUptime
@@ -14022,7 +14178,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                 keyEquivalent: "")
         useGPU.target = self
         useGPU.state = settings.useGPU ? .on : .off
-        useGPU.toolTip = "Runs whisper.cpp's Vulkan backend instead of CPU+BLAS. Opt-in; reloads the speech model."
+        useGPU.toolTip = "Runs Parakeet's Vulkan backend instead of CPU. Opt-in; reloads the speech model. Not yet implemented in this build — Parakeet falls back to CPU with a log note when this is enabled."
         sub.addItem(useGPU)
 
         parent.submenu = sub
@@ -14223,7 +14379,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// differ after normalization, restarts JUST the AVAudioEngine
     /// capture layer via `restartAudioInput(reason:)` — which reuses
     /// `installCaptureTap()` / `recoverAfterConfigurationChange()`
-    /// and never touches `TranscriptionWorker` or the whisper.cpp
+    /// and never touches `TranscriptionWorker` or the parakeet.cpp
     /// engine/model.
     ///
     /// Wired into the mic-selection menu item above, which is the
@@ -14241,7 +14397,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// mechanism — contrast upstream's broader, out-of-scope
     /// `SETTINGS_CHANGED_NOTIFICATION` / `reloadSettingsWhenIdle`
     /// (tied to FluidAudio-specific download-telemetry fields this
-    /// fork's whisper.cpp rewrite doesn't have). This function only
+    /// fork's parakeet.cpp rewrite doesn't have). This function only
     /// ever looks at the microphone preference.
     ///
     /// Reads `settings.inputDevice` as it stands in memory right now;
@@ -16212,6 +16368,12 @@ private enum ParakeySelfTest {
             return runSuite("insertion-target", testInsertionTargetTracking)
         case "insertion-target-live":
             return runSuite("insertion-target-live", testLiveInsertionTargetProbe)
+        case "parakeet-bridge":
+            return runSuite("parakeet-bridge", testParakeetBridge)
+        case "parakeet-cpu":
+            return runSuite("parakeet-cpu", testParakeetCPUIntegration)
+        case "parakeet-text-repair":
+            return runSuite("parakeet-text-repair", testParakeetTranscriptRepair)
         case "all":
             return runSuite("all", testAll)
         default:
@@ -16256,6 +16418,8 @@ private enum ParakeySelfTest {
         try testPrivateLogAppend()
         try testDiagnostics()
         try testInsertionTargetTracking()
+        try testParakeetTranscriptRepair()
+        try testParakeetBridge()
     }
 
     private static func testInsertionTargetTracking() throws {
@@ -16505,7 +16669,7 @@ private enum ParakeySelfTest {
                 memoryLines: ["Resident: 100 MB"],
                 permissionLines: ["Microphone: granted", "Accessibility: granted", "Input Monitoring: granted"],
                 settingLines: [
-                    "Speech model: Multilingual (Whisper large-v3-turbo)",
+                    "Speech model: Parakeet TDT 0.6B v3",
                     "Language: Auto-detect",
                     "Recent transcripts: Last 5 (1 in memory)",
                     "Text corrections: 1 configured",
@@ -16523,7 +16687,7 @@ private enum ParakeySelfTest {
                    "diagnostics report should not include text correction contents")
         try expect(report.contains("Text corrections: 1 configured"), equals: true,
                    "diagnostics report should include correction counts")
-        try expect(report.contains("Speech model: Multilingual (Whisper large-v3-turbo)"), equals: true,
+        try expect(report.contains("Speech model: Parakeet TDT 0.6B v3"), equals: true,
                    "diagnostics report should include the speech model")
         try expect(report.contains("Recent log lines:"), equals: true,
                    "diagnostics report should include the recent log section")
@@ -16900,27 +17064,32 @@ private enum ParakeySelfTest {
 
         try expect(
             productionSpeechModelProfile(rawValue: nil),
-            equals: .multilingualV3,
+            equals: .parakeetTDTv3,
             "missing speech model setting should use the production default"
         )
         try expect(
-            productionSpeechModelProfile(rawValue: SpeechModelProfile.multilingualV3.rawValue),
-            equals: .multilingualV3,
+            productionSpeechModelProfile(rawValue: SpeechModelProfile.parakeetTDTv3.rawValue),
+            equals: .parakeetTDTv3,
             "stored v3 speech model should remain valid"
         )
         try expect(
-            productionSpeechModelProfile(rawValue: SpeechModelProfile.englishUnified.rawValue),
-            equals: .multilingualV3,
-            "deprecated Unified speech model setting should migrate back to v3"
+            productionSpeechModelProfile(rawValue: "english_unified"),
+            equals: .parakeetTDTv3,
+            "old deprecated/legacy speech model setting should migrate to Parakeet TDT v3"
+        )
+        try expect(
+            productionSpeechModelProfile(rawValue: "multilingual_v3"),
+            equals: .parakeetTDTv3,
+            "old pre-migration Whisper speech model setting should migrate to Parakeet TDT v3"
         )
         try expect(
             productionSpeechModelProfile(rawValue: "unknown_model"),
-            equals: .multilingualV3,
-            "unknown speech model setting should migrate back to v3"
+            equals: .parakeetTDTv3,
+            "unknown speech model setting should migrate to Parakeet TDT v3"
         )
 
         try expect(
-            speechModelSetupRowState(profile: .multilingualV3,
+            speechModelSetupRowState(profile: .parakeetTDTv3,
                                      isSpeechModelReady: false,
                                      isStartupInProgress: true,
                                      startupStatusTitle: "Downloading speech model… 50%",
@@ -16931,7 +17100,7 @@ private enum ParakeySelfTest {
             "setup checklist should show speech model progress"
         )
         try expect(
-            speechModelSetupRowState(profile: .multilingualV3,
+            speechModelSetupRowState(profile: .parakeetTDTv3,
                                      isSpeechModelReady: false,
                                      isStartupInProgress: false,
                                      startupStatusTitle: "Loading speech model…",
@@ -16942,12 +17111,12 @@ private enum ParakeySelfTest {
             "setup checklist should offer retry for speech model failures"
         )
         try expect(
-            speechModelSetupRowState(profile: .multilingualV3,
+            speechModelSetupRowState(profile: .parakeetTDTv3,
                                      isSpeechModelReady: true,
                                      isStartupInProgress: false,
                                      startupStatusTitle: "Loading speech model…",
                                      failure: nil),
-            equals: SetupChecklistRowState(detail: "Whisper large-v3-turbo is loaded locally.",
+            equals: SetupChecklistRowState(detail: "Parakeet TDT 0.6B v3 is loaded locally.",
                                            status: "Ready",
                                            buttonTitle: nil),
             "setup checklist should show the speech model when ready"
@@ -17285,9 +17454,9 @@ private enum ParakeySelfTest {
             "history timing metadata should survive persistence"
         )
         try expect(
-            asrTimingTooltip(timing)?.contains("whisper.cpp  286.0 ms"),
+            asrTimingTooltip(timing)?.contains("parakeet.cpp  286.0 ms"),
             equals: true,
-            "history timing tooltip should expose the whisper.cpp engine's own processing time"
+            "history timing tooltip should expose the parakeet.cpp engine's own processing time"
         )
 
         let legacyEntryData = Data(
@@ -18432,96 +18601,65 @@ private enum ParakeySelfTest {
     }
 
     private static func testSpeechModelStartupStatus() throws {
-        // `.auto` must map to `nil` here, and `WhisperEngine.transcribe` must in
-        // turn map `nil` to the literal string "auto" (not leave whisper.cpp's
-        // compiled-in "en" default in place) — see the doc comment on
-        // `WhisperEngine.transcribe(samples:languageCode:)`. This test can only
-        // exercise the DictationLanguage → whisperLanguageCode half of that
-        // contract without a real loaded model; the nil → "auto" half is
-        // asserted by the doc comment + code review, not by an automated test,
-        // since exercising it for real would require a live whisper.cpp context.
+        // `.auto` maps to `nil` here — parakeet.cpp's plain PCM transcription
+        // entry point (wrapped by `sd_parakeet_transcribe`) does not accept a
+        // forced-language parameter at all (unlike whisper.cpp's
+        // `params.language`, which this app used to map `nil` to the literal
+        // string "auto" for), so `isoLanguageCode` is used only for
+        // deterministic post-processing (`ParakeetTranscriptRepair`) — see
+        // `DictationLanguage`'s doc comment in this file.
         try expect(
-            DictationLanguage.auto.whisperLanguageCode,
+            DictationLanguage.auto.isoLanguageCode,
             equals: nil,
-            "auto-detect must pass no language hint to whisper.cpp"
+            "auto-detect should resolve to no forced ISO language code"
         )
         try expect(
-            DictationLanguage.russian.whisperLanguageCode,
+            DictationLanguage.russian.isoLanguageCode,
             equals: "ru",
             "a specific language selection should pass its ISO-639-1 code through unchanged"
         )
         try expect(
-            resolveEffectiveWhisperLanguage(setting: .russian),
+            resolveEffectiveDictationLanguage(setting: .russian),
             equals: "ru",
             "an explicit language selection should bypass keyboard resolution unchanged"
         )
-        // resolveEffectiveWhisperLanguage(setting: .auto) itself depends on
+        // resolveEffectiveDictationLanguage(setting: .auto) itself depends on
         // the live Carbon keyboard input source, which is unavailable/unset
         // over SSH with no GUI session — so it can only be asserted here to
-        // not crash. The actual tag → whisper-code mapping it delegates to
+        // not crash. The actual tag → language-code mapping it delegates to
         // is a pure function and is fully exercised below.
-        _ = resolveEffectiveWhisperLanguage(setting: .auto)
+        _ = resolveEffectiveDictationLanguage(setting: .auto)
         try expect(
-            whisperLanguageCode(forKeyboardLanguageTag: "en-US"),
+            dictationLanguageCode(forKeyboardLanguageTag: "en-US"),
             equals: "en",
-            "a region-qualified BCP-47 tag should resolve to its primary subtag's whisper code"
+            "a region-qualified BCP-47 tag should resolve to its primary subtag's language code"
         )
         try expect(
-            whisperLanguageCode(forKeyboardLanguageTag: "RU"),
+            dictationLanguageCode(forKeyboardLanguageTag: "RU"),
             equals: "ru",
             "keyboard language tags should be matched case-insensitively"
         )
         try expect(
-            whisperLanguageCode(forKeyboardLanguageTag: "zh-Hans"),
+            dictationLanguageCode(forKeyboardLanguageTag: "zh-Hans"),
             equals: nil,
-            "a keyboard language with no matching DictationLanguage should fall through to whisper auto-detect"
+            "a keyboard language with no matching DictationLanguage should fall through to auto-detect"
         )
         try expect(
-            whisperLanguageCode(forKeyboardLanguageTag: ""),
+            dictationLanguageCode(forKeyboardLanguageTag: ""),
             equals: nil,
-            "an empty keyboard language tag should fall through to whisper auto-detect"
+            "an empty keyboard language tag should fall through to auto-detect"
         )
         try expect(
-            whisperLanguageCode(forKeyboardLanguageTag: "auto"),
+            dictationLanguageCode(forKeyboardLanguageTag: "auto"),
             equals: nil,
             "a keyboard tag literally matching DictationLanguage.auto's rawValue must not be treated as a forced language"
         )
-        // A 2s clip (32_000 samples @ 16kHz) needs only 2 * 50fps * 2x margin
-        // = 200 frames, which is below the 256 floor, so it clamps there —
-        // this is exercised separately below. A 5s clip (80_000 samples)
-        // needs 5 * 50fps * 2x margin = 500 frames, comfortably between the
-        // floor and the model max, which is what this pair of assertions
-        // checks.
-        try expect(
-            WhisperEngine.audioContextFrames(forSampleCount: 80_000, modelMaxAudioCtx: 1500) > 256,
-            equals: true,
-            "a 5s clip should size the encoder context above the floor"
-        )
-        try expect(
-            WhisperEngine.audioContextFrames(forSampleCount: 80_000, modelMaxAudioCtx: 1500) < 1500,
-            equals: true,
-            "a 5s clip should size the encoder context well below the full 30s window"
-        )
-        try expect(
-            WhisperEngine.audioContextFrames(forSampleCount: 32_000, modelMaxAudioCtx: 1500),
-            equals: 256,
-            "a 2s clip's naive requirement (200 frames) is below the floor, so it should clamp to 256"
-        )
-        try expect(
-            WhisperEngine.audioContextFrames(forSampleCount: 560_000, modelMaxAudioCtx: 1500),
-            equals: 1500,
-            "a 35s clip (longer than the model's max window) must clamp to modelMaxAudioCtx, never exceed it"
-        )
-        try expect(
-            WhisperEngine.audioContextFrames(forSampleCount: 0, modelMaxAudioCtx: 1500),
-            equals: 256,
-            "a zero-length clip must still return the floor, never 0 or negative"
-        )
-        try expect(
-            WhisperEngine.audioContextFrames(forSampleCount: 320, modelMaxAudioCtx: 1500),
-            equals: 256,
-            "a near-zero sample count must still return the floor, never 0 or negative"
-        )
+        // No Parakeet equivalent of whisper.cpp's `audio_ctx` window-trimming
+        // concept exists (parakeet.cpp's encoder is not the same
+        // architecture — see docs/parakeet-intel-backend.md's Phase 1
+        // integration checklist) — the former
+        // `WhisperEngine.audioContextFrames` boundary tests that lived here
+        // were removed along with `WhisperEngine.swift` itself, not ported.
         try expect(
             speechModelStartupStatusTitle(0),
             equals: "Checking speech model files…",
@@ -18552,29 +18690,29 @@ private enum ParakeySelfTest {
             equals: nil,
             "completed download should show indeterminate model progress"
         )
-        let requiredBytes = speechModelDownloadRequiredBytes(for: .multilingualV3,
+        let requiredBytes = speechModelDownloadRequiredBytes(for: .parakeetTDTv3,
                                                              headroomBytes: 100)
         try expect(
             requiredBytes,
-            equals: WHISPER_MODEL_SIZE_BYTES + 100,
+            equals: PARAKEET_MODEL_SIZE_BYTES + 100,
             "speech model download requirement should include model estimate plus headroom"
         )
         try expect(
-            speechModelDiskSpaceFailureDetail(profile: .multilingualV3,
+            speechModelDiskSpaceFailureDetail(profile: .parakeetTDTv3,
                                               availableBytes: requiredBytes - 1,
                                               requiredBytes: requiredBytes)?.contains("Free some disk space"),
             equals: true,
             "low disk-space failures should explain how to recover"
         )
         try expect(
-            speechModelDiskSpaceFailureDetail(profile: .multilingualV3,
+            speechModelDiskSpaceFailureDetail(profile: .parakeetTDTv3,
                                               availableBytes: requiredBytes,
                                               requiredBytes: requiredBytes),
             equals: nil,
             "disk-space check should pass once required space is available"
         )
         try expect(
-            speechModelDiskSpaceFailureDetail(profile: .multilingualV3,
+            speechModelDiskSpaceFailureDetail(profile: .parakeetTDTv3,
                                               availableBytes: nil,
                                               requiredBytes: requiredBytes),
             equals: nil,
@@ -18693,12 +18831,12 @@ private enum ParakeySelfTest {
         try expect(rejectedSymlinkHashRead, equals: true,
                    "model integrity hashing should not follow leaf symlinks")
 
-        let localWhisperCache = speechModelCacheDirectory(for: .productionDefault)
-        if fm.fileExists(atPath: localWhisperCache.path) {
+        let localParakeetCache = speechModelCacheDirectory(for: .productionDefault)
+        if fm.fileExists(atPath: localParakeetCache.path) {
             try expect(
-                try sha256Hex(ofFileAt: localWhisperCache) == WHISPER_MODEL_SHA256,
+                try sha256Hex(ofFileAt: localParakeetCache) == PARAKEET_MODEL_SHA256,
                 equals: true,
-                "cached whisper model should pass checksum verification"
+                "cached Parakeet model should pass checksum verification"
             )
         }
     }
@@ -18707,61 +18845,61 @@ private enum ParakeySelfTest {
         let fm = FileManager.default
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("parakey-cache-safety-\(UUID().uuidString)", isDirectory: true)
-        let support = root.appendingPathComponent("Whisper", isDirectory: true)
-        let cache = support.appendingPathComponent("Models/ggml-large-v3-turbo.bin", isDirectory: true)
+        let support = root.appendingPathComponent("SuperDictate", isDirectory: true)
+        let cache = support.appendingPathComponent("Models/parakeet-tdt-0.6b-v3-q8_0.gguf", isDirectory: true)
         try fm.createDirectory(at: cache, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: root) }
 
         try expect(
             isSafeSpeechModelCacheDirectory(
                 cache,
-                whisperSupportDirectory: support
+                parakeetSupportDirectory: support
             ),
             equals: true,
-            "speech model cache reset should allow nested Whisper cache paths"
+            "speech model cache reset should allow nested Parakeet cache paths"
         )
         try expect(
             isExistingSpeechModelCacheDirectorySafeForRemoval(cache,
-                                                             whisperSupportDirectory: support),
+                                                             parakeetSupportDirectory: support),
             equals: true,
             "speech model cache reset should allow existing plain cache directories"
         )
         try expect(
-            isSafeSpeechModelCacheDirectory(support, whisperSupportDirectory: support),
+            isSafeSpeechModelCacheDirectory(support, parakeetSupportDirectory: support),
             equals: false,
-            "speech model cache reset should not remove the Whisper support root"
+            "speech model cache reset should not remove the SuperDictate support root"
         )
         try expect(
             isSafeSpeechModelCacheDirectory(
-                support.deletingLastPathComponent().appendingPathComponent("WhisperBackup/ggml-large-v3-turbo.bin", isDirectory: true),
-                whisperSupportDirectory: support
+                support.deletingLastPathComponent().appendingPathComponent("SuperDictateBackup/parakeet-tdt-0.6b-v3-q8_0.gguf", isDirectory: true),
+                parakeetSupportDirectory: support
             ),
             equals: false,
             "speech model cache reset should reject sibling support directories"
         )
         try expect(
             isSafeSpeechModelCacheDirectory(
-                support.appendingPathComponent("../Outside/ggml-large-v3-turbo.bin", isDirectory: true),
-                whisperSupportDirectory: support
+                support.appendingPathComponent("../Outside/parakeet-tdt-0.6b-v3-q8_0.gguf", isDirectory: true),
+                parakeetSupportDirectory: support
             ),
             equals: false,
-            "speech model cache reset should reject paths that normalize outside Whisper support"
+            "speech model cache reset should reject paths that normalize outside SuperDictate support"
         )
 
         let outside = root.appendingPathComponent("Outside", isDirectory: true)
-        let outsideCache = outside.appendingPathComponent("ggml-large-v3-turbo.bin", isDirectory: true)
+        let outsideCache = outside.appendingPathComponent("parakeet-tdt-0.6b-v3-q8_0.gguf", isDirectory: true)
         try fm.createDirectory(at: outsideCache, withIntermediateDirectories: true)
 
         let leafLink = support.appendingPathComponent("Models/link-cache", isDirectory: true)
         try fm.createSymbolicLink(at: leafLink, withDestinationURL: outsideCache)
         try expect(
-            isSafeSpeechModelCacheDirectory(leafLink, whisperSupportDirectory: support),
+            isSafeSpeechModelCacheDirectory(leafLink, parakeetSupportDirectory: support),
             equals: true,
             "speech model cache reset path check should remain string-only"
         )
         try expect(
             isExistingSpeechModelCacheDirectorySafeForRemoval(leafLink,
-                                                             whisperSupportDirectory: support),
+                                                             parakeetSupportDirectory: support),
             equals: false,
             "speech model cache reset should reject leaf symlink directories before deletion"
         )
@@ -18770,8 +18908,8 @@ private enum ParakeySelfTest {
         try fm.createSymbolicLink(at: linkedParent, withDestinationURL: outside)
         try expect(
             isExistingSpeechModelCacheDirectorySafeForRemoval(
-                linkedParent.appendingPathComponent("ggml-large-v3-turbo.bin", isDirectory: true),
-                whisperSupportDirectory: support
+                linkedParent.appendingPathComponent("parakeet-tdt-0.6b-v3-q8_0.gguf", isDirectory: true),
+                parakeetSupportDirectory: support
             ),
             equals: false,
             "speech model cache reset should reject symlinked parent directories before deletion"
@@ -18779,31 +18917,32 @@ private enum ParakeySelfTest {
         try expect(
             isSafeSpeechModelCacheDirectory(speechModelCacheDirectory(for: .productionDefault)),
             equals: true,
-            "Whisper v3 cache path should remain inside Whisper Application Support"
+            "Parakeet cache path should remain inside SuperDictate Application Support"
         )
-        let defaultV3Cache = speechModelCacheDirectory(for: .productionDefault)
-        if fm.fileExists(atPath: defaultV3Cache.path) {
+        let defaultCache = speechModelCacheDirectory(for: .productionDefault)
+        if fm.fileExists(atPath: defaultCache.path) {
             try expect(
-                isExistingSpeechModelCacheDirectorySafeForRemoval(defaultV3Cache),
+                isExistingSpeechModelCacheDirectorySafeForRemoval(defaultCache),
                 equals: true,
-                "existing Whisper v3 cache path should remain removable"
+                "existing Parakeet cache path should remain removable"
             )
         }
 
-        // Exercise the file-leaf case directly: the real whisper cache path
-        // is a regular file, not a directory (fixed as part of this port —
+        // Exercise the file-leaf case directly: the real Parakeet cache path
+        // is a regular file, not a directory (fixed as part of the original
+        // Whisper port this inherited from —
         // isExistingSpeechModelCacheDirectorySafeForRemoval previously walked
         // every path component, including the leaf, through
         // isExistingPlainDirectory, which meant it could never return true
         // for a file-shaped cache target and removeSpeechModelCacheDirectory
         // would permanently refuse to remove the cached model).
-        let fileLeafCache = support.appendingPathComponent("Models/ggml-file-leaf.bin", isDirectory: false)
+        let fileLeafCache = support.appendingPathComponent("Models/parakeet-file-leaf.gguf", isDirectory: false)
         try fm.createDirectory(at: fileLeafCache.deletingLastPathComponent(),
                                withIntermediateDirectories: true)
         try Data("fake model bytes".utf8).write(to: fileLeafCache)
         try expect(
             isExistingSpeechModelCacheDirectorySafeForRemoval(fileLeafCache,
-                                                             whisperSupportDirectory: support),
+                                                             parakeetSupportDirectory: support),
             equals: true,
             "speech model cache reset should allow removing a file-shaped cache leaf"
         )
@@ -19623,6 +19762,225 @@ private enum ParakeySelfTest {
         )
     }
 
+    // MARK: - Sync bridge for actor calls from the (synchronous) self-test runner
+    //
+    // `ParakeetEngine` is an actor; calling any of its methods from outside
+    // requires crossing an isolation boundary, which is always `async` at
+    // the call site even for a nominally-synchronous-bodied method. The
+    // self-test entry point (`ParakeySelfTest.run`, called from top-level
+    // code in this file) is plain synchronous code, so a small
+    // semaphore-based bridge is needed to call into the actor and get a
+    // result back before returning. Write-then-signal / wait-then-read
+    // through the semaphore is the standard safe pattern here: the
+    // semaphore itself provides the happens-before relationship, so
+    // `@unchecked Sendable` on the box is justified by construction (single
+    // writer before signal, single reader after wait).
+    private final class ParakeetSyncBridgeBox<T>: @unchecked Sendable {
+        var result: Result<T, Error>?
+    }
+
+    private static func runParakeetEngineSynchronously<T: Sendable>(_ operation: @escaping @Sendable () async throws -> T) throws -> T {
+        let semaphore = DispatchSemaphore(value: 0)
+        let box = ParakeetSyncBridgeBox<T>()
+        Task {
+            do {
+                box.result = .success(try await operation())
+            } catch {
+                box.result = .failure(error)
+            }
+            semaphore.signal()
+        }
+        semaphore.wait()
+        switch box.result! {
+        case .success(let value): return value
+        case .failure(let error): throw error
+        }
+    }
+
+    // MARK: - Parakeet transcript repair (spec §13's required test coverage:
+    // sentence-initial, mid-word/mid-sentence, punctuation-adjacent, repeated
+    // tokens, Russian/auto/non-Russian). `testRecordingLifecycle()` already
+    // exercises a few of these cases end-to-end through
+    // `processedDictationText`; this group calls `ParakeetTranscriptRepair`
+    // directly for focused, addressable coverage of the full matrix.
+
+    private static func testParakeetTranscriptRepair() throws {
+        try expect(
+            ParakeetTranscriptRepair.apply(to: "<unk>лка стоит в углу.", language: .russian),
+            equals: "Ёлка стоит в углу.",
+            "sentence-initial <unk> should repair to capitalized Ё for Russian"
+        )
+        try expect(
+            ParakeetTranscriptRepair.apply(to: "Моя л<unk>бимая песня.", language: .russian),
+            equals: "Моя лёбимая песня.",
+            "mid-word <unk> should repair to lowercase ё"
+        )
+        try expect(
+            ParakeetTranscriptRepair.apply(to: "Привет, <unk>! Как дела?", language: .auto),
+            equals: "Привет, ё! Как дела?",
+            "punctuation-adjacent <unk> should repair correctly under auto-detect"
+        )
+        try expect(
+            ParakeetTranscriptRepair.apply(to: "<unk> и <unk> и <unk>.", language: .russian),
+            equals: "Ё и ё и ё.",
+            "repeated <unk> tokens should each repair independently"
+        )
+        try expect(
+            ParakeetTranscriptRepair.apply(to: "Hello <unk> world.", language: .english),
+            equals: "Hello world.",
+            "non-Russian language should remove <unk> rather than substitute Cyrillic ё"
+        )
+        try expect(
+            ParakeetTranscriptRepair.apply(to: "No unknown tokens here.", language: .russian),
+            equals: "No unknown tokens here.",
+            "text without <unk> should pass through unchanged (the guard makes this a no-op)"
+        )
+    }
+
+    // MARK: - Parakeet bridge (spec §18.1 — no large model required)
+
+    private static func testParakeetBridge() throws {
+        // Null/invalid-path handling: ParakeetEngine.init checks
+        // FileManager existence before ever calling into the native bridge,
+        // so this also covers "invalid model path" without needing a live
+        // parakeet.cpp context or the ~940MB GGUF.
+        var threwModelNotFound = false
+        do {
+            _ = try ParakeetEngine(
+                modelPath: "/nonexistent/path/to/model-\(UUID().uuidString).gguf",
+                device: .cpu,
+                threadCount: 4
+            )
+        } catch ParakeetEngineError.modelNotFound {
+            threwModelNotFound = true
+        }
+        try expect(threwModelNotFound, equals: true,
+                   "ParakeetEngine should reject a nonexistent model path with .modelNotFound")
+
+        // Requesting Vulkan must fail deterministically this phase (not
+        // vendored/compiled in yet) rather than silently falling back to
+        // CPU while claiming GPU — see ParakeetEngine.init's guard.
+        var threwVulkanUnavailable = false
+        do {
+            _ = try ParakeetEngine(
+                modelPath: "/nonexistent/path/to/model-\(UUID().uuidString).gguf",
+                device: .vulkan,
+                threadCount: 4
+            )
+        } catch ParakeetEngineError.vulkanUnavailable {
+            threwVulkanUnavailable = true
+        }
+        try expect(threwVulkanUnavailable, equals: true,
+                   "requesting Vulkan should fail deterministically, not silently fall back to CPU")
+
+        // parakeet.cpp's own version string is a native call that needs no
+        // loaded model — exercises the bridge/native link itself.
+        try expect(
+            parakeetRuntimeVersion().isEmpty,
+            equals: false,
+            "parakeet.cpp runtime version string should be non-empty"
+        )
+
+        // Thread-count policy (spec §10): max(2, min(8, active/2)), with a
+        // validated SUPERDICTATE_ASR_THREADS override (1...32).
+        try expect(
+            TranscriptionWorker.resolvedParakeetThreadCount(activeProcessorCount: 4, environmentOverride: nil),
+            equals: 2,
+            "4 active processors should floor to the minimum of 2 threads"
+        )
+        try expect(
+            TranscriptionWorker.resolvedParakeetThreadCount(activeProcessorCount: 32, environmentOverride: nil),
+            equals: 8,
+            "a high processor count should cap at the maximum of 8 threads"
+        )
+        try expect(
+            TranscriptionWorker.resolvedParakeetThreadCount(activeProcessorCount: 8, environmentOverride: nil),
+            equals: 4,
+            "8 active processors should use half (4) within the 2...8 band"
+        )
+        try expect(
+            TranscriptionWorker.resolvedParakeetThreadCount(activeProcessorCount: 8, environmentOverride: "6"),
+            equals: 6,
+            "a valid SUPERDICTATE_ASR_THREADS override should take precedence over the default policy"
+        )
+        try expect(
+            TranscriptionWorker.resolvedParakeetThreadCount(activeProcessorCount: 8, environmentOverride: "0"),
+            equals: 4,
+            "an out-of-range (below 1) override should be ignored, falling back to the default"
+        )
+        try expect(
+            TranscriptionWorker.resolvedParakeetThreadCount(activeProcessorCount: 8, environmentOverride: "64"),
+            equals: 4,
+            "an out-of-range (above 32) override should be ignored, falling back to the default"
+        )
+        try expect(
+            TranscriptionWorker.resolvedParakeetThreadCount(activeProcessorCount: 8, environmentOverride: "not-a-number"),
+            equals: 4,
+            "a non-numeric override should be ignored, falling back to the default"
+        )
+
+        // Model metadata pins (spec §3 / §27) — guards against silent drift
+        // of the values recorded in the migration plan/report.
+        try expect(PARAKEET_MODEL_SIZE_BYTES, equals: 940_663_680,
+                   "pinned Parakeet model size must match the value verified in Phase 2")
+        try expect(PARAKEET_MODEL_SHA256, equals: "4d69a4a6683f4f2d952bad794c1357ca6eb628027695b4699c5a9ad4cd07d757",
+                   "pinned Parakeet model SHA-256 must match the value verified in Phase 2")
+        try expect(PARAKEET_MODEL_FILENAME, equals: "tdt-0.6b-v3-q8_0.gguf",
+                   "pinned Parakeet model filename must not drift silently")
+    }
+
+    // MARK: - Parakeet CPU integration (spec §18.2 — real model, opt-in via env var)
+
+    /// Skipped (not failed) unless `SUPERDICTATE_PARAKEET_MODEL` points at a
+    /// real, already-downloaded GGUF — mirrors spec §18.2's "if the
+    /// environment variable or device is absent, mark the integration test
+    /// skipped, not passed" requirement (written for the Vulkan case there,
+    /// applied here to the CPU case too since CI/most dev machines won't
+    /// have the ~940MB model pre-staged).
+    private static func testParakeetCPUIntegration() throws {
+        guard let modelPath = ProcessInfo.processInfo.environment["SUPERDICTATE_PARAKEET_MODEL"],
+              FileManager.default.fileExists(atPath: modelPath) else {
+            print("SKIP parakeet-cpu: SUPERDICTATE_PARAKEET_MODEL not set to an existing file")
+            return
+        }
+
+        let threadCount = TranscriptionWorker.resolvedParakeetThreadCount()
+        let loadStarted = ProcessInfo.processInfo.systemUptime
+        // ParakeetEngine.init is synchronous (an actor's init runs before
+        // the instance's isolation is established, so no `await` is needed
+        // to call it) — only its instance methods need the sync bridge
+        // below. `engine` itself is Sendable (actors are Sendable by
+        // construction), so it can be captured directly in the bridge's
+        // `Task { }` closures with no extra wrapper.
+        let engine = try ParakeetEngine(modelPath: modelPath, device: .cpu, threadCount: threadCount)
+        let loadSeconds = ProcessInfo.processInfo.systemUptime - loadStarted
+
+        try runParakeetEngineSynchronously { try await engine.warmUp() }
+
+        // 0.5s of near-silence (a tiny DC offset, not exact zero, so this
+        // isn't indistinguishable from a truly empty buffer) — enough to
+        // exercise a real forward pass without needing a real speech
+        // fixture file bundled into the repo.
+        let sampleCount = Int(SAMPLE_RATE * 0.5)
+        let samples = [Float](repeating: 0.0001, count: sampleCount)
+        let inferStarted = ProcessInfo.processInfo.systemUptime
+        let result = try runParakeetEngineSynchronously { try await engine.transcribe(samples: samples) }
+        let inferSeconds = ProcessInfo.processInfo.systemUptime - inferStarted
+        let rtf = inferSeconds / max(0.001, Double(sampleCount) / SAMPLE_RATE)
+
+        print("PARAKEET CPU: load \(String(format: "%.2f", loadSeconds))s, threads \(threadCount), infer \(String(format: "%.3f", inferSeconds))s, RTF \(String(format: "%.3f", rtf)), text=\"\(result.text)\"")
+
+        // Repeat inference on the SAME loaded context (load-once contract).
+        let secondResult = try runParakeetEngineSynchronously { try await engine.transcribe(samples: samples) }
+        print("PARAKEET CPU (2nd call, same context): text=\"\(secondResult.text)\"")
+
+        // Destroy and recreate the context safely (spec §18.2 item 7).
+        try runParakeetEngineSynchronously { await engine.shutdown() }
+        let recreated = try ParakeetEngine(modelPath: modelPath, device: .cpu, threadCount: threadCount)
+        try runParakeetEngineSynchronously { try await recreated.warmUp() }
+        try runParakeetEngineSynchronously { await recreated.shutdown() }
+    }
+
     private static func testAudioRouteChangeDecision() throws {
         try expect(
             audioStartupRetryDelaySeconds(afterFailedAttempt: 1),
@@ -19818,7 +20176,7 @@ private enum ParakeySelfTest {
             "non-Russian language should remove <unk> tokens, not replace with Cyrillic ё"
         )
 
-        let removedUnkPunctuation = SpeechModelTextRepair.apply(
+        let removedUnkPunctuation = ParakeetTranscriptRepair.apply(
             to: "Hello <unk>, world.",
             language: .english
         )
@@ -19828,7 +20186,7 @@ private enum ParakeySelfTest {
             "removing <unk> should not leave a space before punctuation"
         )
 
-        let removedUnkMultiSpace = SpeechModelTextRepair.apply(
+        let removedUnkMultiSpace = ParakeetTranscriptRepair.apply(
             to: "Hello <unk>   world",
             language: .english
         )
@@ -19838,17 +20196,17 @@ private enum ParakeySelfTest {
             "removing <unk> should collapse multi-space runs left behind"
         )
 
-        let removedUnkFrench = SpeechModelTextRepair.apply(
+        let removedUnkFrench = ParakeetTranscriptRepair.apply(
             to: "Bonjour <unk> le monde.",
             language: .french
         )
         try expect(
             removedUnkFrench,
             equals: "Bonjour le monde.",
-            "SpeechModelTextRepair should strip <unk> for French"
+            "ParakeetTranscriptRepair should strip <unk> for French"
         )
 
-        let autoYo = SpeechModelTextRepair.apply(
+        let autoYo = ParakeetTranscriptRepair.apply(
             to: "<unk>лка",
             language: .auto
         )

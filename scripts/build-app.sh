@@ -55,7 +55,12 @@ cp "$ROOT_DIR/swift/Info.plist" "$STAGE_APP/Contents/Info.plist"
 cp "$ROOT_DIR/swift/Resources/parakey-menubar.png" "$STAGE_APP/Contents/Resources/"
 cp "$ROOT_DIR/swift/Resources/parakey-menubar@2x.png" "$STAGE_APP/Contents/Resources/"
 cp "$ROOT_DIR/icon/Parakey.icns" "$STAGE_APP/Contents/Resources/Parakey.icns"
-cp -R "$ROOT_DIR/swift/Sources/whisper_cpp/vulkan-shaders" "$STAGE_APP/Contents/Resources/vulkan-shaders"
+# No vulkan-shaders resource copy this phase: Parakeet CPU only (Phase 3 of
+# the parakeet.cpp migration plan). whisper_cpp's precompiled SPIR-V corpus
+# was deleted along with the rest of swift/Sources/whisper_cpp/ — it targeted
+# whisper's own ggml vintage and would not have been reusable against
+# parakeet.cpp's pinned ggml v0.13.0 anyway. Phase 5 (Vulkan) will add a
+# fresh shader corpus and its own resource-copy step here.
 chmod 755 "$STAGE_APP/Contents/MacOS/SuperDictate"
 
 SIGN_ARGS=(--force --deep --sign "$SIGN_IDENTITY" --options runtime
