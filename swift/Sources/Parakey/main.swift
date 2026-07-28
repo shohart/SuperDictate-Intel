@@ -5,13 +5,13 @@
 // default with an opt-in Vulkan GPU backend — see the "Use GPU" setting),
 // paste-at-cursor (`NSPasteboard` + `CGEvent`),
 // system-audio mute (`NSAppleScript`), menu-bar UI, settings,
-// rolling history, in-app updater, TCC self-healing.
+// rolling history, in-app updater, and permission guidance.
 //
 // Section comments (`// MARK: -`) tag every major region; Cmd+Ctrl+Up
 // in Xcode jumps between them. Keep them honest as you edit.
 //
 // Architectural invariants the build relies on are documented in
-// ../../AGENTS.md — read that before refactoring concurrency,
+// ../../../AGENTS.md — read that before refactoring concurrency,
 // resource loading, or codesigning. In particular:
 //   - `AudioCapture` is *not* @MainActor (AVAudioEngine tap fires on
 //     an audio thread; main-actor entry would SIGTRAP under Swift 6
@@ -2207,6 +2207,77 @@ func audioInputDevice(matching preference: String,
         ?? devices.first { $0.name.caseInsensitiveCompare(trimmed) == .orderedSame }
 }
 
+/// Whether a saved audio-input preference differs meaningfully from
+/// the preference audio capture is currently running with, once both
+/// are normalized the same way `applyInputDevicePreference` and
+/// `audioInputDevice(matching:)` already normalize preferences
+/// elsewhere in this file (trimmed, with any spelling of "system
+/// default" — including CoreAudio default-aggregate UIDs/names —
+/// collapsed to the same value). Two preferences that both normalize
+/// to "system default" are not a change even if their raw strings
+/// differ (e.g. "" vs a stale aggregate UID left over from a previous
+/// save), so this never reports a spurious change for that case.
+func audioInputPreferenceDidChange(saved: String, activeAtLastEngineStart: String) -> Bool {
+    normalizedInputDevicePreference(saved) != normalizedInputDevicePreference(activeAtLastEngineStart)
+}
+
+func currentAudioInputDeviceID(for unit: AudioUnit) -> AudioDeviceID? {
+    var deviceID = AudioDeviceID(0)
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    let status = AudioUnitGetProperty(unit,
+                                      kAudioOutputUnitProperty_CurrentDevice,
+                                      kAudioUnitScope_Global,
+                                      0,
+                                      &deviceID,
+                                      &size)
+    guard status == noErr, size == UInt32(MemoryLayout<AudioDeviceID>.size) else {
+        return nil
+    }
+    return deviceID
+}
+
+func audioInputDeviceNominalSampleRate(_ deviceID: AudioDeviceID) -> Double? {
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyNominalSampleRate,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var sampleRate = Float64(0)
+    var size = UInt32(MemoryLayout<Float64>.size)
+    let status = AudioObjectGetPropertyData(deviceID,
+                                            &address,
+                                            0,
+                                            nil,
+                                            &size,
+                                            &sampleRate)
+    guard status == noErr, sampleRate > 0 else { return nil }
+    return sampleRate
+}
+
+/// Pure decision helper, ported from upstream, for whether a settings
+/// change to the microphone preference should trigger an audio-only
+/// restart of a *running* agent process, given whether that process's
+/// core runtime is ready. Not currently wired to anything in this
+/// fork: the settings window and its "Save" button run in
+/// `SuperDictateControlPanelApp`, a separate OS process from
+/// `ParakeyApp` (the `--agent` process where audio capture actually
+/// runs), so this fork cannot call this from the settings-save path
+/// and reach the running agent directly. Instead, saving the
+/// microphone preference here goes through the existing full-relaunch
+/// path shared by every other setting
+/// (`beginServiceOperation(.applyingSettings)`), and the relaunched
+/// agent reads `settings.inputDevice` fresh from `UserDefaults` at its
+/// own startup (see `startAudioInputWithRetries`) — no live-reload
+/// call needed for correctness. Kept here (exercised only by the
+/// self-test below) so a later, in-scope addition of a cross-process
+/// bridge (mirroring the `HOTKEY_CAPTURE_BEGIN/END_NOTIFICATION`
+/// precedent) can reuse this decision logic instead of duplicating it.
+func shouldRestartAudioInputForSettingsChange(previousPreference: String,
+                                               nextPreference: String,
+                                               isCoreRuntimeReady: Bool) -> Bool {
+    isCoreRuntimeReady && previousPreference != nextPreference
+}
+
 // MARK: - Logger
 //
 // All output goes to stderr (line-buffered, so we don't lose lines
@@ -2322,12 +2393,40 @@ enum SuperDictateControlPanelRegistry {
         return true
     }
 
-    static func claimCurrentPanel() {
-        do {
-            try "\(getpid())\n".write(to: url, atomically: true, encoding: .utf8)
-        } catch {
-            log("control panel pid write failed: \(error.localizedDescription)")
+    static func claimCurrentPanel() -> Bool {
+        for _ in 0..<2 {
+            let fd = Darwin.open(
+                url.path,
+                O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                mode_t(S_IRUSR | S_IWUSR)
+            )
+            if fd >= 0 {
+                do {
+                    try writeAllData(Data("\(getpid())\n".utf8), to: fd)
+                    guard Darwin.close(fd) == 0 else {
+                        _ = Darwin.unlink(url.path)
+                        log("control panel pid close failed")
+                        return false
+                    }
+                    return true
+                } catch {
+                    _ = Darwin.close(fd)
+                    _ = Darwin.unlink(url.path)
+                    log("control panel pid write failed: \(error.localizedDescription)")
+                    return false
+                }
+            }
+
+            guard errno == EEXIST else {
+                log("control panel pid claim failed: \(currentPOSIXError().localizedDescription)")
+                return false
+            }
+            if currentPanelPID() != nil {
+                return false
+            }
+            _ = Darwin.unlink(url.path)
         }
+        return false
     }
 
     static func clearCurrentPanel() {
@@ -2377,7 +2476,13 @@ enum SuperDictateAgentService {
         try writeLaunchAgentPlist()
         _ = runLaunchctl(["bootstrap", launchDomain, launchAgentURL.path])
         _ = runLaunchctl(["enable", launchService])
-        let kick = runLaunchctl(["kickstart", "-k", launchService])
+        if isAgentRunning() {
+            return
+        }
+        // Never use `kickstart -k` here: opening the control panel while
+        // CoreML is still loading must not kill the healthy agent and make
+        // Neural Engine preparation start over.
+        let kick = runLaunchctl(["kickstart", launchService])
         if kick.status != 0 && !isAgentRunning() {
             throw NSError(domain: "SuperDictateAgentService",
                           code: Int(kick.status),
@@ -2406,6 +2511,10 @@ enum SuperDictateAgentService {
             return true
         }
         return !agentProcessIDs().isEmpty
+    }
+
+    static func isAgentLoadedOrRunning() -> Bool {
+        isAgentRunning() || runLaunchctl(["print", launchService]).status == 0
     }
 
     static func agentProcessIDs() -> [Int32] {
@@ -2635,8 +2744,8 @@ final class Settings: @unchecked Sendable {
 
     static let shared = Settings()
 
-    init() {
-        self.defaults = .standard
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
     }
 
     @discardableResult
@@ -3706,7 +3815,7 @@ final class Permissions {
         case .microphone:
             let status = AVCaptureDevice.authorizationStatus(for: .audio)
             if status == .denied {
-                openSettingsPane("Privacy_Microphone")
+                openSettings(for: p)
             } else {
                 AVCaptureDevice.requestAccess(for: .audio) { granted in
                     log("Microphone request: granted=\(granted)")
@@ -3723,18 +3832,25 @@ final class Permissions {
             // string literal that matches its documented value.
             let key = "AXTrustedCheckOptionPrompt"
             _ = AXIsProcessTrustedWithOptions([key: kCFBooleanTrue!] as CFDictionary)
-            openSettingsPane("Privacy_Accessibility")
         case .inputMonitoring:
             // CGRequestListenEventAccess is the canonical request
             // path for CGEventTap clients. On macOS 26 it registers
-            // the app in the Input Monitoring list and shows a
-            // prompt OR opens Settings as appropriate.
+            // the app in the Input Monitoring list and shows the
+            // native permission prompt.
             _ = CGRequestListenEventAccess()
-            openSettingsPane("Privacy_ListenEvent")
         }
     }
 
-    private static func openSettingsPane(_ subpath: String) {
+    static func openSettings(for permission: Permission) {
+        let subpath: String
+        switch permission {
+        case .microphone:
+            subpath = "Privacy_Microphone"
+        case .accessibility:
+            subpath = "Privacy_Accessibility"
+        case .inputMonitoring:
+            subpath = "Privacy_ListenEvent"
+        }
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(subpath)") {
             NSWorkspace.shared.open(url)
         }
@@ -4930,26 +5046,12 @@ final class AudioCapture: @unchecked Sendable {
         }
 
         let input = engine.inputNode
-        applyInputDevicePreference(inputDevicePreference, to: input)
-        let inputFormat = input.outputFormat(forBus: 0)
-
-        guard let targetFormat = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: SAMPLE_RATE,
-            channels: 1,
-            interleaved: false
-        ) else { throw NSError(domain: "Parakey", code: -1) }
-
-        let sourceFormat = converterSourceFormat(for: inputFormat)
-        let mixToMono = inputFormat.channelCount > 1 && sourceFormat.channelCount == 1
-        let newConverter = AVAudioConverter(from: sourceFormat, to: targetFormat)
-        // Publish the converter trio under the lock — handleTap reads
-        // them on the render thread (see the locking-discipline note
-        // on the class comment).
+        let selectedDevice = applyInputDevicePreference(inputDevicePreference, to: input)
+        if let selectedDevice {
+            waitForSelectedInputDevice(selectedDevice, on: input)
+        }
+        _ = try installCaptureTap(on: input)
         lock.lock()
-        converterInputFormat = sourceFormat
-        manuallyMixInputToMono = mixToMono
-        converter = newConverter
         if recordingImmediately {
             recordingGeneration &+= 1
             samples.removeAll(keepingCapacity: true)
@@ -4959,19 +5061,9 @@ final class AudioCapture: @unchecked Sendable {
             self.recoveryJournal = recoveryJournal
         }
         lock.unlock()
-        let mixLabel = mixToMono ? " via manual mono mix" : ""
-        log("AudioCapture: input \(inputFormat.sampleRate) Hz \(inputFormat.channelCount)ch\(mixLabel) → \(targetFormat.sampleRate) Hz mono")
-
-        // Capture targetFormat by value into the closure. self is
-        // weak so the engine doesn't keep AudioCapture alive past
-        // its owner. The closure runs on AVFoundation's audio
-        // thread — handleTap is non-isolated and uses NSLock for
-        // any shared-state access.
-        input.installTap(onBus: 0, bufferSize: 512, format: inputFormat) { [weak self] buffer, _ in
-            self?.handleTap(buffer: buffer, target: targetFormat)
-        }
 
         do {
+            engine.prepare()
             try engine.start()
         } catch {
             input.removeTap(onBus: 0)
@@ -4995,6 +5087,39 @@ final class AudioCapture: @unchecked Sendable {
         try startEngine(inputDevicePreference: inputDevicePreference,
                         recordingImmediately: true,
                         recoveryJournal: recoveryJournal)
+    }
+
+    /// AVAudioEngine stops and uninitializes its I/O unit when a selected
+    /// device changes sample rate or channel layout. Rebuild the tap and
+    /// converter on the existing engine so its explicitly selected HAL
+    /// device remains attached and an active recording can continue.
+    fileprivate func recoverAfterConfigurationChange() throws -> Bool {
+        guard isEngineStarted else { return false }
+
+        let input = engine.inputNode
+        input.removeTap(onBus: 0)
+        engine.stop()
+
+        var didInstallTap = false
+        do {
+            let inputFormat = try installCaptureTap(on: input)
+            didInstallTap = true
+            engine.prepare()
+            try engine.start()
+            log("AudioCapture: graph recovered at \(inputFormat.sampleRate) Hz \(inputFormat.channelCount)ch")
+            return true
+        } catch {
+            if didInstallTap {
+                input.removeTap(onBus: 0)
+            }
+            lock.lock()
+            converter = nil
+            converterInputFormat = nil
+            manuallyMixInputToMono = false
+            engineStarted = false
+            lock.unlock()
+            throw error
+        }
     }
 
     func stopEngine() {
@@ -5105,6 +5230,64 @@ final class AudioCapture: @unchecked Sendable {
         return _isRunning
             ? (latestLevel, latestLevelSequence)
             : (0, latestLevelSequence)
+    }
+
+    private func installCaptureTap(on input: AVAudioInputNode) throws -> AVAudioFormat {
+        // On macOS, changing kAudioOutputUnitProperty_CurrentDevice updates
+        // the input scope immediately while AVAudioInputNode's output scope
+        // can keep the previous device's sample rate indefinitely. Passing
+        // that stale output format to installTap raises an Objective-C
+        // exception instead of returning an error. The input-scope format is
+        // the actual hardware stream delivered by the selected device.
+        let inputFormat = input.inputFormat(forBus: 0)
+        guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
+            throw NSError(
+                domain: "SuperDictate.AudioCapture",
+                code: -2,
+                userInfo: [NSLocalizedDescriptionKey: "The selected microphone has no active audio stream."]
+            )
+        }
+        guard let targetFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: SAMPLE_RATE,
+            channels: 1,
+            interleaved: false
+        ) else {
+            throw NSError(
+                domain: "SuperDictate.AudioCapture",
+                code: -3,
+                userInfo: [NSLocalizedDescriptionKey: "Could not create the transcription audio format."]
+            )
+        }
+
+        let sourceFormat = converterSourceFormat(for: inputFormat)
+        let mixToMono = inputFormat.channelCount > 1 && sourceFormat.channelCount == 1
+        guard let newConverter = AVAudioConverter(from: sourceFormat, to: targetFormat) else {
+            throw NSError(
+                domain: "SuperDictate.AudioCapture",
+                code: -4,
+                userInfo: [NSLocalizedDescriptionKey: "Could not convert audio from the selected microphone."]
+            )
+        }
+
+        // Publish the converter trio under the lock — handleTap reads
+        // them on the render thread (see the locking-discipline note
+        // on the class comment).
+        lock.lock()
+        converterInputFormat = sourceFormat
+        manuallyMixInputToMono = mixToMono
+        converter = newConverter
+        lock.unlock()
+
+        // Capture targetFormat by value into the closure. self is weak so
+        // the engine does not keep AudioCapture alive past its owner.
+        input.installTap(onBus: 0, bufferSize: 512, format: inputFormat) { [weak self] buffer, _ in
+            self?.handleTap(buffer: buffer, target: targetFormat)
+        }
+
+        let mixLabel = mixToMono ? " via manual mono mix" : ""
+        log("AudioCapture: input \(inputFormat.sampleRate) Hz \(inputFormat.channelCount)ch\(mixLabel) → \(targetFormat.sampleRate) Hz mono")
+        return inputFormat
     }
 
     private func handleTap(buffer: AVAudioPCMBuffer, target: AVAudioFormat) {
@@ -5222,18 +5405,24 @@ final class AudioCapture: @unchecked Sendable {
         return out
     }
 
-    private func applyInputDevicePreference(_ preference: String, to input: AVAudioInputNode) {
+    private func applyInputDevicePreference(_ preference: String,
+                                            to input: AVAudioInputNode) -> AudioInputDevice? {
         let trimmed = preference.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        guard !isDefaultAggregateAudioInputPreference(trimmed) else { return }
+        guard !trimmed.isEmpty else { return nil }
+        guard !isDefaultAggregateAudioInputPreference(trimmed) else { return nil }
 
         guard let device = audioInputDevice(matching: trimmed) else {
             log("AudioCapture: saved input device unavailable, using system default")
-            return
+            return nil
         }
         guard let unit = input.audioUnit else {
             log("AudioCapture: input audio unit unavailable, using system default")
-            return
+            return nil
+        }
+
+        if currentAudioInputDeviceID(for: unit) == device.id {
+            log("AudioCapture: selected input \(device.name) already active")
+            return device
         }
 
         var deviceID = device.id
@@ -5245,9 +5434,39 @@ final class AudioCapture: @unchecked Sendable {
                                           UInt32(MemoryLayout<AudioDeviceID>.size))
         guard status == noErr else {
             log("AudioCapture: input device switch failed (\(formattedOSStatus(status))), using system default")
-            return
+            return nil
         }
         log("AudioCapture: selected input \(device.name)")
+        return device
+    }
+
+    private func waitForSelectedInputDevice(_ device: AudioInputDevice,
+                                            on input: AVAudioInputNode) {
+        guard let unit = input.audioUnit else { return }
+
+        let expectedRate = audioInputDeviceNominalSampleRate(device.id)
+        let deadline = ProcessInfo.processInfo.systemUptime + 3
+        var lastDeviceID = currentAudioInputDeviceID(for: unit)
+        var lastFormat = input.inputFormat(forBus: 0)
+
+        while ProcessInfo.processInfo.systemUptime < deadline {
+            lastDeviceID = currentAudioInputDeviceID(for: unit)
+            lastFormat = input.inputFormat(forBus: 0)
+            let rateIsReady = expectedRate.map {
+                abs(lastFormat.sampleRate - $0) < 0.5
+            } ?? (lastFormat.sampleRate > 0)
+
+            if lastDeviceID == device.id,
+               lastFormat.channelCount > 0,
+               rateIsReady {
+                log("AudioCapture: selected input ready at \(lastFormat.sampleRate) Hz \(lastFormat.channelCount)ch")
+                return
+            }
+            Thread.sleep(forTimeInterval: 0.025)
+        }
+
+        let expected = expectedRate.map { "\($0) Hz" } ?? "an active format"
+        log("AudioCapture: selected input route still settling; device=\(lastDeviceID ?? 0), format=\(lastFormat.sampleRate) Hz \(lastFormat.channelCount)ch, expected \(expected)")
     }
 }
 
@@ -7215,69 +7434,6 @@ func isNewer(_ candidate: String, than current: String) -> Bool {
         if x != y { return x > y }
     }
     return false
-}
-
-// MARK: - TCC recovery
-//
-// macOS's TCC database occasionally ends up with a DENIED entry
-// for our bundle id that the user can't easily clear (typical
-// trigger: an upgrade that changes the signed binary while a
-// previous denial is still cached). On a fresh launch after an
-// upgrade (CFBundleShortVersionString differs from
-// settings.lastSeenVersion), we proactively `tccutil reset` any
-// DENIED entry for `com.local.superdictate`. GRANTED entries stay
-// intact — we never reset away permissions the user gave us.
-//
-// The companion to this is the click-twice-to-reset retry in the
-// permission rows: if the user clicks a ⚠ row, sees the OS dialog
-// say nothing useful, and clicks the same row again, the second
-// click runs `tccutil reset` to clear stuck state and re-request.
-
-enum TCC {
-    /// Maps the human-readable permission name we use in the menu to
-    /// the TCC service identifier `tccutil reset` accepts. Input
-    /// Monitoring is "ListenEvent" internally.
-    static let serviceName: [Permission: String] = [
-        .microphone: "Microphone",
-        .accessibility: "Accessibility",
-        .inputMonitoring: "ListenEvent",
-    ]
-
-    /// Serial so multiple resets (e.g. the upgrade-recovery loop)
-    /// execute in the order they were requested.
-    private static let queue = DispatchQueue(label: "ParakeyTCCReset", qos: .userInitiated)
-
-    /// Runs `tccutil reset` on a background queue. tccutil is usually
-    /// quick but waitUntilExit() on the main thread would run behind
-    /// the session-wide event tap, where any stall delays every
-    /// keystroke system-wide. `completion`, if provided, is invoked
-    /// on the main actor after the reset has finished — callers that
-    /// re-request the permission must do so from the completion, or
-    /// the request would race the scrub it depends on.
-    static func reset(_ p: Permission,
-                      bundleID: String,
-                      completion: (@MainActor @Sendable () -> Void)? = nil) {
-        guard let service = serviceName[p] else {
-            if let completion { Task { @MainActor in completion() } }
-            return
-        }
-        queue.async {
-            let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
-            proc.arguments = ["reset", service, bundleID]
-            proc.environment = systemToolProcessEnvironment()
-            proc.standardOutput = Pipe()
-            proc.standardError = Pipe()
-            do {
-                try proc.run()
-                proc.waitUntilExit()
-                log("  tccutil reset \(service) \(bundleID) → exit \(proc.terminationStatus)")
-            } catch {
-                log("  tccutil reset \(service) failed: \(error)")
-            }
-            if let completion { Task { @MainActor in completion() } }
-        }
-    }
 }
 
 // MARK: - Update check
@@ -9667,6 +9823,17 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var maxDurationWorkItem: DispatchWorkItem?
     private var audioIdleStopWorkItem: DispatchWorkItem?
     private var isRestartingAudioInput = false
+    /// The `settings.inputDevice` value passed to the most recent
+    /// successful `AudioCapture.startEngine(inputDevicePreference:)`
+    /// call (set in `startAudioInputWithRetries`). Used only by
+    /// `reloadAudioInputIfNeeded()` to detect whether a freshly saved
+    /// preference actually changed; a later `startRecording` call can
+    /// also start the engine with a since-changed `settings.inputDevice`
+    /// without going through that path, which can leave this value
+    /// briefly stale — harmless here, since the only effect is a
+    /// redundant restart on the next check, never a missed one.
+    private var audioInputPreferenceAtLastEngineStart = ""
+    private var audioConfigurationRecoveryWorkItem: DispatchWorkItem?
     private var pendingAudioRouteRefresh = false
     private var audioConfigurationChangeSuppressedUntil: TimeInterval?
     private var workspacePowerObservers: [NSObjectProtocol] = []
@@ -9720,6 +9887,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var statisticsOverlayPresented = false
     private var statisticsOverlayGlobalDismissMonitor: Any?
     private var statisticsOverlayLocalDismissMonitor: Any?
+    private var controlPanelLaunchInProgress = false
+    private var controlPanelProcess: Process?
 
     /// Local transcript archive, newest first. UI applies the user's visible limit.
     private var history: [TranscriptHistoryEntry] = []
@@ -9728,9 +9897,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         limitedRecentTranscriptEntries(history, limit: settings.recentTranscriptLimit)
     }
 
-    /// In-session click counter per permission. Click #2 onwards
-    /// resets the matching TCC entry before re-requesting — belt
-    /// and braces for stuck DENIED entries macOS occasionally caches.
+    /// In-session click counter per permission. The first click asks
+    /// macOS; later clicks open the matching System Settings pane.
     private var permClickCount: [Permission: Int] = [:]
 
     /// Latest release detected by the periodic check. nil = no update,
@@ -9841,6 +10009,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             hotkey.resetToggleState()
             hotkey.stop()
             log("readiness failed (\(reason)): hotkey listener unavailable")
+            // Without this the icon stays invisible forever even though we're
+            // now showing an error state the user should be able to see/click.
+            revealMenuBarIcon()
             setMenuBarState(.error)
             if missingPermissions().isEmpty {
                 startupFailure = StartupFailure(stage: .hotkeyListener,
@@ -9856,6 +10027,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         startupStatusTitle = "Ready"
         startupFailure = nil
         stopPermissionReadinessMonitor()
+        // This is the normal-path counterpart to concealMenuBarIcon() —
+        // hides the icon during startup; this reveals it again once ready.
+        revealMenuBarIcon()
         setMenuBarState(.idle)
         refreshActivationPolicy()
 
@@ -9868,7 +10042,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             log("ASR: reset unsupported saved speech model selection to \(settings.speechModelProfile.shortName)")
         }
 
-        recoverStaleTCCAfterUpgrade()
         _ = previousExitNoticeAction(previousRunWasActive: settings.hasActiveRunMarker)
         recoverStaleSystemAudioMuteIfNeeded()
         settings.hasActiveRunMarker = true
@@ -9919,6 +10092,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             log("control panel activated from agent")
             return
         }
+        guard !controlPanelLaunchInProgress else {
+            log("control panel open coalesced while launch is in progress")
+            return
+        }
         guard let executablePath = Bundle.main.executablePath else {
             log("control panel open failed: missing executable path")
             return
@@ -9927,10 +10104,23 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         process.executableURL = URL(fileURLWithPath: executablePath)
         process.arguments = []
         process.environment = systemToolProcessEnvironment()
+        controlPanelLaunchInProgress = true
+        controlPanelProcess = process
+        process.terminationHandler = { [weak self] terminatedProcess in
+            Task { @MainActor in
+                guard let self else { return }
+                if self.controlPanelProcess === terminatedProcess {
+                    self.controlPanelProcess = nil
+                    self.controlPanelLaunchInProgress = false
+                }
+            }
+        }
         do {
             try process.run()
             log("control panel opened from agent")
         } catch {
+            controlPanelProcess = nil
+            controlPanelLaunchInProgress = false
             log("control panel open failed: \(error.localizedDescription)")
         }
     }
@@ -9941,6 +10131,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         isTerminating = true
+        controlPanelProcess = nil
+        controlPanelLaunchInProgress = false
         hotkeyRecorder?.cancel()
         hotkeyRecorder = nil
         publishAgentState(status: "stopping", detail: "Dictation service is stopping.")
@@ -10360,6 +10552,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let detail = startupFailureDetail(stage: stage, error: error)
         startupFailure = StartupFailure(stage: stage, detail: detail)
         log("startup failed (\(reason), \(stage)): \(startupFailureLogDetail(stage: stage, error: error))")
+        // Without this the icon stays invisible forever on a startup failure,
+        // instead of showing an error state the user can click for details.
+        revealMenuBarIcon()
         setMenuBarState(.error)
         if !missingPermissions().isEmpty {
             startPermissionReadinessMonitor(reason: reason)
@@ -10367,10 +10562,18 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         rebuildMenu()
     }
 
+    // Precondition: every call site must reach this with `audio.isEngineStarted
+    // == false` (i.e. after `stopAudioEngineImmediately()`), because
+    // `AudioCapture.startEngine` early-returns without applying
+    // `inputDevicePreference` when the engine is already started — if that
+    // ever isn't true, the `audioInputPreferenceAtLastEngineStart` assignment
+    // below would record a preference that was never actually applied,
+    // silently desyncing reloadAudioInputIfNeeded()'s change detection.
     private func startAudioInputWithRetries(reason: String,
                                             initialStatusTitle: String) async throws {
         let totalAttempts = AUDIO_START_RETRY_DELAYS_SECONDS.count + 1
         var lastError: Error?
+        let inputDevicePreference = settings.inputDevice
 
         for attempt in 1...totalAttempts {
             try Task.checkCancellation()
@@ -10384,7 +10587,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             do {
                 didTouchAudioEngine = true
                 suppressAudioConfigurationChangesFromAppEngineUpdate()
-                try audio.startEngine(inputDevicePreference: settings.inputDevice)
+                try audio.startEngine(inputDevicePreference: inputDevicePreference)
+                // Tracks the preference audio capture last (re)started
+                // with, so reloadAudioInputIfNeeded() can tell whether a
+                // freshly saved preference is actually a change.
+                audioInputPreferenceAtLastEngineStart = inputDevicePreference
                 stopAudioEngineImmediately()
                 return
             } catch {
@@ -10581,6 +10788,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         logPermissionReadinessWait(missing)
         startPermissionReadinessMonitor(reason: reason)
+        // Without this the icon stays invisible forever whenever permissions
+        // (Accessibility/Input Monitoring) are missing on first launch, which
+        // is the most common real-world path a brand-new user hits. The user
+        // needs the icon visible to click it and see what's blocking them.
+        revealMenuBarIcon()
         setMenuBarState(.loading)
         rebuildMenu()
     }
@@ -10697,6 +10909,18 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         statusItem.length = 0
         statusItem.button?.isHidden = true
         statusItem.button?.toolTip = nil
+    }
+
+    /// Counterpart to concealMenuBarIcon() — restores the icon to exactly
+    /// the state configureStatusItemImage() left it in before the startup
+    /// conceal. Called from every place that can be reached after
+    /// concealMenuBarIcon() (ready, and every startup-failure/blocked
+    /// state) so the icon never stays invisible once there is something
+    /// (idle, error, or a permission prompt) the user should see or click.
+    private func revealMenuBarIcon() {
+        statusItem.length = NSStatusItem.squareLength
+        statusItem.button?.isHidden = false
+        statusItem.button?.toolTip = "Parakey"
     }
 
     private func tintedCopy(of source: NSImage, with color: NSColor) -> NSImage {
@@ -13432,7 +13656,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         root.addArrangedSubview(makeHotkeySetupRow())
 
         if !setupChecklistIsComplete {
-            let tip = setupLabel("Tip: If clicking 'Grant' doesn't open a prompt or show SuperDictate in System Settings, click 'Try Again' — SuperDictate will reset its macOS privacy permission entry and re-request, which clears stuck macOS state.",
+            let tip = setupLabel("Tip: If macOS does not show a permission prompt, click 'Open Settings' and enable SuperDictate in the displayed privacy section.",
                                  font: .systemFont(ofSize: 11),
                                  color: .secondaryLabelColor)
             tip.preferredMaxLayoutWidth = 476
@@ -13642,16 +13866,13 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         requestPermissionFromMenu(Permission.allCases[sender.tag])
     }
 
-    // MARK: - Permission row + click-twice-to-reset
+    // MARK: - Permission row
 
     private func buildPermissionItem(_ p: Permission) -> NSMenuItem {
         let clicks = permClickCount[p] ?? 0
         let title: String
         if clicks >= 1 {
-            // First click already happened; permission still denied,
-            // so signal explicitly that a second click will reset
-            // any stuck TCC state and re-request.
-            title = "⚠ Grant \(p.rawValue) (try again — will reset stuck state)…"
+            title = "⚠ Open \(p.rawValue) settings…"
         } else {
             title = "⚠ Grant \(p.rawValue) permission…"
         }
@@ -13682,24 +13903,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         log("perm click #\(clicks): \(p.rawValue)")
 
         if clicks >= 2 {
-            // Click #2+: scrub TCC before re-requesting. The most
-            // common cause of "I clicked Grant but nothing happened"
-            // is a stuck TCC entry that survived an upgrade. The
-            // re-request happens in the reset's completion — issuing
-            // it before tccutil finished would race the scrub it
-            // depends on.
-            log("  resetting TCC for \(p.rawValue) before retry")
-            TCC.reset(p, bundleID: Bundle.main.bundleIdentifier ?? "com.local.superdictate") { [weak self] in
-                guard let self, !self.isTerminating else { return }
-                Permissions.request(p)
-                self.startPermissionReadinessMonitor(reason: "permission grant")
-                self.updateSetupChecklist()
-                self.rebuildMenu()
-            }
-            rebuildMenu()
-            return
+            Permissions.openSettings(for: p)
+        } else {
+            Permissions.request(p)
         }
-        Permissions.request(p)
         startPermissionReadinessMonitor(reason: "permission grant")
         updateSetupChecklist()
         rebuildMenu()
@@ -14006,11 +14213,58 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             ? "system default"
             : (audioInputDevice(matching: preference)?.name ?? preference)
         log("input device selected: \(label)")
-        restartAudioForInputDeviceChange()
+        reloadAudioInputIfNeeded()
     }
 
-    private func restartAudioForInputDeviceChange() {
-        restartAudioInput(reason: "input device change")
+    /// Fork-native, narrowly-scoped live-reload hook for the
+    /// audio-input device only. Compares the currently saved
+    /// `settings.inputDevice` preference against whatever preference
+    /// audio capture is actually running with and, only if they
+    /// differ after normalization, restarts JUST the AVAudioEngine
+    /// capture layer via `restartAudioInput(reason:)` — which reuses
+    /// `installCaptureTap()` / `recoverAfterConfigurationChange()`
+    /// and never touches `TranscriptionWorker` or the whisper.cpp
+    /// engine/model.
+    ///
+    /// Wired into the mic-selection menu item above, which is the
+    /// only place *inside this process* (`ParakeyApp`, the `--agent`
+    /// process) that changes `settings.inputDevice`. The settings
+    /// window's microphone picker lives in `SuperDictateControlPanelApp`,
+    /// a separate OS process, so it cannot call this directly; saving
+    /// a microphone there instead goes through the existing
+    /// full-relaunch settings-save path shared by every other
+    /// setting, and the relaunched agent picks up the new
+    /// `settings.inputDevice` at its own startup (see
+    /// `startAudioInputWithRetries`) without needing this function.
+    ///
+    /// This is deliberately NOT a general settings-live-reload
+    /// mechanism — contrast upstream's broader, out-of-scope
+    /// `SETTINGS_CHANGED_NOTIFICATION` / `reloadSettingsWhenIdle`
+    /// (tied to FluidAudio-specific download-telemetry fields this
+    /// fork's whisper.cpp rewrite doesn't have). This function only
+    /// ever looks at the microphone preference.
+    ///
+    /// Reads `settings.inputDevice` as it stands in memory right now;
+    /// a caller whose preference change may have been written by a
+    /// different process (e.g. a future settings-window save from the
+    /// control-panel process) is responsible for calling
+    /// `settings.refreshFromDisk()` first.
+    ///
+    /// Returns `true` if a restart was triggered, `false` if the
+    /// preference was unchanged or a restart could not be safely
+    /// started right now (already restarting, mid-recording, busy, or
+    /// terminating — `restartAudioInput(reason:)` separately handles
+    /// the case where the core runtime isn't ready yet).
+    @discardableResult
+    private func reloadAudioInputIfNeeded() -> Bool {
+        guard !isRestartingAudioInput, !isRecording, !isBusy, !isTerminating else { return false }
+        guard audioInputPreferenceDidChange(saved: settings.inputDevice,
+                                            activeAtLastEngineStart: audioInputPreferenceAtLastEngineStart) else {
+            return false
+        }
+        log("AudioCapture: input device preference changed; reloading audio input only")
+        restartAudioInput(reason: "settings save: audio input changed")
+        return true
     }
 
     private func suppressAudioConfigurationChangesFromAppEngineUpdate() {
@@ -14051,6 +14305,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func stopAudioEngineImmediately() {
         cancelAudioIdleStop()
+        audioConfigurationRecoveryWorkItem?.cancel()
+        audioConfigurationRecoveryWorkItem = nil
         if audio.isEngineStarted {
             suppressAudioConfigurationChangesFromAppEngineUpdate()
         }
@@ -14068,7 +14324,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func handleAudioConfigurationChange() {
         if shouldIgnoreAppOwnedAudioConfigurationChange() {
-            log("AudioCapture: app-owned audio configuration change ignored")
+            scheduleAppOwnedAudioConfigurationRecovery()
             return
         }
 
@@ -14093,6 +14349,32 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             rebuildMenu()
             restartAudioInput(reason: "audio configuration change")
         }
+    }
+
+    private func scheduleAppOwnedAudioConfigurationRecovery() {
+        audioConfigurationRecoveryWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, !self.isTerminating else { return }
+            self.audioConfigurationRecoveryWorkItem = nil
+            do {
+                if try self.audio.recoverAfterConfigurationChange() {
+                    log("AudioCapture: app-owned audio configuration change recovered")
+                }
+            } catch {
+                log("AudioCapture: configuration recovery failed: \(error.localizedDescription)")
+                self.pendingAudioRouteRefresh = true
+                if self.isRecording || self.audio.isRunning {
+                    self.cancelActiveRecording(reason: "audio configuration recovery failed")
+                } else {
+                    self.restartAudioInput(reason: "audio configuration recovery failed")
+                }
+            }
+        }
+        audioConfigurationRecoveryWorkItem = work
+        // AVAudioEngine posts the notification while it is tearing down its
+        // I/O unit. Recover on the next run-loop turn instead of mutating the
+        // graph from inside that notification callback.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: work)
     }
 
     @discardableResult
@@ -15865,30 +16147,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    // MARK: - TCC stale-state recovery on upgrade
-
-    private func recoverStaleTCCAfterUpgrade() {
-        let last = settings.lastSeenVersion
-        let current = currentBundleVersion()
-        guard !last.isEmpty else {
-            // First-ever launch — just record the version. No state
-            // to recover.
-            settings.lastSeenVersion = current
-            return
-        }
-        guard last != current else { return }
-        log("upgrade detected: \(last) → \(current); checking for stale TCC state")
-        let bundleID = Bundle.main.bundleIdentifier ?? "com.local.superdictate"
-        for p in Permission.allCases {
-            if Permissions.isGranted(p) { continue }
-            // Fire-and-forget on TCC's serial queue: these resets are
-            // best-effort scrubbing of stale DENIED entries, nothing
-            // at launch depends on their completion, and the user's
-            // first Grant click has its own reset-and-retry path.
-            TCC.reset(p, bundleID: bundleID)
-        }
-        settings.lastSeenVersion = current
-    }
 }
 
 // MARK: - Entry point
@@ -15930,6 +16188,8 @@ private enum ParakeySelfTest {
             return runSuite("audio-conversion", testAudioConversion)
         case "audio-input":
             return runSuite("audio-input", testAudioInputDeviceFiltering)
+        case "audio-input-live":
+            return runSuite("audio-input-live", testLiveAudioInputEnumeration)
         case "model-status":
             return runSuite("model-status", testSpeechModelStartupStatus)
         case "audio-route":
@@ -18024,6 +18284,151 @@ private enum ParakeySelfTest {
             equals: "real-yeti-nano",
             "named microphone preferences should still resolve by display name"
         )
+
+        // reloadAudioInputIfNeeded()'s change-detection must treat any
+        // spelling of "system default" (empty string, whitespace-only,
+        // or a stale CoreAudio default-aggregate UID) as equivalent, so
+        // a settings save doesn't trigger a spurious audio-only restart.
+        try expect(
+            audioInputPreferenceDidChange(saved: "real-yeti-nano", activeAtLastEngineStart: ""),
+            equals: true,
+            "switching from system default to a named device should count as a change"
+        )
+        try expect(
+            audioInputPreferenceDidChange(saved: "real-yeti-nano", activeAtLastEngineStart: "real-yeti-nano"),
+            equals: false,
+            "reselecting the already-active device should not count as a change"
+        )
+        try expect(
+            audioInputPreferenceDidChange(saved: "", activeAtLastEngineStart: "  "),
+            equals: false,
+            "empty and whitespace-only preferences should both normalize to system default"
+        )
+        try expect(
+            audioInputPreferenceDidChange(saved: "", activeAtLastEngineStart: pseudo.uid),
+            equals: false,
+            "a stale default-aggregate UID and an empty preference should both mean system default"
+        )
+        try expect(
+            audioInputPreferenceDidChange(saved: " Yeti Nano\n", activeAtLastEngineStart: "Yeti Nano"),
+            equals: false,
+            "untrimmed and trimmed spellings of the same device should not count as a change"
+        )
+        try expect(
+            audioInputPreferenceDidChange(saved: "real-yeti-nano", activeAtLastEngineStart: "other-device"),
+            equals: true,
+            "switching between two named devices should count as a change"
+        )
+
+        let sameName = AudioInputDevice(id: 3,
+                                        uid: "another-yeti-nano",
+                                        name: "Yeti Nano")
+        try expect(
+            audioInputDevice(matching: sameName.uid, in: [real, sameName])?.id,
+            equals: sameName.id,
+            "stable device UIDs should win even when microphone names are duplicated"
+        )
+        try expect(
+            audioInputDevice(matching: "missing-device", in: [real]),
+            equals: nil,
+            "a disconnected saved microphone should resolve to system default"
+        )
+        try expect(
+            shouldRestartAudioInputForSettingsChange(previousPreference: "",
+                                                     nextPreference: real.uid,
+                                                     isCoreRuntimeReady: true),
+            equals: true,
+            "changing microphones should restart only the audio input when runtime is ready"
+        )
+        try expect(
+            shouldRestartAudioInputForSettingsChange(previousPreference: real.uid,
+                                                     nextPreference: real.uid,
+                                                     isCoreRuntimeReady: true),
+            equals: false,
+            "saving the same microphone should not restart audio"
+        )
+        try expect(
+            shouldRestartAudioInputForSettingsChange(previousPreference: "",
+                                                     nextPreference: real.uid,
+                                                     isCoreRuntimeReady: false),
+            equals: false,
+            "startup should pick up a microphone change without an extra audio restart"
+        )
+
+        let suiteName = "com.local.superdictate.self-test.input.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            throw SelfTestFailure.failed("could not create isolated input-device defaults")
+        }
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let isolatedSettings = Settings(defaults: defaults)
+        try expect(isolatedSettings.inputDevice, equals: "",
+                   "microphone settings should default to the macOS system input")
+        isolatedSettings.inputDevice = " \(real.uid)\n"
+        try expect(isolatedSettings.inputDevice, equals: real.uid,
+                   "microphone settings should persist a normalized stable UID")
+        isolatedSettings.inputDevice = pseudo.uid
+        try expect(isolatedSettings.inputDevice, equals: "",
+                   "pseudo aggregate inputs should reset the preference to system default")
+    }
+
+    private static func testLiveAudioInputEnumeration() throws {
+        let devices = availableAudioInputDevices()
+        guard !devices.isEmpty else {
+            throw SelfTestFailure.failed("CoreAudio reported no selectable input devices")
+        }
+        var seenUIDs = Set<String>()
+        for device in devices {
+            guard !device.uid.isEmpty, !device.name.isEmpty else {
+                throw SelfTestFailure.failed("CoreAudio returned an input with an empty UID or name")
+            }
+            guard audioDeviceHasInputChannels(device.id) else {
+                throw SelfTestFailure.failed("\(device.name) has no input channels")
+            }
+            guard !isDefaultAggregateAudioInputDevice(device) else {
+                throw SelfTestFailure.failed("a temporary CoreAudio aggregate leaked into the picker")
+            }
+            guard seenUIDs.insert(device.uid).inserted else {
+                throw SelfTestFailure.failed("CoreAudio returned duplicate input UID \(device.uid)")
+            }
+            print("AUDIO INPUT: \(device.name) [\(device.uid)]")
+        }
+
+        let engine = AVAudioEngine()
+        guard let unit = engine.inputNode.audioUnit else {
+            throw SelfTestFailure.failed("AVAudioEngine did not expose an input audio unit")
+        }
+        for device in devices {
+            var deviceID = device.id
+            let status = AudioUnitSetProperty(unit,
+                                              kAudioOutputUnitProperty_CurrentDevice,
+                                              kAudioUnitScope_Global,
+                                              0,
+                                              &deviceID,
+                                              UInt32(MemoryLayout<AudioDeviceID>.size))
+            guard status == noErr else {
+                throw SelfTestFailure.failed(
+                    "CoreAudio rejected \(device.name): \(formattedOSStatus(status))"
+                )
+            }
+            guard currentAudioInputDeviceID(for: unit) == device.id else {
+                throw SelfTestFailure.failed(
+                    "CoreAudio did not make \(device.name) the current input"
+                )
+            }
+            let captureFormat = engine.inputNode.inputFormat(forBus: 0)
+            guard captureFormat.sampleRate > 0, captureFormat.channelCount > 0 else {
+                throw SelfTestFailure.failed(
+                    "\(device.name) did not expose an active capture format"
+                )
+            }
+            if let expectedRate = audioInputDeviceNominalSampleRate(device.id),
+               abs(captureFormat.sampleRate - expectedRate) >= 0.5 {
+                throw SelfTestFailure.failed(
+                    "\(device.name) capture format \(captureFormat.sampleRate) did not match \(expectedRate)"
+                )
+            }
+            print("AUDIO SELECT: \(device.name) OK")
+        }
     }
 
     private static func testSpeechModelStartupStatus() throws {
@@ -20432,6 +20837,7 @@ private struct ControlPanelSettingsDraft: Equatable {
     var primaryCompletionBehavior: DictationCompletionBehavior
     var alternateCompletionEnabled: Bool
     var enterDelayMilliseconds: Int
+    var inputDevicePreference: String
     var recordingColor: RecordingHUDAccentColor
     var transcribingColor: RecordingHUDAccentColor
     var backgroundStyle: RecordingHUDBackgroundStyle
@@ -20444,6 +20850,8 @@ private struct ControlPanelSettingsDraft: Equatable {
         primaryCompletionBehavior = settings.primaryCompletionBehavior
         alternateCompletionEnabled = settings.alternateCompletionEnabled
         enterDelayMilliseconds = settings.enterDelayMilliseconds
+        let savedInput = settings.inputDevice
+        inputDevicePreference = audioInputDevice(matching: savedInput)?.uid ?? savedInput
         recordingColor = settings.recordingHUDRecordingColor
         transcribingColor = settings.recordingHUDTranscribingColor
         backgroundStyle = settings.recordingHUDBackgroundStyle
@@ -20491,16 +20899,21 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private var language: InterfaceLanguage { settings.interfaceLanguage }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.regular)
-        if SuperDictateControlPanelRegistry.activateExistingPanelIfPresent() {
-            NSApp.terminate(nil)
-            return
+        if !SuperDictateControlPanelRegistry.claimCurrentPanel() {
+            if SuperDictateControlPanelRegistry.activateExistingPanelIfPresent() {
+                NSApp.terminate(nil)
+                return
+            }
+            // No live panel to hand off to (stale pid file, permission error,
+            // recycled PID) -- opening normally is safer than terminating
+            // silently and leaving the control panel unreachable.
+            log("controlPanel: claimCurrentPanel failed and no existing panel could be activated; opening anyway")
         }
-        SuperDictateControlPanelRegistry.claimCurrentPanel()
+        NSApp.setActivationPolicy(.regular)
         showWindow()
         startRefreshTimer()
         checkForUpdates()
-        if settings.agentEnabled && !SuperDictateAgentService.isAgentRunning() {
+        if settings.agentEnabled && !SuperDictateAgentService.isAgentLoadedOrRunning() {
             beginServiceOperation(.starting)
         }
     }
@@ -20610,6 +21023,11 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private func renderFingerprint() -> String {
         let state = AgentRuntimeStateStore.read()
         let permissions = Permission.allCases.map { Permissions.isGranted($0) ? "1" : "0" }.joined()
+        let inputDevices = settingsWindow?.isVisible == true
+            ? availableAudioInputDevices()
+                .map { "\($0.uid)=\($0.name)" }
+                .joined(separator: "|")
+            : ""
         let stateToken: String
         if serviceOperation != nil {
             stateToken = "operation"
@@ -20631,6 +21049,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
                 settings.configuredHotkey.name,
                 settings.configuredEnterHotkey.name,
                 settings.configuredHistoryHotkey.name,
+                settings.inputDevice,
+                inputDevices,
                 settings.primaryCompletionBehavior.rawValue,
                 settings.alternateCompletionEnabled ? "alternate-on" : "alternate-off",
                 settings.triggerMode.rawValue,
@@ -20719,6 +21139,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             toolTip: t("Открыть или закрыть последние транскрипции.",
                        "Open or close recent transcriptions.")
         ))
+        root.addArrangedSubview(separator())
+        root.addArrangedSubview(microphoneSettingsRow(draft))
         root.addArrangedSubview(separator())
         root.addArrangedSubview(popupRow(
             title: t("Размер капсулы", "Capsule size"),
@@ -21015,7 +21437,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let title = panelLabel(permissionTitle(permission), size: 11.5, weight: .medium)
         title.toolTip = permissionDetail(permission)
         let buttonTitle = (permissionClickCount[permission] ?? 0) >= 1
-            ? t("Повторить", "Try Again") : t("Разрешить", "Grant")
+            ? t("Открыть настройки", "Open Settings") : t("Разрешить", "Grant")
         let button = panelButton(buttonTitle,
                                  action: #selector(grantPermissionClicked(_:)),
                                  enabled: serviceOperation == nil,
@@ -21536,6 +21958,86 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         )
     }
 
+    private func microphoneSettingsRow(_ draft: ControlPanelSettingsDraft) -> NSView {
+        let devices = availableAudioInputDevices()
+        let preference = draft.inputDevicePreference
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let selectedDevice = audioInputDevice(matching: preference, in: devices)
+        let unavailable = !preference.isEmpty && selectedDevice == nil
+
+        let detailText: String
+        if unavailable {
+            detailText = t(
+                "Устройство сейчас недоступно — временно используется системный микрофон.",
+                "The device is unavailable; the system microphone is used temporarily."
+            )
+        } else if let selectedDevice {
+            detailText = t(
+                "Выбран: \(selectedDevice.name). Применится после перезапуска сервиса.",
+                "Selected: \(selectedDevice.name). Applies after the service restarts."
+            )
+        } else {
+            detailText = t(
+                "Следовать выбору входа в настройках macOS.",
+                "Follow the input selected in macOS settings."
+            )
+        }
+
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 14
+
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        text.addArrangedSubview(panelLabel(t("Микрофон", "Microphone"),
+                                           size: 13,
+                                           weight: .semibold))
+        let detail = panelLabel(detailText, size: 12, color: .secondaryLabelColor)
+        detail.maximumNumberOfLines = 2
+        detail.lineBreakMode = .byWordWrapping
+        text.addArrangedSubview(detail)
+
+        let popup = NSPopUpButton()
+        popup.target = self
+        popup.action = #selector(selectInputDeviceDraft(_:))
+        popup.toolTip = t(
+            "Выберите микрофон для диктовки. Отключённое устройство автоматически заменяется системным до его возвращения.",
+            "Choose the dictation microphone. A disconnected device falls back to the system input until it returns."
+        )
+        popup.addItem(withTitle: t("Системный по умолчанию", "System default"))
+        popup.lastItem?.representedObject = ""
+
+        if unavailable {
+            popup.addItem(withTitle: t("Недоступен: \(preference)", "Unavailable: \(preference)"))
+            popup.lastItem?.representedObject = preference
+            popup.lastItem?.isEnabled = false
+        }
+        if !devices.isEmpty {
+            popup.menu?.addItem(.separator())
+        }
+        for device in devices {
+            popup.addItem(withTitle: device.name)
+            popup.lastItem?.representedObject = device.uid
+            popup.lastItem?.toolTip = device.uid
+        }
+
+        let selectedValue = selectedDevice?.uid ?? (unavailable ? preference : "")
+        if let item = popup.itemArray.first(where: {
+            ($0.representedObject as? String) == selectedValue
+        }) {
+            popup.select(item)
+        }
+        popup.setContentHuggingPriority(.required, for: .horizontal)
+
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(popup)
+        return row
+    }
+
     private func popupRow(title: String,
                           detail: String,
                           selectedValue: String,
@@ -21967,14 +22469,14 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         settingsDraft = ControlPanelSettingsDraft(settings: settings)
 
         let settingsWindow = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 680, height: 590),
+            contentRect: NSRect(x: 0, y: 0, width: 680, height: 660),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
         settingsWindow.title = t("Настройки SuperDictate", "SuperDictate Settings")
-        settingsWindow.contentMinSize = NSSize(width: 680, height: 590)
-        settingsWindow.contentMaxSize = NSSize(width: 680, height: 590)
+        settingsWindow.contentMinSize = NSSize(width: 680, height: 660)
+        settingsWindow.contentMaxSize = NSSize(width: 680, height: 660)
         settingsWindow.isReleasedWhenClosed = false
         settingsWindow.delegate = self
         settingsWindow.contentView = makeSettingsContentView()
@@ -22121,6 +22623,14 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         refreshSettingsWindow()
     }
 
+    @objc private func selectInputDeviceDraft(_ sender: NSPopUpButton) {
+        guard let preference = sender.selectedItem?.representedObject as? String else { return }
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.inputDevicePreference = preference
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
     @objc private func selectRecordingHUDSize(_ sender: NSPopUpButton) {
         guard let raw = sender.selectedItem?.representedObject as? String,
               let size = RecordingHUDSize(rawValue: raw) else { return }
@@ -22144,6 +22654,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         settings.primaryCompletionBehavior = draft.primaryCompletionBehavior
         settings.alternateCompletionEnabled = draft.alternateCompletionEnabled
         settings.enterDelayMilliseconds = draft.enterDelayMilliseconds
+        settings.inputDevice = draft.inputDevicePreference
         settings.recordingHUDRecordingColor = draft.recordingColor
         settings.recordingHUDTranscribingColor = draft.transcribingColor
         settings.recordingHUDBackgroundStyle = draft.backgroundStyle
@@ -22171,11 +22682,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         let clicks = (permissionClickCount[permission] ?? 0) + 1
         permissionClickCount[permission] = clicks
         if clicks >= 2 {
-            TCC.reset(permission, bundleID: Bundle.main.bundleIdentifier ?? SETTINGS_SUITE) { [weak self] in
-                guard let self else { return }
-                Permissions.request(permission)
-                self.refresh(force: true)
-            }
+            Permissions.openSettings(for: permission)
         } else {
             Permissions.request(permission)
         }
@@ -22192,9 +22699,49 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     }
 }
 
+private func runAudioCaptureDiagnostic(arguments: [String]) -> Int32? {
+    guard arguments.first == "--diagnose-audio-capture" else { return nil }
+    guard arguments.count == 3,
+          let duration = TimeInterval(arguments[2]),
+          duration > 0,
+          duration <= 15 else {
+        fputs("usage: SuperDictate --diagnose-audio-capture <device-uid|default> <seconds>\n",
+              stderr)
+        return EXIT_FAILURE
+    }
+
+    let preference = arguments[1] == "default" ? "" : arguments[1]
+    let capture = AudioCapture()
+    do {
+        try capture.startRecording(inputDevicePreference: preference)
+        Thread.sleep(forTimeInterval: duration)
+        let recording = capture.endRecording()
+        capture.stopEngine()
+
+        let capturedSeconds = Double(recording.samples.count) / SAMPLE_RATE
+        let peak = recording.samples.reduce(Float(0)) { max($0, abs($1)) }
+        print(
+            String(
+                format: "AUDIO CAPTURE: requested=%.2fs captured=%.3fs samples=%d peak=%.6f",
+                duration,
+                capturedSeconds,
+                recording.samples.count,
+                peak
+            )
+        )
+        return capturedSeconds >= duration * 0.75 ? EXIT_SUCCESS : EXIT_FAILURE
+    } catch {
+        capture.stopEngine()
+        fputs("AUDIO CAPTURE FAILED: \(error.localizedDescription)\n", stderr)
+        return EXIT_FAILURE
+    }
+}
+
 let app = NSApplication.shared
 let launchArguments = Array(CommandLine.arguments.dropFirst())
-if launchArguments.first == RECORDING_HUD_EXPORT_ARGUMENT {
+if let diagnosticResult = runAudioCaptureDiagnostic(arguments: launchArguments) {
+    exit(diagnosticResult)
+} else if launchArguments.first == RECORDING_HUD_EXPORT_ARGUMENT {
     guard launchArguments.count == 2 else {
         fputs("usage: SuperDictate --export-hud-animation <frames-directory>\n", stderr)
         exit(EXIT_FAILURE)
