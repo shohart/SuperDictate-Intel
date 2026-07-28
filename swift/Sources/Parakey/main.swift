@@ -6448,6 +6448,74 @@ enum RecordingHUDTargetDecision {
     case switchTarget(FocusedInsertionTargetFrame)
 }
 
+/// Holds the `FocusedTextTarget` resolved at hotkey-press time for exactly
+/// one dictation session. `consume()` clears it as a side effect so a
+/// resolved target is used at most once and never leaks into the next
+/// dictation — a stale AX reference from a previous session must not be
+/// reused if the resolver failed (or hadn't finished) for the current one.
+struct PendingTextInsertionTargetStore {
+    private(set) var target: FocusedTextTarget?
+
+    mutating func capture(_ target: FocusedTextTarget?) {
+        self.target = target
+    }
+
+    mutating func consume() -> FocusedTextTarget? {
+        defer { target = nil }
+        return target
+    }
+}
+
+/// Which of the three outcomes handleRelease() should take after trying
+/// `TextInsertionService` against a resolved `FocusedTextTarget`.
+enum TextInsertionRoute: Equatable {
+    case usedFocusedTarget
+    case fallBackToGlobalInsertion
+    case abortToClipboard
+}
+
+/// `targetElementStillValid` is what actually distinguishes "the popover
+/// closed and the AX element is gone" (abort — falling back to the global
+/// mechanism would silently insert into whatever app is now frontmost,
+/// exactly what the bug report forbids) from "the element is still there
+/// but none of TextInsertionService's three tiers could write to it" (e.g.
+/// a read-only field — the global fallback is still the right call there).
+/// This can't be inferred from `TextInsertionResult` alone:
+/// `TextInsertionService.isProcessAlive` only checks whether the target's
+/// *process* is still running, and in the motivating SwiftBar case the
+/// process (SwiftBar itself) stays alive after its popover closes — only
+/// the AX *element* dies, which surfaces as every tier failing with
+/// `.noSupportedInsertionMethod`, not `.targetNoLongerValid`. See
+/// `isAXElementStillValid(_:)` for how the caller computes this.
+func textInsertionRoute(for result: TextInsertionResult?, targetElementStillValid: Bool) -> TextInsertionRoute {
+    guard let result else { return .fallBackToGlobalInsertion }
+    switch result {
+    case .insertedUsingSelectedText, .insertedUsingValueAndRange, .insertedUsingKeyboardEvents:
+        return .usedFocusedTarget
+    case .failed(.targetNoLongerValid):
+        return .abortToClipboard
+    case .failed:
+        return targetElementStillValid ? .fallBackToGlobalInsertion : .abortToClipboard
+    }
+}
+
+/// Probes whether an `AXUIElement` still refers to a live UI element by
+/// reading an attribute every element is expected to have. `.success` and
+/// most error cases (e.g. `.attributeUnsupported`) mean the element itself
+/// is still there, just perhaps not settable/text-bearing; only
+/// `.invalidUIElement`/`.cannotComplete` mean the element — and likely the
+/// window/popover it belonged to — is actually gone.
+func isAXElementStillValid(_ element: AXUIElement) -> Bool {
+    var value: CFTypeRef?
+    let result = AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &value)
+    switch result {
+    case .invalidUIElement, .cannotComplete:
+        return false
+    default:
+        return true
+    }
+}
+
 struct RecordingHUDTargetStabilizer {
     private(set) var initialApplicationPID: pid_t?
     private(set) var confirmedIdentity: FocusedInsertionTargetIdentity?
@@ -10224,6 +10292,13 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var recordingHUDTargetSessionToken = 0
     private var recordingHUDWaitingForInitialTarget = false
     private var insertionTargetCache: [pid_t: CachedInsertionTarget] = [:]
+    // The real, AX-resolved insertion target for the in-flight dictation
+    // (see FocusedTextTarget.swift) — distinct from insertionTargetCache
+    // above, which is purely about HUD positioning. Captured at
+    // handlePress() and consumed exactly once by handleRelease(); see
+    // PendingTextInsertionTargetStore and captureTextInsertionTargetForNextDictation().
+    private var pendingTextInsertionTarget = PendingTextInsertionTargetStore()
+    private var textInsertionTargetCaptureToken = 0
     private var globalMouseDownMonitor: Any?
     private var lastExternalClick: LastExternalClick?
     private var errorFlashWorkItem: DispatchWorkItem?
@@ -12087,6 +12162,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
         let initialInsertionContext = insertionTargetQueryContext()
+        captureTextInsertionTargetForNextDictation()
         cancelAudioIdleStop()
         var recoveryJournal: PendingDictationJournal?
         do {
@@ -12121,6 +12197,45 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         rebuildMenu()
     }
 
+    /// Resolves the real AX-focused element (see FocusedTextTarget.swift)
+    /// as early as possible in the press → release cycle, before any
+    /// recording/UI state changes, and stores it in
+    /// `pendingTextInsertionTarget` for handleRelease() to consume.
+    /// `captureTarget()` is a synchronous, potentially ~200ms-blocking AX
+    /// round-trip (see its own doc comment), so this runs it off the main
+    /// actor rather than stalling recording start on it; if it hasn't
+    /// finished by the time insertion actually happens, handleRelease()
+    /// simply falls back to the pre-existing global-post mechanism, exactly
+    /// as if this capture didn't exist. `textInsertionTargetCaptureToken`
+    /// guards against a slow capture from an earlier, already-finished
+    /// press (e.g. a rapid tap-and-release that was too short to
+    /// transcribe) landing after a newer press has already reset the
+    /// pending target.
+    private func captureTextInsertionTargetForNextDictation() {
+        textInsertionTargetCaptureToken += 1
+        let token = textInsertionTargetCaptureToken
+        pendingTextInsertionTarget.capture(nil)
+        // `Task { }` (not `.detached`) inherits this method's MainActor
+        // isolation, so the body runs there except for the inner
+        // `Task.detached`, which is the only part that needs to leave the
+        // main actor (see FocusedTextTargetResolver's own doc comment on
+        // why `captureTarget()` must not run on it). The resolver is
+        // constructed inside that inner closure rather than captured into
+        // it, so nothing non-Sendable crosses the actor boundary except
+        // the `FocusedTextTarget` result itself.
+        Task { [weak self] in
+            do {
+                let target = try await Task.detached(priority: .userInitiated) {
+                    try FocusedTextTargetResolver().captureTarget()
+                }.value
+                guard let self, self.textInsertionTargetCaptureToken == token else { return }
+                self.pendingTextInsertionTarget.capture(target)
+            } catch {
+                log("FocusedTextTargetResolver: capture failed at hotkey press: \(error)")
+            }
+        }
+    }
+
     /// If the user switched to a different app/window after dictation
     /// started, macOS's synthetic-keystroke insertion (`TextInserter`) would
     /// otherwise land the transcript in whatever is frontmost at release
@@ -12128,7 +12243,13 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// to the front first — best-effort: if it quit, or is already
     /// frontmost, or activation doesn't complete quickly, insertion falls
     /// through to whatever is currently focused, exactly as before this
-    /// method existed.
+    /// method existed. Only used by the fallback global-post insertion path
+    /// — when a `FocusedTextTarget` was resolved (see
+    /// captureTextInsertionTargetForNextDictation()), `TextInsertionService`
+    /// targets that process directly and this reactivation step is skipped
+    /// entirely, since forcing a different app (the pre-popover frontmost
+    /// one) to the front right before an AX-targeted insertion would be
+    /// pure overhead at best and disruptive at worst.
     private func reactivateDictationOriginAppIfNeeded(_ originPID: pid_t?) async {
         guard let originPID,
               NSWorkspace.shared.frontmostApplication?.processIdentifier != originPID,
@@ -12284,10 +12405,49 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         }
 
                         let insertionStartedAt = ProcessInfo.processInfo.systemUptime
-                        await reactivateDictationOriginAppIfNeeded(dictationOriginPID)
-                        let inserted = TextInserter.insert(
-                            pastedText(from: cleaned, suffix: settings.pasteSuffix)
-                        )
+                        let textToInsert = pastedText(from: cleaned, suffix: settings.pasteSuffix)
+                        let textInsertionTarget = pendingTextInsertionTarget.consume()
+                        var inserted = false
+                        // See reactivateDictationOriginAppIfNeeded(_:) and
+                        // captureTextInsertionTargetForNextDictation() for why the
+                        // AX-targeted path is tried first and skips reactivation.
+                        // See textInsertionRoute(for:targetElementStillValid:) for
+                        // why .abortToClipboard must not fall through to the
+                        // global mechanism.
+                        var route: TextInsertionRoute = .fallBackToGlobalInsertion
+                        var focusedTargetResult: TextInsertionResult?
+                        if let textInsertionTarget {
+                            let result = TextInsertionService().insert(textToInsert, into: textInsertionTarget)
+                            focusedTargetResult = result
+                            route = textInsertionRoute(
+                                for: result,
+                                targetElementStillValid: isAXElementStillValid(textInsertionTarget.element)
+                            )
+                        }
+                        switch route {
+                        case .usedFocusedTarget:
+                            inserted = true
+                            log("text insertion: used AX-focused target (\(focusedTargetResult.map { "\($0)" } ?? "?"))")
+                        case .abortToClipboard:
+                            // The resolved target's process/element disappeared
+                            // (e.g. the popover closed) mid-dictation. Falling
+                            // through to the global-post mechanism here would
+                            // silently insert into whatever is now frontmost —
+                            // not the app the user was dictating into — so this
+                            // is a hard stop, not a soft fallback.
+                            log("text insertion: AX-focused target no longer valid (\(focusedTargetResult.map { "\($0)" } ?? "?")); not falling back to global insertion")
+                            if ClipboardPasteInserter.write(textToInsert, to: NSPasteboard.general) {
+                                log("text insertion: transcript saved to clipboard after original target disappeared")
+                            } else {
+                                log("text insertion: clipboard save also failed after original target disappeared")
+                            }
+                        case .fallBackToGlobalInsertion:
+                            if let focusedTargetResult {
+                                log("text insertion: AX-focused target attempt failed (\(focusedTargetResult)); falling back to global insertion")
+                            }
+                            await reactivateDictationOriginAppIfNeeded(dictationOriginPID)
+                            inserted = TextInserter.insert(textToInsert)
+                        }
                         let insertionCompletedAt = ProcessInfo.processInfo.systemUptime
                         var enterDelaySeconds: Double?
                         if inserted {
@@ -16604,6 +16764,10 @@ private enum ParakeySelfTest {
             return runSuite("insertion-target", testInsertionTargetTracking)
         case "insertion-target-live":
             return runSuite("insertion-target-live", testLiveInsertionTargetProbe)
+        case "text-insertion-target-store":
+            return runSuite("text-insertion-target-store", testPendingTextInsertionTargetStore)
+        case "text-insertion-routing":
+            return runSuite("text-insertion-routing", testTextInsertionRouting)
         case "parakeet-bridge":
             return runSuite("parakeet-bridge", testParakeetBridge)
         case "parakeet-cpu":
@@ -16658,8 +16822,111 @@ private enum ParakeySelfTest {
         try testPrivateLogAppend()
         try testDiagnostics()
         try testInsertionTargetTracking()
+        try testPendingTextInsertionTargetStore()
+        try testTextInsertionRouting()
         try testParakeetTranscriptRepair()
         try testParakeetBridge()
+    }
+
+    /// Covers `textInsertionRoute(for:targetElementStillValid:)` — the
+    /// actual decision logic handleRelease() runs after trying
+    /// TextInsertionService, including the case a prior version of this
+    /// integration got wrong: `.noSupportedInsertionMethod` with a dead AX
+    /// element (the SwiftBar-popover-closed case, where the *process*
+    /// stays alive so `TextInsertionService` itself reports
+    /// `.noSupportedInsertionMethod` rather than `.targetNoLongerValid`)
+    /// must abort to clipboard, not fall back to the global mechanism —
+    /// falling back there would silently insert into whatever app is now
+    /// frontmost.
+    private static func testTextInsertionRouting() throws {
+        try expect(textInsertionRoute(for: nil, targetElementStillValid: true), equals: .fallBackToGlobalInsertion,
+                   "no resolved target at all should go straight to the global mechanism")
+
+        for success: TextInsertionResult in [.insertedUsingSelectedText, .insertedUsingValueAndRange, .insertedUsingKeyboardEvents] {
+            try expect(textInsertionRoute(for: success, targetElementStillValid: true), equals: .usedFocusedTarget,
+                       "a successful tier result should be treated as success regardless of element-liveness")
+        }
+
+        try expect(textInsertionRoute(for: .failed(.targetNoLongerValid), targetElementStillValid: true),
+                   equals: .abortToClipboard,
+                   "TextInsertionService's own targetNoLongerValid (dead process) must abort, not fall back")
+
+        try expect(textInsertionRoute(for: .failed(.noSupportedInsertionMethod), targetElementStillValid: false),
+                   equals: .abortToClipboard,
+                   "all tiers failing against a dead AX element (process alive, element gone — the SwiftBar popover-closed case) must abort, not fall back")
+
+        try expect(textInsertionRoute(for: .failed(.noSupportedInsertionMethod), targetElementStillValid: true),
+                   equals: .fallBackToGlobalInsertion,
+                   "all tiers failing against a still-live element (e.g. a read-only field) should fall back, not abort")
+
+        try expect(textInsertionRoute(for: .failed(.accessibilityError(operation: "test", error: .failure)), targetElementStillValid: true),
+                   equals: .fallBackToGlobalInsertion,
+                   "a live-element AX error other than targetNoLongerValid should fall back")
+        try expect(textInsertionRoute(for: .failed(.accessibilityError(operation: "test", error: .failure)), targetElementStillValid: false),
+                   equals: .abortToClipboard,
+                   "a dead-element AX error other than targetNoLongerValid should still abort")
+    }
+
+    /// Covers the press → release lifecycle of `pendingTextInsertionTarget`
+    /// (ParakeyApp): captured on hotkey press, consumed exactly once at
+    /// insertion time, and cleared afterward so a stale/previous session's
+    /// target can never leak into the next dictation. Exercises
+    /// `PendingTextInsertionTargetStore` directly rather than going through
+    /// `ParakeyApp.handlePress`/`handleRelease`, which pull in the audio
+    /// engine, hotkey registration, and menu bar — not something a headless
+    /// self-test should stand up. `AXUIElementCreateSystemWide()` needs no
+    /// Accessibility permission to construct (only to query attributes on
+    /// it), so this runs unconditionally, unlike `insertion-target-live`.
+    private static func testPendingTextInsertionTargetStore() throws {
+        let systemWide = AXUIElementCreateSystemWide()
+        let fakeTarget = FocusedTextTarget(
+            application: systemWide,
+            element: systemWide,
+            applicationPID: 4242,
+            elementPID: 4242,
+            applicationName: "self-test",
+            role: "AXTextArea",
+            subrole: nil
+        )
+
+        var store = PendingTextInsertionTargetStore()
+        try expect(store.target == nil, equals: true,
+                   "a freshly constructed store should start empty (nothing captured yet)")
+
+        // handlePress(): resolver succeeds, target captured.
+        store.capture(fakeTarget)
+        guard let capturedTarget = store.target else {
+            throw SelfTestFailure.failed("capture() should store the resolved target for handleRelease() to consume")
+        }
+        try expect(capturedTarget.applicationPID, equals: fakeTarget.applicationPID,
+                   "captured target should match what was passed to capture()")
+
+        // handleRelease(): consume() hands the target to the insertion call
+        // site and clears it in the same step — a one-shot use per
+        // dictation, per the bug report's explicit requirement not to
+        // reuse a stale target for a later, unrelated dictation.
+        guard let consumed = store.consume() else {
+            throw SelfTestFailure.failed("consume() should return the target captured at press time")
+        }
+        try expect(consumed.applicationPID, equals: fakeTarget.applicationPID,
+                   "consume() should return the same target that was captured")
+        try expect(store.target == nil, equals: true,
+                   "consume() must clear the store as a side effect")
+
+        // A second consume() (e.g. a stray retry) must not resurrect the
+        // already-used target.
+        try expect(store.consume() == nil, equals: true,
+                   "consuming an already-emptied store should yield nil, not the previous target")
+
+        // handlePress() for the NEXT dictation: capture(nil) is what
+        // captureTextInsertionTargetForNextDictation() does immediately,
+        // before the async AX resolution completes — simulates the
+        // resolver failing/still-in-flight case, which must fall back to
+        // the pre-existing global-post mechanism rather than reusing
+        // anything from the previous session.
+        store.capture(nil)
+        try expect(store.consume() == nil, equals: true,
+                   "a press with no resolved target must leave nothing for release to consume")
     }
 
     private static func testInsertionTargetTracking() throws {

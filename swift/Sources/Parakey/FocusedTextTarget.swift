@@ -24,6 +24,14 @@ struct FocusedTextTarget {
     let subrole: String?
 }
 
+// AXUIElement (an opaque CFTypeRef) isn't Sendable by default, so this
+// struct doesn't get the compiler's automatic internal-type Sendable
+// inference. Accessibility calls are documented by Apple as safe from any
+// thread/queue — this resolver's own doc comment above assumes exactly
+// that, expecting callers to hop actors around `captureTarget()`'s result
+// — so `@unchecked` here just asserts what was already the design intent.
+extension FocusedTextTarget: @unchecked Sendable {}
+
 enum FocusedTargetError: Error {
     case accessibilityPermissionMissing
     case focusedApplicationUnavailable(AXError)
