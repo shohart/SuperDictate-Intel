@@ -20899,10 +20899,15 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private var language: InterfaceLanguage { settings.interfaceLanguage }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        guard SuperDictateControlPanelRegistry.claimCurrentPanel() else {
-            _ = SuperDictateControlPanelRegistry.activateExistingPanelIfPresent()
-            NSApp.terminate(nil)
-            return
+        if !SuperDictateControlPanelRegistry.claimCurrentPanel() {
+            if SuperDictateControlPanelRegistry.activateExistingPanelIfPresent() {
+                NSApp.terminate(nil)
+                return
+            }
+            // No live panel to hand off to (stale pid file, permission error,
+            // recycled PID) -- opening normally is safer than terminating
+            // silently and leaving the control panel unreachable.
+            log("controlPanel: claimCurrentPanel failed and no existing panel could be activated; opening anyway")
         }
         NSApp.setActivationPolicy(.regular)
         showWindow()
