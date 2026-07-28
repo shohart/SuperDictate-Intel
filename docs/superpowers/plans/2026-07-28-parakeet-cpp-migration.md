@@ -38,10 +38,20 @@ spec's own Phase 1-6 ordering:
    phase order keeps both trees compiling into the same executable through
    its Phase 4. Fix: from the first phase that touches the `Parakey`
    executable target, the target depends on **exactly one** of
-   `whisper_cpp` / `parakeet_cpp` at a time — never both. Whisper's source
-   stays on disk (compiled or not) until the final removal phase, giving a
-   one-line rollback (`dependencies:` swap in `Package.swift`) at every
-   intermediate phase.
+   `whisper_cpp` / `parakeet_cpp` at a time — never both.
+
+**2026-07-28 update — full commitment, no dual-track hedging.** The user
+has explicitly directed: this branch fully moves to Parakeet, forget about
+Whisper on this branch, don't design around rollback complexity. This
+changes how the phases below treat Whisper removal: it is not a separate,
+gated, final phase kept behind an accuracy sign-off — Whisper source is
+deleted progressively as Parakeet replaces each piece of it (Phase 3 and
+Phase 6 below are merged in spirit: CPU integration *is* the removal for
+that piece). The A/B measurement against the Phase 1 baseline (previously
+"Gate C") still happens and is still reported honestly, because it's
+useful signal — but it is no longer a blocking stop/go gate that pauses
+the branch waiting for sign-off before code can be deleted. Sequencing
+stays CPU-first, then Vulkan, per the user's explicit instruction.
 
 Additionally: `main.swift` already contains a real, working
 `SpeechModelTextRepair.apply(to:language:)` (main.swift:5659-5714) with the
@@ -83,30 +93,31 @@ PARAKEET_MODEL_ARCH        = parakeet (TDT, hybrid)
 PARAKEET_MODEL_QUANTIZATION = q8_0
 ```
 
-## Phase gates (explicit stop/go points)
+## Phase checkpoints (real-hardware verification, not stop/go approval gates)
 
-- **Gate A (end of Phase 2)**: standalone CPU spike produces a correct
-  transcript from real audio on the real Intel Mac, outside the app. If
-  this fails, nothing else in this plan proceeds.
-- **Gate B (end of Phase 3)**: Parakeet CPU is fully wired into the real
-  application (hotkey → capture → transcribe → paste → history) end to end
-  on real hardware, Whisper is compile-time excluded from the executable
-  (source untouched on disk), self-tests pass.
-- **Gate C (end of Phase 4 — the accuracy/perf gate)**: a real A/B on the
-  user's own Russian audio (names, numbers, technical terms, mixed
-  RU/EN, short commands, a long monologue) comparing Parakeet CPU against
-  the currently-shipped Whisper+Vulkan v0.3.1. **This is presented to the
-  user for a decision before Phase 6 (Whisper deletion) starts.** A newer
-  model is not assumed better for this specific language/use case; if the
-  A/B shows a regression, the plan stops here (or Vulkan is added first
-  and re-measured) rather than deleting Whisper on faith.
-- **Gate D (end of Phase 5, optional)**: Parakeet Vulkan measured against
-  Parakeet CPU on the real RX 6600. Only pursued if Gate C's CPU numbers
-  are promising enough that GPU speedup is worth the added risk (matches
-  the spec's own §20 target: ≥15-20% latency reduction over CPU, reported
-  honestly either way).
-- **Gate E (end of Phase 6)**: Whisper fully removed — only entered after
-  explicit user sign-off on Gate C's results.
+Per the user's 2026-07-28 direction, these are checkpoints to verify real
+progress on real hardware, not approval gates that pause the branch. The
+branch moves forward through them; results are reported at each one, but
+none of them block deleting Whisper code or proceeding to the next phase.
+
+- **Checkpoint A (end of Phase 2)**: standalone CPU spike produces a
+  correct transcript from real audio on the real Intel Mac, outside the
+  app.
+- **Checkpoint B (end of Phase 3)**: Parakeet CPU is fully wired into the
+  real application (hotkey → capture → transcribe → paste → history) end
+  to end on real hardware, self-tests pass. Whisper source for the pieces
+  Parakeet has replaced is deleted as part of this phase, not kept around.
+- **Checkpoint C (end of Phase 4)**: a real A/B on Russian/English audio
+  (names, numbers, technical terms, mixed RU/EN, short commands, a long
+  monologue) comparing Parakeet CPU against the Phase 1 Whisper+Vulkan
+  v0.3.1 baseline. Reported for visibility; the branch proceeds to Phase 5
+  (Vulkan) regardless, per the user's explicit CPU-then-Vulkan instruction.
+- **Checkpoint D (end of Phase 5)**: Parakeet Vulkan measured against
+  Parakeet CPU on the real RX 6600 (matches the spec's own §20 target of
+  ≥15-20% latency reduction over CPU, reported honestly either way).
+- **Checkpoint E (end of Phase 6)**: Whisper fully removed from the tree,
+  build, and binary — verified via the spec's §17/§24 grep/`nm`/`strings`
+  checks.
 
 ## Phases
 
@@ -131,7 +142,7 @@ Merged `main`@`3449355` into this branch (worktree
   (model download/cache, `TranscriptionWorker`, settings, self-tests,
   README) as a checklist for Phase 3/6, without editing anything yet.
 
-### Phase 2 — standalone parakeet.cpp CPU spike (Gate A)
+### Phase 2 — standalone parakeet.cpp CPU spike (Checkpoint A)
 
 Mirrors this project's own established spike pattern (the Vulkan work did
 the same thing first, as a fully separate SwiftPM package — see commits
@@ -153,9 +164,7 @@ rejected for being out-of-process).
 - Record: pinned commit (re-confirmed), real SHA-256, model load time,
   first-inference latency, peak RSS.
 
-**Gate A must pass on real hardware before Phase 3 starts.**
-
-### Phase 3 — application integration, CPU only (Gate B)
+### Phase 3 — application integration, CPU only, Whisper deleted as it's replaced (Checkpoint B)
 
 - `scripts/vendor-parakeet-cpp.sh` per spec §5: deterministic vendoring
   into `swift/Sources/parakeet_cpp/` (inference sources + the pinned ggml
@@ -167,10 +176,12 @@ rejected for being out-of-process).
   own `parakeet_capi_*` functions already provide equivalent load-once,
   exception-free, PCM-in/UTF-8-out semantics — a thin Swift-facing rename/
   wrapper is enough, not a from-scratch C ABI).
-- **Change the `Parakey` executable target's `dependencies` from
-  `whisper_cpp` to `parakeet_cpp`.** `whisper_cpp`'s source tree and
-  `Package.swift` target definition stay on disk untouched — this is the
-  rollback point for the rest of the migration, until Phase 6.
+- **Remove the `whisper_cpp` target from the `Parakey` executable's
+  `dependencies` and delete `swift/Sources/whisper_cpp/` outright in this
+  phase** (full commitment per the user's direction — no dual-track
+  hedging, no source kept "just in case"). This single-handedly avoids the
+  duplicate-ggml link hazard, since there is only ever one ggml in the tree
+  from this point forward.
 - `ParakeetEngine` Swift wrapper (spec §8), new model storage path
   (`~/Library/Application Support/SuperDictate/Models/`, spec §4), new
   downloader with the same integrity guarantees the Whisper downloader
@@ -193,33 +204,30 @@ rejected for being out-of-process).
   capture → Parakeet CPU transcribe → paste → history) proven live, same
   as every prior real-hardware verification in this project's history.
 
-**Gate B must pass on real hardware before Phase 4 starts.**
-
-### Phase 4 — A/B measurement against the shipped baseline (Gate C)
+### Phase 4 — A/B measurement against the shipped baseline (Checkpoint C)
 
 - Run the full Phase 1 corpus through the now-integrated Parakeet CPU path
   on the real Mac; compare text and latency against the Phase 1 Whisper
   baseline, clip by clip.
-- Report to the user: accuracy (qualitative, since there's no ground-truth
-  transcript, but flag any garbled/hallucinated/wrong-language output),
-  latency/RTF, peak RAM, and the `<unk>`/`ё` finding from Phase 3.
-- **Stop and present this to the user before Phase 6.** Possible outcomes:
-  continue to Phase 5 (Vulkan) then Phase 6 (removal); skip Vulkan and go
-  straight to Phase 6; or stop the migration here if Parakeet regresses on
-  the user's actual dictation content.
+- Report: accuracy (qualitative, since there's no ground-truth transcript,
+  but flag any garbled/hallucinated/wrong-language output), latency/RTF,
+  peak RAM, and the `<unk>`/`ё` finding from Phase 3. This is informational
+  — the branch proceeds to Phase 5 (Vulkan) regardless, per the user's
+  explicit CPU-then-Vulkan instruction.
 
-### Phase 5 — Vulkan add-on (optional, only if Gate C looks promising)
+### Phase 5 — Vulkan add-on (Checkpoint D)
 
 - Add `PARAKEET_GGML_VULKAN` to the vendor script and `parakeet_cpp`
   target, forward the same static-MoltenVK linking pattern already proven
   in this fork's Whisper Vulkan work (`opt/`-symlink-based Homebrew paths
   at build time, static link, no runtime Homebrew dependency, verified via
   `otool -L`).
-- **A fresh SPIR-V shader corpus is required** — the existing 1785 `.spv`
-  files under `whisper_cpp/vulkan-shaders/` were generated against
-  whisper's ggml vintage and are not reusable against ggml v0.13.0. Budget
-  this as its own sub-step (it was effectively a mini-project during the
-  Whisper Vulkan work too).
+- **A fresh SPIR-V shader corpus is required** — the shader corpus that
+  used to live under `whisper_cpp/vulkan-shaders/` (deleted in Phase 3
+  along with the rest of `whisper_cpp/`) was generated against whisper's
+  ggml vintage and would not have been reusable against ggml v0.13.0
+  anyway. Budget this as its own sub-step (it was effectively a
+  mini-project during the Whisper Vulkan work too).
 - Real device probing via ggml's registry (spec §11.2 — never infer from
   IOKit alone), warm-up with timeout, CPU fallback on any Vulkan
   init/inference failure (spec §9.3), wire the existing `Use GPU (Vulkan)`
@@ -227,21 +235,19 @@ rejected for being out-of-process).
 - Benchmark Parakeet Vulkan vs Parakeet CPU on the real RX 6600, report
   honestly (spec §20 target is ≥15-20% latency reduction, not guaranteed).
 
-**Gate D**: report results; user decides whether Vulkan ships enabled,
-ships but off-by-default, or is deferred.
+### Phase 6 — verify Whisper is fully gone (Checkpoint E)
 
-### Phase 6 — remove Whisper entirely (Gate E, only after user sign-off on Gate C)
+Whisper's source (`swift/Sources/whisper_cpp/`) and its SwiftPM target were
+already deleted in Phase 3, alongside the app-integration swap. This phase
+is the final sweep to confirm nothing was missed, not a new deletion step:
 
-- Delete `swift/Sources/whisper_cpp/`, the `whisper_cpp` SwiftPM target,
-  all Whisper compile definitions/constants/comments/tests, the old model
-  cache path handling (leave the legacy `~/Library/Application
-  Support/Whisper` directory alone per spec §4.4 — do not recursively
-  delete a user directory).
 - `rg -n -i "whisper|large-v3-turbo|whisper_cpp" .` → no matches (or
   narrowly justified changelog mentions only).
 - `nm -gU`/`strings` on the built binary → no Whisper symbols/strings.
 - Update `scripts/build-app.sh`, `scripts/dev-run.sh`, `install.sh`,
   `uninstall.sh`, README, this plan's own spec doc if anything drifted.
+- Legacy model cache: leave `~/Library/Application Support/Whisper` alone
+  per spec §4.4 — do not recursively delete a user directory.
 
 ### Phase 7 — packaging, benchmarking, release
 
