@@ -215,7 +215,24 @@ rejected for being out-of-process).
   — the branch proceeds to Phase 5 (Vulkan) regardless, per the user's
   explicit CPU-then-Vulkan instruction.
 
-### Phase 5 — Vulkan add-on (Checkpoint D)
+### Phase 5 — Vulkan add-on (Checkpoint D) — DONE, see
+`.superpowers/sdd/2026-07-28-parakeet-cpp-migration/phase-5-vulkan-integration-report.md`
+
+Real Vulkan backend built and verified on the RX 6600: real device
+enumeration/selection, static MoltenVK linking confirmed via `otool -L` on
+the shipped app binary, the pre-spike's silent-CPU-fallback bug fixed and
+proven via a forced-failure test, full `TranscriptionWorker` load/fallback
+algorithm (spec §9.1/§9.3) implemented, localized settings UI wired to a
+real capability probe. Shader corpus ships as loose `.spv` (60MB, matching
+this fork's own whisper.cpp precedent) rather than embedded C arrays
+(230MB, tried first and superseded). Benchmark result is an honest mixed
+one: the ≥15-20% target (spec §20) is met on 3 of 4 corpus clips (26-57%,
+growing with clip length) but the shortest clip (1.67s) regresses (Vulkan
+28% slower than CPU) once real Swift/actor/bridge overhead is included —
+see the report's §8 for full numbers and analysis. Not done: a clean
+`ioreg` VRAM delta (ggml's own allocator log used instead), 100-sequential-
+dictations stress testing against Vulkan, and full GUI-level toggle
+verification (deliberately skipped — see report §10 for why).
 
 - Add `PARAKEET_GGML_VULKAN` to the vendor script and `parakeet_cpp`
   target, forward the same static-MoltenVK linking pattern already proven
