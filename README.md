@@ -220,15 +220,37 @@ CMake-сборке (без Swift/bridge-накладных расходов, г�
 ## Проверки перед pull request
 
 ```bash
-bash -n install.sh uninstall.sh scripts/build-app.sh
+bash -n install.sh uninstall.sh scripts/*.sh
 plutil -lint swift/Info.plist entitlements.plist
 swift run -c debug --package-path swift Parakey --self-test all
 ./scripts/build-app.sh ./dist/SuperDictate.app
 codesign --verify --deep --strict ./dist/SuperDictate.app
+otool -L ./dist/SuperDictate.app/Contents/MacOS/SuperDictate
+file ./dist/SuperDictate.app/Contents/MacOS/SuperDictate
+lipo -info ./dist/SuperDictate.app/Contents/MacOS/SuperDictate
 ```
+
+`otool -L` не должен содержать `/usr/local`, `/opt/homebrew`, `Cellar`,
+`MoltenVK.dylib` или `libvulkan` (MoltenVK и весь ggml/parakeet.cpp
+статически слинкованы в исполняемый файл — единственные рантайм-зависимости
+это системные фреймворки Apple).
 
 GitHub Actions повторяет самотесты, собирает bundle, прогоняет установщик на
 чистом macOS runner и проверяет удаление.
+
+### Бенчмарк Parakeet CPU vs Vulkan
+
+`scripts/benchmark-parakeet.sh` — постоянный, переисполняемый скрипт (не
+одноразовый спайк): синтезирует фиксированный корпус через `say`/`afconvert`
+(RU/EN/смешанный, короткие команды, числа, технические термины, ~30с и
+~120с фрагменты), прогоняет каждый клип через реальный
+`--benchmark-transcribe` (постоянная точка входа в `main.swift`, проверяется
+до создания `NSApplication`, поэтому никогда не проваливается в обычный
+запуск приложения) на CPU и Vulkan, и печатает таблицу с холодной загрузкой,
+разогревом, первой транскрипцией, медианной/p95 задержкой в тёплом режиме,
+RTF, пиковой RSS и фактически выбранным устройством. Результаты реального
+прогона — в
+`.superpowers/sdd/2026-07-28-parakeet-cpp-migration/FINAL-IMPLEMENTATION-REPORT.md`.
 
 ## Ограничения
 

@@ -1,5 +1,19 @@
 # Plan: migrate ASR from whisper.cpp to parakeet.cpp (NVIDIA Parakeet TDT 0.6B v3)
 
+> **Status (2026-07-28): migration functionally complete.** All 7 phases
+> below are done — Whisper is fully removed, Parakeet CPU and Vulkan both
+> work and are verified on real hardware (Intel Xeon E5-2678 v3 + AMD
+> Radeon RX 6600 via MoltenVK). See
+> `.superpowers/sdd/2026-07-28-parakeet-cpp-migration/FINAL-IMPLEMENTATION-REPORT.md`
+> for the full closing report (pinned commits, benchmarks, known
+> limitations, validation results). **This branch has not been merged into
+> `main` and nothing has been pushed to `origin`.** Per the task owner's
+> explicit instruction, the user tests this branch by hand before any
+> merge decision — this plan doc and the `.superpowers/sdd/` workspace are
+> deliberately kept in the tree for that testing (see the plan's own Phase
+> 7 section below for the literal "delete before merge" instruction this
+> status note is intentionally not yet following).
+
 Branch: `agent/parakeet-intel-backend-architecture` (worktree
 `.worktrees/parakeet-migration`), synced to `main`@`3449355` (v0.3.1).
 
@@ -266,24 +280,35 @@ is the final sweep to confirm nothing was missed, not a new deletion step:
 - Legacy model cache: leave `~/Library/Application Support/Whisper` alone
   per spec §4.4 — do not recursively delete a user directory.
 
-### Phase 7 — packaging, benchmarking, release
+### Phase 7 — packaging, benchmarking, release — **DONE (2026-07-28)**
 
-- `scripts/benchmark-parakeet.sh` (spec §19) as a permanent, re-runnable
-  script (not a one-off spike).
-- Full validation command suite (spec §24): shell syntax checks, plist
+- [x] `scripts/benchmark-parakeet.sh` (spec §19) as a permanent, re-runnable
+  script (not a one-off spike). Built, run for real on the target Mac (CPU
+  vs Vulkan, 8-clip synthetic corpus); real output recorded in
+  `FINAL-IMPLEMENTATION-REPORT.md`.
+- [x] Full validation command suite (spec §24): shell syntax checks, plist
   lint, self-tests, `build-app.sh`, `codesign --verify --deep --strict`,
   `otool -L` (no Homebrew paths), `file`/`lipo` arch checks, Whisper-absence
-  checks.
-- Implementation report per spec §27 (pinned commits, model metadata,
+  checks. All passed for real on the target Mac at this phase's final
+  commit — see `FINAL-IMPLEMENTATION-REPORT.md` §15.
+- [x] Implementation report per spec §27 (pinned commits, model metadata,
   license notices, flags, thread counts, actual Vulkan device if
-  applicable, benchmarks, known limitations).
-- Delete this plan doc and the `.superpowers/sdd/` workspace before
+  applicable, benchmarks, known limitations). See
+  `.superpowers/sdd/2026-07-28-parakeet-cpp-migration/FINAL-IMPLEMENTATION-REPORT.md`.
+- [ ] Delete this plan doc and the `.superpowers/sdd/` workspace before
   merging to `main`, per this project's standing "no internal Claude
   planning docs in the tracked repo" rule (same as every prior plan in
   this project's history). `docs/parakeet-intel-backend.md` (the original
   target-state spec) may be kept or removed at the user's discretion at
   that point — it documents real architecture decisions, unlike this
   phase-sequencing plan, so it is more likely to be worth keeping.
+  **Deliberately NOT done as part of this phase** — per a later, more
+  specific instruction from the task owner than this bullet's own text,
+  this branch is not being merged to `main` in this phase at all; the user
+  tests it by hand first. Deletion is deferred to that eventual, separate
+  merge step. See the status note at the top of this file and
+  `FINAL-IMPLEMENTATION-REPORT.md` §18 for the full explanation of this
+  deviation.
 
 ## Future work (explicitly out of scope for this plan)
 

@@ -32,7 +32,7 @@ OUT_DIR="$ROOT_DIR/dist/benchmark-parakeet-$(date +%Y%m%d-%H%M%S)"
 REPEATS=11   # first call = "first inference (cold)"; remaining N-1 = warm pool
 DEVICES="cpu vulkan"
 
-say() { printf 'benchmark-parakeet: %s\n' "$*"; }
+log_msg() { printf 'benchmark-parakeet: %s\n' "$*"; }
 fail() { printf 'benchmark-parakeet: %s\n' "$*" >&2; exit 1; }
 
 while [[ $# -gt 0 ]]; do
@@ -56,7 +56,7 @@ if [[ -z "$BINARY" ]]; then
     if [[ -x "$ROOT_DIR/dist/SuperDictate.app/Contents/MacOS/SuperDictate" ]]; then
         BINARY="$ROOT_DIR/dist/SuperDictate.app/Contents/MacOS/SuperDictate"
     else
-        say "No --binary given and no dist/SuperDictate.app found; building release via swift build..."
+        log_msg "No --binary given and no dist/SuperDictate.app found; building release via swift build..."
         swift build -c release --package-path "$ROOT_DIR/swift"
         BIN_DIR="$(swift build -c release --package-path "$ROOT_DIR/swift" --show-bin-path)"
         BINARY="$BIN_DIR/Parakey"
@@ -96,7 +96,7 @@ for spec in "${CORPUS_SPECS[@]}"; do
     fi
     CORPUS_FILES+=("$wav")
 done
-say "Corpus ready: ${#CORPUS_FILES[@]} clips in $CORPUS_DIR (synthetic, macOS 'say' — no private recordings)."
+log_msg "Corpus ready: ${#CORPUS_FILES[@]} clips in $CORPUS_DIR (synthetic, macOS 'say' — no private recordings)."
 
 # ---------------------------------------------------------------------------
 # 2. Helpers
@@ -158,7 +158,7 @@ run_one() {
         > "$log_file" 2> "$time_file"; then
         echo "$log_file"
     else
-        say "  [$device/$clip_name] FAILED (see $log_file / $time_file) — see BENCH_FAILED line if present"
+        log_msg "  [$device/$clip_name] FAILED (see $log_file / $time_file) — see BENCH_FAILED line if present"
         cat "$time_file" >> "$log_file" 2>/dev/null || true
         echo "$log_file"
         return 1
@@ -191,10 +191,10 @@ REPORT="$OUT_DIR/report.md"
 } > "$REPORT"
 
 for device in $DEVICES; do
-    say "=== Device: $device ==="
+    log_msg "=== Device: $device ==="
     for clip_path in "${CORPUS_FILES[@]}"; do
         clip_name="$(basename "$clip_path" .wav)"
-        say "  Running $clip_name..."
+        log_msg "  Running $clip_name..."
 
         vram_before="$(vram_snapshot)"
         if ! log_file="$(run_one "$device" "$clip_path")"; then
@@ -206,13 +206,19 @@ for device in $DEVICES; do
         vram_after="$(vram_snapshot)"
 
         load_line="$(grep '^BENCH_LOAD' "$log_file" || true)"
-        [[ -n "$load_line" ]] || { say "    no BENCH_LOAD line, skipping"; continue; }
+        [[ -n "$load_line" ]] || { log_msg "    no BENCH_LOAD line, skipping"; continue; }
         load_s="$(field "$load_line" load_s)"
         warm_s="$(field "$load_line" warmup_s)"
         actual_device="$(field "$load_line" actual_device)"
 
-        mapfile -t result_lines < <(grep '^BENCH_RESULT' "$log_file" || true)
-        [[ ${#result_lines[@]} -gt 0 ]] || { say "    no BENCH_RESULT lines, skipping"; continue; }
+        # `mapfile`/`readarray` are bash4+ only; this project's macOS shells
+        # ship Apple's ancient bash 3.2, so build the array with a plain
+        # while-read loop instead.
+        result_lines=()
+        while IFS= read -r bench_line; do
+            result_lines+=("$bench_line")
+        done < <(grep '^BENCH_RESULT' "$log_file" || true)
+        [[ ${#result_lines[@]} -gt 0 ]] || { log_msg "    no BENCH_RESULT lines, skipping"; continue; }
 
         duration_s="$(field "${result_lines[0]}" duration_s)"
         first_wall_s="$(field "${result_lines[0]}" wall_s)"
@@ -255,6 +261,6 @@ for device in $DEVICES; do
     done
 done
 
-say "Done. Report: $REPORT"
-say "Raw logs: $OUT_DIR/*.log (stdout), $OUT_DIR/*.time (/usr/bin/time -l output)"
+log_msg "Done. Report: $REPORT"
+log_msg "Raw logs: $OUT_DIR/*.log (stdout), $OUT_DIR/*.time (/usr/bin/time -l output)"
 cat "$REPORT"
