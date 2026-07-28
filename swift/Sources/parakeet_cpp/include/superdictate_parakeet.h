@@ -162,6 +162,18 @@ const char *sd_parakeet_last_error_message(const SDParakeetContext *context);
 // parakeet.cpp's own version string (e.g. "0.0.1"). Never NULL.
 const char *sd_parakeet_runtime_version(void);
 
+// Test-only: resets parakeet.cpp's process-global compute backend
+// (pk::shutdown_backend()) so the NEXT context's first inference
+// reconstructs it from whatever PARAKEET_DEVICE is set at that moment,
+// instead of reusing an already-alive backend from an earlier context in
+// the same process. Production code never needs this — sd_parakeet_warm_up
+// already calls it internally on the one path where it matters (a
+// detected Vulkan-fell-back-to-CPU failure). Exists so a self-test can
+// exercise the forced-failure path deterministically after a prior
+// sub-test already constructed a real, working backend in the same
+// process (see the parakeet-vulkan self-test group).
+void sd_parakeet_test_reset_backend(void);
+
 #ifdef __cplusplus
 }
 #endif

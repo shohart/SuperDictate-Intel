@@ -374,6 +374,10 @@ extern "C" const char *sd_parakeet_vulkan_device_description(void) {
     return description.c_str();
 }
 
+extern "C" void sd_parakeet_test_reset_backend(void) {
+    pk::shutdown_backend();
+}
+
 extern "C" const char *sd_parakeet_last_error_message(const SDParakeetContext *context) {
     if (!context) return "";
     return context->last_error.c_str();

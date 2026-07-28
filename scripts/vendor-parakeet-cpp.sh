@@ -8,9 +8,14 @@
 #
 # The hand-authored SwiftPM module glue (module.modulemap, umbrella header)
 # and the SuperDictate C bridge (swift/Sources/parakeet_cpp/bridge/,
-# swift/Sources/parakeet_cpp/include/superdictate_parakeet.h) are NOT touched
-# by this script — they live outside $UPSTREAM_DEST specifically so a
-# re-vendor never discards them. Edit those files directly.
+# swift/Sources/parakeet_cpp/include/superdictate_parakeet.h) are NOT
+# hand-edited by this script — they live outside $UPSTREAM_DEST specifically
+# so a re-vendor never discards them. Edit those files directly. The one
+# exception: swift/Sources/parakeet_cpp/include/ggml-vulkan-shaders-runtime.h
+# IS overwritten by vendor_vulkan_backend below (a plain copy of this
+# project's own scripts/vulkan-shader-runtime/ source, not vendored from
+# upstream) — see that function for why the umbrella header needs a second
+# copy of that file next to it.
 #
 # CPU backend vendoring (everything up to and including PROVENANCE.md below)
 # requires only git — no C/C++ toolchain, no Vulkan SDK. Re-run this and
@@ -216,6 +221,17 @@ vendor_vulkan_backend() {
        "$vk_dest/ggml-vulkan-shaders-runtime.h"
     cp "$ROOT_DIR/scripts/vulkan-shader-runtime/ggml-vulkan-shaders-runtime.cpp" \
        "$vk_dest/ggml-vulkan-shaders-runtime.cpp"
+    # ALSO copied into $DEST/include/ (the hand-authored umbrella-header
+    # directory, otherwise untouched by this script) so
+    # parakeet_cpp_module.h's `#include "ggml-vulkan-shaders-runtime.h"`
+    # resolves via plain same-directory quote-include -- Swift's Clang
+    # importer builds the umbrella header as its own Objective-C module
+    # compilation, which (confirmed empirically) does NOT honor
+    # Package.swift's headerSearchPath entries the way normal C/C++
+    # translation units in this target do, so a second copy right next to
+    # the umbrella header is the only mechanism proven to work.
+    cp "$ROOT_DIR/scripts/vulkan-shader-runtime/ggml-vulkan-shaders-runtime.h" \
+       "$DEST/include/ggml-vulkan-shaders-runtime.h"
 
     if ! command -v cmake >/dev/null 2>&1 || ! command -v glslc >/dev/null 2>&1; then
         echo "vendor-parakeet-cpp.sh: cmake and/or glslc not found on PATH -- skipping Vulkan shader (re)generation." >&2

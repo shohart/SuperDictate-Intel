@@ -16612,6 +16612,8 @@ private enum ParakeySelfTest {
             return runSuite("parakeet-text-repair", testParakeetTranscriptRepair)
         case "parakeet-vulkan":
             return runSuite("parakeet-vulkan", testParakeetVulkanIntegration)
+        case "parakeet-vulkan-bench":
+            return runSuite("parakeet-vulkan-bench", benchmarkParakeetCPUvsVulkan)
         case "all":
             return runSuite("all", testAll)
         default:
@@ -20253,6 +20255,126 @@ private enum ParakeySelfTest {
     /// the Phase 5 integration report's manual runs on the actual RX 6600;
     /// this self-test is the re-runnable regression check for CI/dev boxes
     /// that DO have Vulkan + the model staged.
+    // MARK: - Minimal WAV reader (Phase 5 benchmark harness only)
+
+    /// Parses a canonical 16-bit PCM WAV file into mono Float32 samples in
+    /// [-1, 1] at its native sample rate. Deliberately minimal (no
+    /// float/24-bit/extensible fmt chunk support) — this exists ONLY to
+    /// drive `benchmarkParakeetCPUvsVulkan()` against the Phase 1 corpus
+    /// fixtures (16-bit PCM mono/stereo WAV), not as production audio I/O
+    /// (the app's real capture path uses AVFoundation, never a file).
+    private static func loadWavMonoFloat32(path: String) throws -> (samples: [Float], sampleRate: UInt32) {
+        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        func u32(_ offset: Int) -> UInt32 {
+            UInt32(data[offset]) | (UInt32(data[offset+1]) << 8) | (UInt32(data[offset+2]) << 16) | (UInt32(data[offset+3]) << 24)
+        }
+        func u16(_ offset: Int) -> UInt16 {
+            UInt16(data[offset]) | (UInt16(data[offset+1]) << 8)
+        }
+        guard data.count > 44, data[0...3].elementsEqual("RIFF".utf8), data[8...11].elementsEqual("WAVE".utf8) else {
+            throw NSError(domain: "Parakey", code: -10, userInfo: [NSLocalizedDescriptionKey: "not a RIFF/WAVE file: \(path)"])
+        }
+        var offset = 12
+        var channels: UInt16 = 1
+        var sampleRate: UInt32 = 16000
+        var bitsPerSample: UInt16 = 16
+        var dataRange: Range<Int>?
+        while offset + 8 <= data.count {
+            let chunkID = data[offset...offset+3]
+            let chunkSize = Int(u32(offset + 4))
+            let bodyStart = offset + 8
+            if chunkID.elementsEqual("fmt ".utf8) {
+                channels = u16(bodyStart + 2)
+                sampleRate = u32(bodyStart + 4)
+                bitsPerSample = u16(bodyStart + 14)
+            } else if chunkID.elementsEqual("data".utf8) {
+                dataRange = bodyStart..<min(bodyStart + chunkSize, data.count)
+            }
+            offset = bodyStart + chunkSize + (chunkSize % 2)
+        }
+        guard let dataRange, bitsPerSample == 16 else {
+            throw NSError(domain: "Parakey", code: -11, userInfo: [NSLocalizedDescriptionKey: "unsupported/missing WAV data chunk (need 16-bit PCM): \(path)"])
+        }
+        let bytes = [UInt8](data[dataRange])
+        let frameCount = bytes.count / (2 * Int(channels))
+        var samples = [Float](repeating: 0, count: frameCount)
+        bytes.withUnsafeBytes { raw in
+            let i16 = raw.bindMemory(to: Int16.self)
+            for frame in 0..<frameCount {
+                var sum: Int32 = 0
+                for ch in 0..<Int(channels) {
+                    sum += Int32(i16[frame * Int(channels) + ch])
+                }
+                samples[frame] = Float(sum) / Float(Int(channels)) / 32768.0
+            }
+        }
+        return (samples, sampleRate)
+    }
+
+    /// Phase 5 benchmark harness: Parakeet CPU vs Vulkan, wired through the
+    /// EXACT same ParakeetEngine/bridge path the app itself uses (not the
+    /// standalone parakeet-cli used by the Phase 5 pre-spike) — the point
+    /// is to measure whatever overhead Swift/actor/bridge marshalling adds
+    /// on top of the pre-spike's raw ~30-63% latency reduction. Opt-in via
+    /// SUPERDICTATE_TEST_VULKAN=1 + SUPERDICTATE_PARAKEET_MODEL (same gates
+    /// as testParakeetVulkanIntegration) plus SUPERDICTATE_BENCH_CORPUS_DIR
+    /// pointing at a directory of 16-bit PCM WAV files (the Phase 1 corpus
+    /// fixture set) and SUPERDICTATE_BENCH_DEVICE ("cpu" or "vulkan"). Runs
+    /// ONE device per process invocation deliberately — parakeet.cpp's
+    /// compute backend (pk::global_backend()) is a process-global
+    /// singleton that commits to one device for the process's lifetime
+    /// (confirmed by this same bridge's own post-init safety check, which
+    /// correctly refused a same-process CPU-then-Vulkan sequence here
+    /// during development), matching how TranscriptionWorker itself never
+    /// holds a CPU and a Vulkan engine alive at the same time either. Run
+    /// this once per device and compare the two logs' `cpu_ms`/timing
+    /// columns externally. Not part of testAll — this is a manual
+    /// measurement tool, not a pass/fail regression test (timings are
+    /// inherently machine/load-dependent; only the log output matters).
+    private static func benchmarkParakeetCPUvsVulkan() throws {
+        guard ProcessInfo.processInfo.environment["SUPERDICTATE_TEST_VULKAN"] == "1",
+              let modelPath = ProcessInfo.processInfo.environment["SUPERDICTATE_PARAKEET_MODEL"],
+              FileManager.default.fileExists(atPath: modelPath),
+              let corpusDir = ProcessInfo.processInfo.environment["SUPERDICTATE_BENCH_CORPUS_DIR"],
+              let deviceRaw = ProcessInfo.processInfo.environment["SUPERDICTATE_BENCH_DEVICE"],
+              let device = deviceRaw == "cpu" ? ParakeetDevice.cpu : (deviceRaw == "vulkan" ? ParakeetDevice.vulkan : nil)
+        else {
+            print("SKIP parakeet-vulkan-bench: requires SUPERDICTATE_TEST_VULKAN=1, SUPERDICTATE_PARAKEET_MODEL, SUPERDICTATE_BENCH_CORPUS_DIR, SUPERDICTATE_BENCH_DEVICE=cpu|vulkan")
+            return
+        }
+        if device == .vulkan {
+            guard parakeetVulkanAvailable() else {
+                print("SKIP parakeet-vulkan-bench: no Vulkan device enumerated")
+                return
+            }
+        }
+        let clipNames = ["01_ru_short_command.wav", "02_en_short_command.wav", "03_ru_numbers.wav", "11_ru_paragraph_30s.wav"]
+        let threadCount = TranscriptionWorker.resolvedParakeetThreadCount()
+
+        let engine = try ParakeetEngine(modelPath: modelPath, device: device, threadCount: threadCount)
+        try runParakeetEngineSynchronously { try await engine.warmUp() }
+        let actualDevice = try runParakeetEngineSynchronously { await engine.backendDescription() }
+
+        print("PARAKEET BENCH [\(deviceRaw), actual=\(actualDevice)]: clip,audio_s,wall_ms,text")
+        for name in clipNames {
+            let path = (corpusDir as NSString).appendingPathComponent(name)
+            guard FileManager.default.fileExists(atPath: path) else {
+                print("PARAKEET BENCH: SKIP \(name) (not found under \(corpusDir))")
+                continue
+            }
+            let (samples, sampleRate) = try loadWavMonoFloat32(path: path)
+            let audioSeconds = Double(samples.count) / Double(sampleRate)
+
+            let started = ProcessInfo.processInfo.systemUptime
+            let result = try runParakeetEngineSynchronously { try await engine.transcribe(samples: samples, sampleRate: sampleRate) }
+            let wallMs = (ProcessInfo.processInfo.systemUptime - started) * 1000
+
+            print("PARAKEET BENCH: \(name),\(String(format: "%.2f", audioSeconds)),\(String(format: "%.1f", wallMs)),\"\(result.text)\"")
+        }
+
+        try runParakeetEngineSynchronously { await engine.shutdown() }
+    }
+
     private static func testParakeetVulkanIntegration() throws {
         guard ProcessInfo.processInfo.environment["SUPERDICTATE_TEST_VULKAN"] == "1" else {
             print("SKIP parakeet-vulkan: SUPERDICTATE_TEST_VULKAN=1 not set")
@@ -20269,6 +20391,45 @@ private enum ParakeySelfTest {
         }
 
         let threadCount = TranscriptionWorker.resolvedParakeetThreadCount()
+
+        // Forced-failure fallback check FIRST, before any real Vulkan
+        // backend has been constructed in this process: parakeet.cpp's
+        // compute backend (pk::global_backend()) is a process-global
+        // singleton, created lazily on first use and NOT reconstructed on
+        // a later request unless explicitly reset — so this ordering
+        // matters. Running the forced-failure attempt first guarantees the
+        // bogus device name is actually consulted when the singleton is
+        // first constructed, rather than a real backend from an earlier
+        // sub-test being silently reused (which would make this assertion
+        // pass for the wrong reason — the check never even running, not
+        // "ran and correctly detected no fallback").
+        // SD_PARAKEET_TEST_FORCE_DEVICE_NAME is a test-only bridge hook
+        // (see sd_parakeet_create) that requests a device name guaranteed
+        // not to exist, reproducing exactly the upstream silent-CPU-fallback
+        // behavior the Phase 5 pre-spike found (backend.cpp logs "not
+        // found; falling back to CPU" and continues successfully) —
+        // confirms the bridge's post-init check catches it rather than
+        // reporting Vulkan success. Restores the environment afterward so
+        // it doesn't leak into the real-device sub-test below.
+        setenv("SD_PARAKEET_TEST_FORCE_DEVICE_NAME", "Vulkan9-does-not-exist", 1)
+        var threwFellBackToCPU = false
+        do {
+            let bogus = try ParakeetEngine(modelPath: modelPath, device: .vulkan, threadCount: threadCount)
+            try runParakeetEngineSynchronously { try await bogus.warmUp() }
+        } catch ParakeetEngineError.vulkanFellBackToCPU {
+            threwFellBackToCPU = true
+        }
+        unsetenv("SD_PARAKEET_TEST_FORCE_DEVICE_NAME")
+        try expect(
+            threwFellBackToCPU, equals: true,
+            "a bogus forced device name (upstream falls back to CPU silently) must surface as .vulkanFellBackToCPU, never a silent success"
+        )
+
+        // Real-device verification second: the forced-failure attempt above
+        // left parakeet.cpp's process-global backend torn down (the bridge's
+        // post-init check calls pk::shutdown_backend() on this exact
+        // failure path — see sd_parakeet_warm_up), so this constructs a
+        // genuinely fresh backend against the real device name.
         let loadStarted = ProcessInfo.processInfo.systemUptime
         let engine = try ParakeetEngine(modelPath: modelPath, device: .vulkan, threadCount: threadCount)
         let loadSeconds = ProcessInfo.processInfo.systemUptime - loadStarted
@@ -20295,29 +20456,6 @@ private enum ParakeySelfTest {
         print("PARAKEET VULKAN: load \(String(format: "%.2f", loadSeconds))s, device \(actualDevice), threads \(threadCount), infer \(String(format: "%.3f", inferSeconds))s, RTF \(String(format: "%.3f", rtf)), text=\"\(result.text)\"")
 
         try runParakeetEngineSynchronously { await engine.shutdown() }
-
-        // Forced-failure fallback check: SD_PARAKEET_TEST_FORCE_DEVICE_NAME
-        // is a test-only bridge hook (see sd_parakeet_create) that requests
-        // a device name guaranteed not to exist, reproducing exactly the
-        // upstream silent-CPU-fallback behavior the Phase 5 pre-spike found
-        // (backend.cpp logs "not found; falling back to CPU" and continues
-        // successfully) — confirms the bridge's post-init check catches it
-        // rather than reporting Vulkan success. Restores the environment
-        // afterward so it doesn't leak into any later test/engine
-        // construction in this process.
-        setenv("SD_PARAKEET_TEST_FORCE_DEVICE_NAME", "Vulkan9-does-not-exist", 1)
-        var threwFellBackToCPU = false
-        do {
-            let bogus = try ParakeetEngine(modelPath: modelPath, device: .vulkan, threadCount: threadCount)
-            try runParakeetEngineSynchronously { try await bogus.warmUp() }
-        } catch ParakeetEngineError.vulkanFellBackToCPU {
-            threwFellBackToCPU = true
-        }
-        unsetenv("SD_PARAKEET_TEST_FORCE_DEVICE_NAME")
-        try expect(
-            threwFellBackToCPU, equals: true,
-            "a bogus forced device name (upstream falls back to CPU silently) must surface as .vulkanFellBackToCPU, never a silent success"
-        )
     }
 
     private static func testAudioRouteChangeDecision() throws {

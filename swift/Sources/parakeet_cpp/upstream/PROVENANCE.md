@@ -6,9 +6,14 @@ Do not hand-edit anything under this directory — re-run the vendor script.
   commit: e747acdaee69b916cef62263ae5f718bda9ff3f3
 - ggml (parakeet.cpp's own pinned submodule, third_party/ggml):
   commit: e705c5fed490514458bdd2eaddc43bd098fcce9b (v0.13.0)
-- Vendored: CPU backend only (Accelerate/BLAS on macOS). No CUDA, HIP,
-  Metal, CoreML, or Vulkan sources are included in this vendor pass.
-- License: both parakeet.cpp and ggml are MIT-licensed. See LICENSE-parakeet.cpp
-  and LICENSE-ggml in this directory for the exact upstream notices at the
-  pinned commits above.
-- Vendored on: 2026-07-28T12:53:29Z
+- Vendored: CPU backend (Accelerate/BLAS on macOS) plus the Vulkan backend
+  (ggml-vulkan/, device-agnostic sources + a loose SPIR-V shader corpus
+  under ggml-vulkan/vulkan-shaders/, loaded at runtime via the
+  scripts/vulkan-shader-runtime/ proxy glue — regenerated only when
+  cmake+glslc were available at vendor time; see this script's
+  vendor_vulkan_backend function). No CUDA, HIP, Metal, or CoreML sources
+  are included.
+- License: both parakeet.cpp and ggml are MIT-licensed. See
+  LICENSE-parakeet-cpp.txt and LICENSE-ggml.txt in this directory for the
+  exact upstream notices at the pinned commits above.
+- Vendored on: 2026-07-28T15:26:07Z
