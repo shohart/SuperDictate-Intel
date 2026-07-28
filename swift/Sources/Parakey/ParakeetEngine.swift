@@ -81,6 +81,26 @@ func parakeetVulkanDeviceDescription() -> String {
     String(cString: sd_parakeet_vulkan_device_description())
 }
 
+/// Points the vendored ggml-vulkan runtime SPIR-V loader
+/// (ggml_vk_shaders_set_directory, declared in
+/// ggml-vulkan-shaders-runtime.h and reachable via the parakeet_cpp
+/// umbrella header) at `Contents/Resources/vulkan-shaders` in the current
+/// app bundle, IF that directory actually exists — safe to call more than
+/// once (the most recent call wins) and a correctly-behaved no-op in a
+/// `swift run`/`swift build` dev build with no `.app` bundle yet (the C++
+/// loader's own source-relative fallback finds the real corpus at
+/// swift/Sources/parakeet_cpp/upstream/ggml-vulkan/vulkan-shaders/ in that
+/// case — see ggml-vulkan-shaders-runtime.cpp). MUST be called before the
+/// first Vulkan pipeline is created (i.e. before any inference on a
+/// `.vulkan`-device context) or every shader symbol silently resolves to
+/// null/zero-length.
+private func configureVulkanShaderDirectoryIfPresent() {
+    guard let resourceURL = Bundle.main.resourceURL else { return }
+    let shaderDir = resourceURL.appendingPathComponent("vulkan-shaders", isDirectory: true)
+    guard FileManager.default.fileExists(atPath: shaderDir.path) else { return }
+    shaderDir.path.withCString { ggml_vk_shaders_set_directory($0) }
+}
+
 /// Owns exactly one loaded parakeet.cpp context (`SDParakeetContext`, from
 /// the `parakeet_cpp` SwiftPM target's C bridge — see
 /// swift/Sources/parakeet_cpp/bridge/superdictate_parakeet.cpp). Mirrors
@@ -133,6 +153,17 @@ actor ParakeetEngine {
             guard parakeetVulkanAvailable() else {
                 throw ParakeetEngineError.vulkanUnavailable
             }
+            // Must happen before parakeet.cpp's backend (and therefore
+            // ggml-vulkan's shader pipeline) is ever constructed — see
+            // ggml_vk_shaders_set_directory's doc comment. Guarded by an
+            // existence check (not an unconditional call): this fork hit a
+            // real regression once already for whisper.cpp where an
+            // unconditional call broke the C++ loader's own dev-build
+            // source-relative fallback when Contents/Resources/vulkan-shaders
+            // didn't exist yet (every shader failed to load, ~37s Vulkan
+            // init instead of ~2s) — only override the directory when a real
+            // bundled corpus is actually there.
+            configureVulkanShaderDirectoryIfPresent()
         }
         guard FileManager.default.fileExists(atPath: modelPath) else {
             throw ParakeetEngineError.modelNotFound(path: modelPath)

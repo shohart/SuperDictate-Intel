@@ -20,31 +20,47 @@
 # Mac/Homebrew-toolchain-gated step (vendor_vulkan_backend, invoked at the
 # bottom of this script): it copies the Vulkan backend's own device-agnostic
 # C++ sources (ggml-vulkan.cpp/.h — no toolchain needed for that copy) AND,
-# only if `cmake`+`glslc` are found on PATH, regenerates the embedded SPIR-V
-# shader corpus (swift/Sources/parakeet_cpp/upstream/ggml-vulkan/generated/)
-# by running parakeet.cpp's OWN unmodified upstream CMake build once (the
-# exact same `-DPARAKEET_GGML_VULKAN=ON` configuration this fork's Phase 5
-# pre-spike already proved builds cleanly, zero source patches) and then
-# harvesting the generated `<shader>.comp.cpp` translation units +
-# `ggml-vulkan-shaders.hpp` it writes under its own CMake build directory.
-# This mirrors ggml v0.13.0's own CMake path exactly (see
-# third_party/ggml/src/ggml-vulkan/CMakeLists.txt's `vulkan-shaders-gen`
-# ExternalProject + per-.comp add_custom_command loop) rather than
-# reimplementing or patching that generator — the generated corpus is
-# embedded C arrays compiled directly into the parakeet_cpp SwiftPM target,
-# NOT loose `.spv` resource files (see PROVENANCE.md / the Phase 5
-# integration report for why this fork chose embedded arrays over the
-# loose-`.spv`-plus-Bundle.main pattern this fork used for whisper.cpp:
-# ggml v0.13.0's generator only supports the embedded-array output shape
-# without a from-scratch patch, and embedding avoids the
-# Contents/Resources + codesign-coverage surface entirely).
+# only if `cmake`+`glslc` are found on PATH, (re)builds the real SPIR-V
+# corpus and the runtime-loader glue that lets it ship as loose `.spv`
+# resource files, loaded lazily by explicit file path at first use, instead
+# of upstream's compiled-in C-array embed — EXACTLY the mechanism this fork
+# already proved for whisper.cpp's own Vulkan backend (commit b0ab800,
+# "Load Vulkan SPIR-V shaders from bundled resource files at runtime"; see
+# scripts/gen-vulkan-shader-runtime.py's module docstring for the full
+# design rationale, ported here unmodified since parakeet.cpp's pinned
+# ggml v0.13.0 uses the identical vulkan-shaders-gen.cpp shape). An earlier
+# version of this script tried the compiled-in-embed shape ggml's own CMake
+# path defaults to; that produced ~230MB of generated C++ source (vs. the
+# ~50-60MB of binary .spv this mechanism ships) for zero benefit, so this
+# script does NOT use it — see the Phase 5 integration report for the
+# measured comparison. Concretely, this step:
+#   1. Runs parakeet.cpp's OWN unmodified upstream CMake build
+#      (`-DPARAKEET_GGML_VULKAN=ON`, the exact configuration the Phase 5
+#      pre-spike proved builds cleanly, zero source patches) far enough to
+#      produce the `ggml-vulkan` target, which — as a byproduct of its own
+#      per-.comp add_custom_command loop — writes the real compiled `.spv`
+#      corpus into its build tree (third_party/ggml/src/ggml-vulkan/
+#      vulkan-shaders.spv/); those loose files are harvested directly.
+#   2. Invokes the SAME built vulkan-shaders-gen tool binary ONE more time
+#      in its "aggregate" mode (no --source) to produce a ground-truth
+#      header declaring every shader symbol name upstream's generated code
+#      references, with no byte data attached.
+#   3. Runs scripts/gen-vulkan-shader-runtime.py against that ground-truth
+#      header to produce a drop-in replacement `ggml-vulkan-shaders.hpp`/
+#      `.cpp` pair: same identifier names, but backed by lazy file-loading
+#      proxies (scripts/vulkan-shader-runtime/, hand-authored, copied in
+#      here since this script wipes upstream/ on every run) instead of
+#      embedded arrays. ggml-vulkan.cpp itself needs zero source edits —
+#      its #include "ggml-vulkan-shaders.hpp" resolves to this generated
+#      substitute by filename alone.
 #
 # If `cmake`/`glslc` are NOT found (e.g. running this on a non-Mac CI box to
 # refresh just the CPU pin), vendor_vulkan_backend still copies the
 # device-agnostic ggml-vulkan.cpp/.h sources but SKIPS shader regeneration
-# and leaves whatever generated/ corpus is already committed untouched — so
-# a plain CPU-only re-vendor never requires Homebrew and never silently
-# deletes a working, already-committed shader corpus.
+# and leaves whatever ggml-vulkan/{vulkan-shaders,ggml-vulkan-shaders.*}
+# corpus is already committed untouched — so a plain CPU-only re-vendor
+# never requires Homebrew and never silently deletes a working,
+# already-committed shader corpus.
 set -euo pipefail
 
 PARAKEET_CPP_COMMIT="e747acdaee69b916cef62263ae5f718bda9ff3f3"
@@ -154,10 +170,12 @@ Do not hand-edit anything under this directory — re-run the vendor script.
 - ggml (parakeet.cpp's own pinned submodule, third_party/ggml):
   commit: $ACTUAL_GGML_COMMIT ($GGML_DESCRIBE)
 - Vendored: CPU backend (Accelerate/BLAS on macOS) plus the Vulkan backend
-  (ggml-vulkan/, device-agnostic sources + an embedded SPIR-V shader corpus
-  under ggml-vulkan/generated/, regenerated only when cmake+glslc were
-  available at vendor time — see this script's vendor_vulkan_backend
-  function). No CUDA, HIP, Metal, or CoreML sources are included.
+  (ggml-vulkan/, device-agnostic sources + a loose SPIR-V shader corpus
+  under ggml-vulkan/vulkan-shaders/, loaded at runtime via the
+  scripts/vulkan-shader-runtime/ proxy glue — regenerated only when
+  cmake+glslc were available at vendor time; see this script's
+  vendor_vulkan_backend function). No CUDA, HIP, Metal, or CoreML sources
+  are included.
 - License: both parakeet.cpp and ggml are MIT-licensed. See
   LICENSE-parakeet-cpp.txt and LICENSE-ggml.txt in this directory for the
   exact upstream notices at the pinned commits above.
@@ -174,13 +192,12 @@ cp "$GGML_SRC/LICENSE" "$UPSTREAM_DEST/LICENSE-ggml.txt"
 #
 # Copies the device-agnostic ggml-vulkan.cpp/.h sources unconditionally (pure
 # copy, no toolchain needed), and — only if cmake+glslc are on PATH —
-# regenerates the embedded SPIR-V shader corpus by running parakeet.cpp's own
-# unmodified CMake build (`-DPARAKEET_GGML_VULKAN=ON`, the exact configuration
-# this fork's Phase 5 pre-spike already proved builds cleanly against this
-# exact pinned commit, zero source patches) far enough to produce the
-# `ggml-vulkan` CMake target's generated sources, then harvesting them. This
-# deliberately reuses upstream's own generator rather than re-implementing or
-# patching vulkan-shaders-gen.
+# (re)builds the real SPIR-V corpus plus the runtime-loader glue that lets it
+# ship as loose `.spv` files instead of upstream's compiled-in C-array embed.
+# See this file's own header comment for the full rationale (ported
+# unmodified from this fork's proven whisper.cpp Vulkan mechanism, commit
+# b0ab800) and scripts/gen-vulkan-shader-runtime.py's module docstring for
+# the exact three shader-declaration shapes this depends on.
 vendor_vulkan_backend() {
     local vk_src="$GGML_SRC/src/ggml-vulkan"
     local vk_dest="$UPSTREAM_DEST/ggml-vulkan"
@@ -192,14 +209,27 @@ vendor_vulkan_backend() {
     # lives under ggml's own include/, like every other public ggml header) --
     # not re-copied here to avoid two on-disk copies of the same header.
 
+    # The hand-authored runtime-loader glue (never vendored FROM upstream --
+    # this project's own code) is copied in unconditionally too, since it has
+    # no toolchain dependency and $vk_dest gets wiped on every vendor run.
+    cp "$ROOT_DIR/scripts/vulkan-shader-runtime/ggml-vulkan-shaders-runtime.h" \
+       "$vk_dest/ggml-vulkan-shaders-runtime.h"
+    cp "$ROOT_DIR/scripts/vulkan-shader-runtime/ggml-vulkan-shaders-runtime.cpp" \
+       "$vk_dest/ggml-vulkan-shaders-runtime.cpp"
+
     if ! command -v cmake >/dev/null 2>&1 || ! command -v glslc >/dev/null 2>&1; then
         echo "vendor-parakeet-cpp.sh: cmake and/or glslc not found on PATH -- skipping Vulkan shader (re)generation." >&2
-        echo "vendor-parakeet-cpp.sh: ggml-vulkan.cpp/.h were still (re)vendored above; any already-committed" >&2
-        echo "vendor-parakeet-cpp.sh: $vk_dest/generated/ shader corpus is left untouched." >&2
+        echo "vendor-parakeet-cpp.sh: ggml-vulkan.cpp/.h + the runtime-loader glue were still (re)vendored above;" >&2
+        echo "vendor-parakeet-cpp.sh: any already-committed $vk_dest/vulkan-shaders/ + generated" >&2
+        echo "vendor-parakeet-cpp.sh: ggml-vulkan-shaders.hpp/.cpp are left untouched." >&2
         return 0
     fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "vendor-parakeet-cpp.sh: FATAL: cmake+glslc found but python3 is required for scripts/gen-vulkan-shader-runtime.py and was not found on PATH" >&2
+        exit 1
+    fi
 
-    echo "vendor-parakeet-cpp.sh: cmake+glslc found -- regenerating the Vulkan SPIR-V shader corpus (this runs parakeet.cpp's own upstream CMake build; can take a few minutes) ..."
+    echo "vendor-parakeet-cpp.sh: cmake+glslc found -- (re)building the Vulkan SPIR-V shader corpus (this runs parakeet.cpp's own upstream CMake build; can take a few minutes) ..."
     local vk_build="$WORK_DIR/vk-build"
     # PARAKEET_GGML_VULKAN is parakeet.cpp's own CMake option (proven working
     # by the Phase 5 pre-spike); GGML_NATIVE=OFF here because vendoring must be
@@ -211,27 +241,62 @@ vendor_vulkan_backend() {
     cmake -S "$SRC" -B "$vk_build" -DPARAKEET_GGML_VULKAN=ON -DGGML_NATIVE=OFF -DCMAKE_BUILD_TYPE=Release >/dev/null
     cmake --build "$vk_build" --target ggml-vulkan -j
 
+    # Step 1: harvest the real compiled .spv corpus. Building the
+    # `ggml-vulkan` target above already invoked vulkan-shaders-gen once per
+    # .comp file with --source (upstream's own per-shader add_custom_command
+    # loop), which as a byproduct writes each shader's compiled bytes to this
+    # intermediate directory before embedding them into the .comp.cpp this
+    # script does NOT use -- the loose files here are byte-identical to what
+    # upstream embeds, just harvested before the embed step instead of after.
     local gen_dir="$vk_build/third_party/ggml/src/ggml-vulkan"
-    local header="$gen_dir/ggml-vulkan-shaders.hpp"
-    if [[ ! -f "$header" ]]; then
-        echo "vendor-parakeet-cpp.sh: FATAL: expected generated header not found at $header -- upstream's CMake output layout may have changed" >&2
+    local spv_dir="$gen_dir/vulkan-shaders.spv"
+    if [[ ! -d "$spv_dir" ]]; then
+        echo "vendor-parakeet-cpp.sh: FATAL: expected compiled .spv directory not found at $spv_dir -- upstream's CMake output layout may have changed" >&2
+        exit 1
+    fi
+    rm -rf "$vk_dest/vulkan-shaders"
+    mkdir -p "$vk_dest/vulkan-shaders"
+    local spv_count=0
+    for f in "$spv_dir"/*.spv; do
+        [[ -e "$f" ]] || continue
+        cp "$f" "$vk_dest/vulkan-shaders/$(basename "$f")"
+        spv_count=$((spv_count + 1))
+    done
+    if [[ "$spv_count" -eq 0 ]]; then
+        echo "vendor-parakeet-cpp.sh: FATAL: no compiled .spv files found under $spv_dir -- upstream's CMake output layout may have changed" >&2
         exit 1
     fi
 
-    rm -rf "$vk_dest/generated"
-    mkdir -p "$vk_dest/generated"
-    cp "$header" "$vk_dest/generated/ggml-vulkan-shaders.hpp"
-    local comp_cpp_count=0
-    for f in "$gen_dir"/*.comp.cpp; do
-        [[ -e "$f" ]] || continue
-        cp "$f" "$vk_dest/generated/$(basename "$f")"
-        comp_cpp_count=$((comp_cpp_count + 1))
-    done
-    if [[ "$comp_cpp_count" -eq 0 ]]; then
-        echo "vendor-parakeet-cpp.sh: FATAL: no generated *.comp.cpp shader translation units found under $gen_dir -- upstream's CMake output layout may have changed" >&2
+    # Step 2: locate the built vulkan-shaders-gen tool binary itself (its
+    # exact path depends on whether the CMake generator in use is
+    # single-config or multi-config) and run it ONE more time in "aggregate"
+    # mode -- no --source, so it emits only `extern` declarations (every
+    # known shader symbol name) and zero glslc/Vulkan-SDK work, into a
+    # scratch ground-truth header.
+    local gen_bin
+    gen_bin="$(find "$vk_build" -type f -name 'vulkan-shaders-gen' -perm -u+x 2>/dev/null | head -1)"
+    if [[ -z "$gen_bin" ]]; then
+        echo "vendor-parakeet-cpp.sh: FATAL: could not locate the built vulkan-shaders-gen tool binary under $vk_build" >&2
         exit 1
     fi
-    echo "vendor-parakeet-cpp.sh: vendored $comp_cpp_count generated shader translation units + header into $vk_dest/generated/"
+    local ground_truth_hpp="$WORK_DIR/ground-truth-ggml-vulkan-shaders.hpp"
+    local scratch_spv_dir="$WORK_DIR/ground-truth-spv-scratch"
+    mkdir -p "$scratch_spv_dir"
+    "$gen_bin" --output-dir "$scratch_spv_dir" --target-hpp "$ground_truth_hpp"
+    if [[ ! -s "$ground_truth_hpp" ]]; then
+        echo "vendor-parakeet-cpp.sh: FATAL: aggregate-mode vulkan-shaders-gen invocation produced an empty/missing header at $ground_truth_hpp" >&2
+        exit 1
+    fi
+
+    # Step 3: turn the ground-truth header into this project's runtime-loader
+    # header/cpp pair (same identifier names, lazy_data/lazy_len proxies
+    # instead of compiled-in arrays -- see gen-vulkan-shader-runtime.py).
+    python3 "$ROOT_DIR/scripts/gen-vulkan-shader-runtime.py" \
+        "$ground_truth_hpp" \
+        "$vk_dest/ggml-vulkan-shaders.hpp" \
+        "$vk_dest/ggml-vulkan-shaders.cpp"
+
+    echo "vendor-parakeet-cpp.sh: vendored $spv_count compiled .spv shaders into $vk_dest/vulkan-shaders/, plus the generated runtime-loader header/cpp"
 }
 vendor_vulkan_backend
 

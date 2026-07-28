@@ -24,17 +24,33 @@ let package = Package(
     targets: [
         .target(
             name: "parakeet_cpp",
-            // No excludes: unlike whisper_cpp's ggml-cpu tree, non-x86 arch
-            // variants were already stripped by scripts/vendor-parakeet-cpp.sh
-            // at vendor time (see that script's `rm -rf` block), so nothing
-            // needs excluding here at the SwiftPM level. amx/ is kept
-            // in-tree and compiled (ggml-cpu.cpp calls
+            // Non-x86 arch variants were already stripped by
+            // scripts/vendor-parakeet-cpp.sh at vendor time (see that
+            // script's `rm -rf` block), so nothing needs excluding there.
+            // amx/ is kept in-tree and compiled (ggml-cpu.cpp calls
             // ggml_backend_amx_buffer_type()/ggml_cpu_has_amx_int8()
             // unconditionally — same as this fork's already-proven
             // whisper_cpp target, which also compiled it in unguarded);
             // its actual AMX codegen paths stay inert without
             // __AMX_INT8__/__AVX512VNNI__, which this target does not
             // define.
+            //
+            // upstream/ggml-vulkan/vulkan-shaders/ IS excluded: it holds
+            // loose pre-compiled `.spv` binaries (not source), loaded at
+            // runtime by explicit file path (see
+            // scripts/vulkan-shader-runtime/ggml-vulkan-shaders-runtime.cpp)
+            // — never through SwiftPM's `resources:` mechanism, which
+            // bundles a `<Package>_<Target>.bundle` directory that
+            // `codesign --deep` won't accept as a signable component
+            // (same rationale as the Parakey executable target's own
+            // `resources:` comment below). scripts/build-app.sh copies this
+            // directory into Contents/Resources/vulkan-shaders/ directly
+            // for the shipped .app; dev-run.sh does the equivalent for
+            // `swift run` builds that need it configured via
+            // ggml_vk_shaders_set_directory().
+            exclude: [
+                "upstream/ggml-vulkan/vulkan-shaders",
+            ],
             cSettings: [
                 .define("GGML_USE_ACCELERATE"),
                 .define("GGML_USE_CPU"),
@@ -58,14 +74,16 @@ let package = Package(
                 .headerSearchPath("upstream"),
                 .headerSearchPath("upstream/include"),
                 .headerSearchPath("upstream/ggml-cpu"),
-                // upstream/ggml-vulkan/ggml-vulkan.cpp #include "ggml-vulkan-shaders.hpp"
-                // (a plain quote-include, resolved relative to the including
-                // file's own directory first) — the generated header lives
-                // one level down, in generated/, alongside the generated
-                // *.comp.cpp shader translation units that also quote-include
-                // it from the same directory. This search path is what makes
-                // ggml-vulkan.cpp's own include resolve to it too.
-                .headerSearchPath("upstream/ggml-vulkan/generated"),
+                // ggml-vulkan-shaders-runtime.h is included from
+                // include/parakeet_cpp_module.h (the umbrella header) so
+                // Swift can call ggml_vk_shaders_set_directory(); it lives
+                // under upstream/ggml-vulkan/, a directory this search path
+                // makes reachable via quote-include from anywhere in the
+                // target (ggml-vulkan.cpp's own #include
+                // "ggml-vulkan-shaders.hpp" resolves via the
+                // same-directory-as-includer tier and doesn't need this,
+                // but include/parakeet_cpp_module.h does).
+                .headerSearchPath("upstream/ggml-vulkan"),
                 // Same Intel-ISA flags this fork already carries for
                 // whisper_cpp's ggml build (see git history / the removed
                 // whisper_cpp target this replaces) — proven on the real
@@ -93,7 +111,16 @@ let package = Package(
                 .headerSearchPath("upstream"),
                 .headerSearchPath("upstream/include"),
                 .headerSearchPath("upstream/ggml-cpu"),
-                .headerSearchPath("upstream/ggml-vulkan/generated"),
+                // ggml-vulkan-shaders-runtime.h is included from
+                // include/parakeet_cpp_module.h (the umbrella header) so
+                // Swift can call ggml_vk_shaders_set_directory(); it lives
+                // under upstream/ggml-vulkan/, a directory this search path
+                // makes reachable via quote-include from anywhere in the
+                // target (ggml-vulkan.cpp's own #include
+                // "ggml-vulkan-shaders.hpp" resolves via the
+                // same-directory-as-includer tier and doesn't need this,
+                // but include/parakeet_cpp_module.h does).
+                .headerSearchPath("upstream/ggml-vulkan"),
                 .unsafeFlags([
                     "-mavx2", "-mfma", "-mf16c", "-mbmi2", "-msse4.2",
                     "-I/usr/local/opt/vulkan-headers/include",

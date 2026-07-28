@@ -55,12 +55,22 @@ cp "$ROOT_DIR/swift/Info.plist" "$STAGE_APP/Contents/Info.plist"
 cp "$ROOT_DIR/swift/Resources/parakey-menubar.png" "$STAGE_APP/Contents/Resources/"
 cp "$ROOT_DIR/swift/Resources/parakey-menubar@2x.png" "$STAGE_APP/Contents/Resources/"
 cp "$ROOT_DIR/icon/Parakey.icns" "$STAGE_APP/Contents/Resources/Parakey.icns"
-# No vulkan-shaders resource copy this phase: Parakeet CPU only (Phase 3 of
-# the parakeet.cpp migration plan). whisper_cpp's precompiled SPIR-V corpus
-# was deleted along with the rest of swift/Sources/whisper_cpp/ — it targeted
-# whisper's own ggml vintage and would not have been reusable against
-# parakeet.cpp's pinned ggml v0.13.0 anyway. Phase 5 (Vulkan) will add a
-# fresh shader corpus and its own resource-copy step here.
+# Phase 5 (Vulkan): the loose, pre-compiled SPIR-V shader corpus (vendored by
+# scripts/vendor-parakeet-cpp.sh into swift/Sources/parakeet_cpp/upstream/
+# ggml-vulkan/vulkan-shaders/, excluded from SwiftPM compilation/resources —
+# see Package.swift's exclude comment) must ship inside the app bundle for
+# Vulkan to work at all: ParakeetEngine.swift's
+# configureVulkanShaderDirectoryIfPresent() points the C++ runtime loader at
+# exactly this Contents/Resources/vulkan-shaders directory. Copied as a
+# real directory tree (not through SwiftPM `resources:`, which this project
+# never uses — see the Parakey executable target's own `resources:` comment
+# in Package.swift) so `codesign --deep` below covers every .spv file.
+VULKAN_SHADER_SRC="$ROOT_DIR/swift/Sources/parakeet_cpp/upstream/ggml-vulkan/vulkan-shaders"
+if [[ -d "$VULKAN_SHADER_SRC" ]]; then
+    cp -R "$VULKAN_SHADER_SRC" "$STAGE_APP/Contents/Resources/vulkan-shaders"
+else
+    echo "build-app.sh: WARNING: $VULKAN_SHADER_SRC not found -- shipping without a Vulkan shader corpus (Vulkan GPU mode will not be usable in this build; re-run scripts/vendor-parakeet-cpp.sh with cmake+glslc on PATH to generate it)" >&2
+fi
 chmod 755 "$STAGE_APP/Contents/MacOS/SuperDictate"
 
 SIGN_ARGS=(--force --deep --sign "$SIGN_IDENTITY" --options runtime
