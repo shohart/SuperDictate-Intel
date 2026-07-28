@@ -268,6 +268,23 @@ is the final sweep to confirm nothing was missed, not a new deletion step:
   that point — it documents real architecture decisions, unlike this
   phase-sequencing plan, so it is more likely to be worth keeping.
 
+## Future work (explicitly out of scope for this plan)
+
+- **Split `swift/Sources/Parakey/main.swift` (~22,800 lines, effectively
+  the entire `Parakey` target in one file) into multiple files.** SwiftPM
+  parallelizes compilation per-file, not within a file, so this single
+  file forces the whole target through one single-threaded
+  `swift-frontend` job regardless of core count — this is why release
+  builds pin one CPU core for the majority of the build time. Not part of
+  this migration (do not mix a large mechanical file-split into the same
+  diff as an ASR engine replacement — it would make review and bisection
+  much harder for no benefit to the migration itself). Revisit once the
+  Parakeet migration is complete and confirmed stable, as a dedicated,
+  purely-mechanical refactor (behavior-preserving file split along
+  existing logical boundaries — UI/settings, audio capture, ASR engine
+  wrapper, menu bar/status item, self-tests, etc.), reviewed separately
+  from any feature work.
+
 ## Process notes carried forward from this session's own hard-won lessons
 
 - Every scratch launch on the Mac during this migration must first run
