@@ -88,7 +88,7 @@ PARAKEET_MODEL_REPOSITORY  = mudler/parakeet-cpp-gguf   (Hugging Face)
 PARAKEET_MODEL_REVISION    = bf0af9f425fa01809cadec671b3cb672709d13e9
 PARAKEET_MODEL_FILENAME    = tdt-0.6b-v3-q8_0.gguf
 PARAKEET_MODEL_SIZE_BYTES  = 940663680
-PARAKEET_MODEL_SHA256      = <TO BE COMPUTED IN PHASE 2 from the real downloaded bytes -- do not trust any hash from an API response>
+PARAKEET_MODEL_SHA256      = 4d69a4a6683f4f2d952bad794c1357ca6eb628027695b4699c5a9ad4cd07d757   (computed 2026-07-28 on the real Intel Mac via `shasum -a 256` over the downloaded bytes; see Phase 2 report)
 PARAKEET_MODEL_ARCH        = parakeet (TDT, hybrid)
 PARAKEET_MODEL_QUANTIZATION = q8_0
 ```
