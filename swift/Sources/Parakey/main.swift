@@ -6592,9 +6592,63 @@ struct RecordingHUDTargetStabilizer {
 }
 
 actor FocusedInsertionTargetTracker {
+    // `NSWorkspace.frontmostApplication` (how `context` was built, on the
+    // main actor) disagrees with the real AX focus for WKWebView-hosted
+    // popovers -- SwiftBar's menu-bar popover is the motivating case
+    // (FocusedTextTarget.swift): the popover owns AX focus while
+    // `frontmostApplication` still reports whatever app was frontmost
+    // before the popover opened. `FocusedInsertionTargetLocator.query`
+    // itself is correct once given the right pid; it just needs it.
+    // Resolving that here (an actor method, off the main actor) rather
+    // than in `insertionTargetQueryContext()` matters because this is a
+    // real AX round-trip that can stall -- doing it on the main actor
+    // would risk freezing menu-bar UI, exactly what
+    // `FocusedTextTargetResolver`'s own doc comment warns callers about.
+    private let axAppResolver = FocusedTextTargetResolver()
+
     func query(context: InsertionTargetQueryContext) -> FocusedInsertionTargetQueryResult {
-        FocusedInsertionTargetLocator.query(context: context)
+        let resolved = try? axAppResolver.captureTarget()
+        let effectiveContext = insertionTargetQueryContext(
+            overriding: context,
+            withAXFocusedApplication: resolved.map {
+                (pid: $0.applicationPID,
+                 name: $0.applicationName,
+                 bundleIdentifier: NSRunningApplication(processIdentifier: $0.applicationPID)?.bundleIdentifier)
+            }
+        )
+        return FocusedInsertionTargetLocator.query(context: effectiveContext)
     }
+}
+
+/// Overrides `context`'s NSWorkspace-derived application identity with the
+/// real AX-focused application when `resolved` disagrees with it -- e.g. a
+/// SwiftBar popover, where `NSWorkspace.frontmostApplication` (how
+/// `context` was built) still reports whatever app was frontmost before
+/// the popover opened, while `resolved` (the real AX focus chain) correctly
+/// points at the popover. Falls back to `context` unchanged if `resolved`
+/// is nil (AX resolution failed -- no accessibility permission, no focused
+/// element, etc.) or agrees with it (the common case, no popover
+/// involved), so this can only ever fix a mismatch, never break an
+/// already-correct query. `lastClickPoint` is dropped when overriding: it
+/// was cached against the NSWorkspace-derived pid, which is now known
+/// wrong for this query, so reusing it would hit-test against the wrong
+/// application's window. The locator's other resolution tiers (direct
+/// focused element, focused-subtree scan, window scan) don't depend on it.
+/// A free function taking already-extracted, plain `Sendable` values
+/// (rather than an actor method calling `FocusedTextTargetResolver`
+/// directly) so this merge decision is unit-testable without needing real
+/// Accessibility permission or a live focus-divergent target.
+func insertionTargetQueryContext(overriding context: InsertionTargetQueryContext,
+                                 withAXFocusedApplication resolved: (pid: pid_t, name: String?, bundleIdentifier: String?)?) -> InsertionTargetQueryContext {
+    guard let resolved, resolved.pid != context.applicationPID else { return context }
+    return InsertionTargetQueryContext(
+        applicationPID: resolved.pid,
+        applicationName: resolved.name ?? context.applicationName,
+        bundleIdentifier: resolved.bundleIdentifier ?? context.bundleIdentifier,
+        screens: context.screens,
+        coordinateReferenceMaxY: context.coordinateReferenceMaxY,
+        lastClickPoint: nil
+    )
 }
 
 private enum FocusedInsertionTargetLocator {
@@ -16874,6 +16928,8 @@ private enum ParakeySelfTest {
             return runSuite("insertion-target", testInsertionTargetTracking)
         case "insertion-target-live":
             return runSuite("insertion-target-live", testLiveInsertionTargetProbe)
+        case "insertion-target-ax-override":
+            return runSuite("insertion-target-ax-override", testInsertionTargetAXOverride)
         case "text-insertion-target-store":
             return runSuite("text-insertion-target-store", testPendingTextInsertionTargetStore)
         case "text-insertion-routing":
@@ -16945,6 +17001,7 @@ private enum ParakeySelfTest {
         try testDiagnostics()
         try testInsertionTargetTracking()
         try testPendingTextInsertionTargetStore()
+        try testInsertionTargetAXOverride()
         try testTextInsertionRouting()
         try testParakeetTranscriptRepair()
         try testRussianNumberITNCardinal()
@@ -17054,6 +17111,85 @@ private enum ParakeySelfTest {
         store.capture(nil)
         try expect(store.consume() == nil, equals: true,
                    "a press with no resolved target must leave nothing for release to consume")
+    }
+
+    /// Covers `insertionTargetQueryContext(overriding:withAXFocusedApplication:)`
+    /// -- the pure merge decision behind the SwiftBar-popover HUD fix -- with
+    /// synthetic pid/name/bundleIdentifier values, so it needs neither real
+    /// Accessibility permission nor a live focus-divergent target (that's
+    /// what `insertion-target-live` is for). See
+    /// `FocusedInsertionTargetTracker.query` for the real caller.
+    private static func testInsertionTargetAXOverride() throws {
+        func baseContext(pid: pid_t = 111, clickPoint: NSPoint? = NSPoint(x: 10, y: 20)) -> InsertionTargetQueryContext {
+            InsertionTargetQueryContext(
+                applicationPID: pid,
+                applicationName: "Terminal",
+                bundleIdentifier: "com.apple.Terminal",
+                screens: [],
+                coordinateReferenceMaxY: 1_080,
+                lastClickPoint: clickPoint
+            )
+        }
+
+        // No AX resolution available (permission missing, resolver threw,
+        // etc.) -- must fall back to the NSWorkspace-derived context
+        // completely unchanged, including its lastClickPoint.
+        let noResolution = insertionTargetQueryContext(overriding: baseContext(), withAXFocusedApplication: nil)
+        try expect(noResolution.applicationPID, equals: 111,
+                   "nil AX resolution must leave context untouched")
+        try expect(noResolution.lastClickPoint != nil, equals: true,
+                   "nil AX resolution must not drop the click-point cache")
+
+        // AX-resolved app agrees with NSWorkspace's frontmost app -- the
+        // common, non-popover case. Must also pass through unchanged,
+        // confirming this fix cannot alter behavior when there's no
+        // divergence to correct.
+        let agreeing = insertionTargetQueryContext(
+            overriding: baseContext(),
+            withAXFocusedApplication: (pid: 111, name: "Terminal", bundleIdentifier: "com.apple.Terminal")
+        )
+        try expect(agreeing.applicationPID, equals: 111, "agreeing AX resolution must leave context untouched")
+        try expect(agreeing.lastClickPoint != nil, equals: true,
+                   "agreeing AX resolution must not drop the click-point cache")
+
+        // AX-resolved app DISAGREES with NSWorkspace's frontmost app -- the
+        // SwiftBar-popover case: NSWorkspace still reports the previously
+        // frontmost app (here, "Terminal", pid 111) while AX focus has
+        // moved to the popover (pid 222). The override must win, and the
+        // stale click-point cache (captured against pid 111) must be
+        // dropped rather than hit-tested against the wrong window.
+        let overridden = insertionTargetQueryContext(
+            overriding: baseContext(),
+            withAXFocusedApplication: (pid: 222, name: "SwiftBar", bundleIdentifier: "com.ameba.SwiftBar")
+        )
+        try expect(overridden.applicationPID, equals: 222,
+                   "diverging AX resolution should override the NSWorkspace-derived pid")
+        try expect(overridden.applicationName, equals: "SwiftBar",
+                   "diverging AX resolution should override the application name")
+        try expect(overridden.bundleIdentifier, equals: "com.ameba.SwiftBar",
+                   "diverging AX resolution should override the bundle identifier")
+        try expect(overridden.lastClickPoint == nil, equals: true,
+                   "an overridden context must drop the click-point cache -- it was captured against the wrong (pre-override) pid")
+        try expect(overridden.screens.count, equals: baseContext().screens.count,
+                   "overriding application identity must not disturb the screen geometry carried over from context")
+        try expect(overridden.coordinateReferenceMaxY, equals: baseContext().coordinateReferenceMaxY,
+                   "overriding application identity must not disturb coordinateReferenceMaxY carried over from context")
+
+        // Resolved name/bundleIdentifier can themselves be nil (e.g.
+        // NSRunningApplication lookup failed) even though the pid
+        // genuinely differs -- must still override the pid, falling back
+        // to context's own name/bundleIdentifier for the fields AX/NSRunningApplication
+        // couldn't supply, rather than losing the override entirely.
+        let partialResolution = insertionTargetQueryContext(
+            overriding: baseContext(),
+            withAXFocusedApplication: (pid: 222, name: nil, bundleIdentifier: nil)
+        )
+        try expect(partialResolution.applicationPID, equals: 222,
+                   "a pid-only AX resolution should still override, even without name/bundleIdentifier")
+        try expect(partialResolution.applicationName, equals: "Terminal",
+                   "missing resolved name should fall back to context's own name")
+        try expect(partialResolution.bundleIdentifier, equals: "com.apple.Terminal",
+                   "missing resolved bundleIdentifier should fall back to context's own bundleIdentifier")
     }
 
     private static func testInsertionTargetTracking() throws {
