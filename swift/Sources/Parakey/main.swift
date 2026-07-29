@@ -7243,11 +7243,26 @@ enum TextInserter {
     }
 }
 
+// NSPasteboard isn't marked Sendable by AppKit, but ClipboardPasteInserter's
+// restorePasteboard(_:...) needs to hand one across a
+// DispatchQueue.global(qos:).async / DispatchQueue.main.async boundary (to
+// let PasteConfirmationPoller's wait happen off the main actor per the
+// threading note below) while a completion callback that always signals
+// via `@unchecked Sendable`-boxed test state observes the result. Every
+// actual read/write of the pasteboard here is confined to the main queue
+// (see `DispatchQueue.main.async` below) — the background queue only ever
+// holds the reference, never touches it — so this conformance describes
+// how this file uses NSPasteboard, not a claim that NSPasteboard is safe
+// for arbitrary concurrent access in general.
+extension NSPasteboard: @unchecked Sendable {}
+
 @MainActor
 private enum ClipboardPasteInserter {
     private static let virtualKeyCommand: CGKeyCode = 0x37  // left Command
     private static let virtualKeyV: CGKeyCode = 0x09  // ANSI 'v'
-    private static let restoreDelay: TimeInterval = 0.35
+    private static let confirmationPollInterval: TimeInterval = 0.05
+    private static let confirmationTimeout: TimeInterval = 2.0
+    private static let confirmationUnreadableBailout: TimeInterval = 0.35
 
     static func write(_ text: String, to pb: NSPasteboard) -> Bool {
         pb.clearContents()
@@ -7273,20 +7288,69 @@ private enum ClipboardPasteInserter {
         restorePasteboard(previous,
                           ifStillTemporaryText: text,
                           changeCount: transientChangeCount,
-                          pasteboard: pasteboard)
+                          pasteboard: pasteboard,
+                          valueReader: PasteConfirmationPoller.currentFocusedElementValueReader(),
+                          confirm: PasteConfirmationPoller.waitForPasteConfirmation)
         return true
     }
 
-    private static func restorePasteboard(_ snapshot: PasteboardSnapshot,
-                                          ifStillTemporaryText text: String,
-                                          changeCount: Int,
-                                          pasteboard: NSPasteboard) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + restoreDelay) {
-            guard pasteboard.changeCount == changeCount,
-                  pasteboard.string(forType: .string) == text else {
-                return
+    // Waits (on a background queue, never the main actor — see the plan's
+    // threading note) for the target app's focused element to actually
+    // contain the pasted text before restoring the user's previous
+    // clipboard contents, instead of guessing a fixed delay. On slow/laggy
+    // target apps a fixed delay could fire before the paste lands, clobbering
+    // the dictated text with the restored clipboard; on fast apps it wasted
+    // up to 0.35s doing nothing. If confirmation never arrives within
+    // confirmationTimeout, this still restores anyway (better to eventually
+    // give the clipboard back than leave the user's previous clipboard
+    // contents lost forever).
+    //
+    // `completion` is a test-only seam (always nil in production, called
+    // from `insert(_:)` above with the default): it lets self-tests observe
+    // when the guarded main-queue restore-or-skip decision has actually run,
+    // without duplicating this function's guard logic in a second,
+    // hand-copied implementation. Not private (fileprivate, i.e. visible
+    // anywhere in this file) for exactly that reason — ParakeySelfTest lives
+    // in this same file and calls this real function directly.
+    fileprivate static func restorePasteboard(_ snapshot: PasteboardSnapshot,
+                                              ifStillTemporaryText text: String,
+                                              changeCount: Int,
+                                              pasteboard: NSPasteboard,
+                                              valueReader: @escaping @Sendable () -> String?,
+                                              confirm: @escaping @Sendable (String, String?, TimeInterval, TimeInterval, TimeInterval, @escaping @Sendable () -> String?) -> Bool,
+                                              completion: (@Sendable () -> Void)? = nil) {
+        // Read these @MainActor-isolated static constants into plain local
+        // values HERE, while still on the main actor, before constructing
+        // the DispatchQueue.global(qos:).async closure below. A Docker
+        // swift:6.0-jammy repro of this exact isolation shape confirmed
+        // referencing them directly from inside that closure is a real
+        // compile error ("main actor-isolated static property ... can not
+        // be referenced from a Sendable closure") -- capturing plain
+        // TimeInterval locals instead sidesteps that entirely, since a
+        // Double has no actor affiliation to strip away.
+        let pollInterval = confirmationPollInterval
+        let timeout = confirmationTimeout
+        let unreadableBailout = confirmationUnreadableBailout
+        DispatchQueue.global(qos: .userInitiated).async {
+            // Baseline is captured here (on the background queue, as the
+            // very first thing this async work does — effectively
+            // "immediately after" the Cmd+V keystroke was posted on the
+            // main actor moments ago) rather than inside `confirm`, so a
+            // field that already happens to contain `text` before this
+            // paste completes doesn't cause an immediate false-positive
+            // confirmation. See PasteConfirmationPoller's doc comment for
+            // the full rationale.
+            let baselineValue = valueReader()
+            _ = confirm(text, baselineValue, pollInterval, timeout, unreadableBailout, valueReader)
+            DispatchQueue.main.async {
+                guard pasteboard.changeCount == changeCount,
+                      pasteboard.string(forType: .string) == text else {
+                    completion?()
+                    return
+                }
+                snapshot.restore(to: pasteboard)
+                completion?()
             }
-            snapshot.restore(to: pasteboard)
         }
     }
 
@@ -16749,6 +16813,10 @@ private enum ParakeySelfTest {
             return runSuite("readiness", testReadiness)
         case "paste":
             return runSuite("paste", testPasteSuffixFormatting)
+        case "paste-confirmation":
+            return runSuite("paste-confirmation", testPasteConfirmationPoller)
+        case "paste-restore":
+            return runSuite("paste-restore", testClipboardPasteInserterRestore)
         case "history":
             return runSuite("history", testRecentTranscriptLimit)
         case "statistics":
@@ -16828,6 +16896,8 @@ private enum ParakeySelfTest {
         try testHotkey()
         try testReadiness()
         try testPasteSuffixFormatting()
+        try testPasteConfirmationPoller()
+        try testClipboardPasteInserterRestore()
         try testRecentTranscriptLimit()
         try testDictationUsageStatistics()
         try testTranscriptCorrections()
@@ -17841,6 +17911,306 @@ private enum ParakeySelfTest {
             equals: "pasteboard probe",
             "clipboard paste should write the intended string before posting Cmd+V"
         )
+    }
+
+    // Covers PasteConfirmationPoller.waitForPasteConfirmation's pure polling
+    // logic with injected valueReaders, so this suite needs neither real AX
+    // permission nor a real paste event.
+    private static func testPasteConfirmationPoller() throws {
+        // A plain captured `var` closure isn't convertible to
+        // waitForPasteConfirmation's `@Sendable` valueReader parameter
+        // (verified with a real Swift 6 compiler in a Docker
+        // swift:6.0-jammy container: "converting non-sendable function
+        // value to '@Sendable () -> String?' may introduce data races").
+        // A reference-type counter sidesteps that, same pattern as
+        // RestoreTestState below.
+        final class CallCountBox: @unchecked Sendable {
+            var count = 0
+        }
+        let callCountBox = CallCountBox()
+        let values = ["", "старое ", "старое текст"]
+        let appearsEventually: @Sendable () -> String? = {
+            defer { callCountBox.count += 1 }
+            let callCount = callCountBox.count
+            return callCount < values.count ? values[callCount] : values.last
+        }
+        let confirmedWhenAppears = PasteConfirmationPoller.waitForPasteConfirmation(
+            expectedSubstring: "текст",
+            baselineValue: "",
+            pollInterval: 0.001,
+            timeout: 1.0,
+            valueReader: appearsEventually
+        )
+        try expect(confirmedWhenAppears, equals: true,
+                   "poller should confirm as soon as the expected substring appears")
+        try expect(callCountBox.count < values.count + 1, equals: true,
+                   "poller should stop polling once confirmed instead of running to the timeout")
+
+        let confirmedOnTimeout = PasteConfirmationPoller.waitForPasteConfirmation(
+            expectedSubstring: "текст",
+            baselineValue: nil,
+            pollInterval: 0.005,
+            timeout: 0.05,
+            valueReader: { "unrelated value" }
+        )
+        try expect(confirmedOnTimeout, equals: false,
+                   "poller should give up and report false once the timeout elapses")
+
+        let confirmedWithNilReader = PasteConfirmationPoller.waitForPasteConfirmation(
+            expectedSubstring: "текст",
+            baselineValue: nil,
+            pollInterval: 0.005,
+            timeout: 0.05,
+            valueReader: { nil }
+        )
+        try expect(confirmedWithNilReader, equals: false,
+                   "poller should treat a reader that always returns nil as never-confirmed")
+
+        let confirmedWithEmptyExpectation = PasteConfirmationPoller.waitForPasteConfirmation(
+            expectedSubstring: "",
+            baselineValue: nil,
+            pollInterval: 0.005,
+            timeout: 0.05,
+            valueReader: { nil }
+        )
+        try expect(confirmedWithEmptyExpectation, equals: true,
+                   "an empty expected substring should confirm immediately without polling")
+
+        // Regression test for the premature-restore race: a field that
+        // ALREADY contains the expected substring before this paste's poll
+        // even starts (e.g. dictating the same short phrase twice into the
+        // same field) must not confirm on tick one just because
+        // `contains(expectedSubstring)` is trivially true against the
+        // pre-existing baseline -- it must wait for the value to actually
+        // change away from that baseline.
+        final class ChangeAfterFewTicksBox: @unchecked Sendable {
+            var tick = 0
+        }
+        let changeBox = ChangeAfterFewTicksBox()
+        let alreadyContainsSubstringThenChanges: @Sendable () -> String? = {
+            defer { changeBox.tick += 1 }
+            // First several ticks report the exact same value as the
+            // baseline (which already contains "текст"); only later does it
+            // change to reflect the new paste actually landing.
+            return changeBox.tick < 3 ? "старый текст" : "новый текст"
+        }
+        let confirmedOnlyAfterValueChangesFromBaseline = PasteConfirmationPoller.waitForPasteConfirmation(
+            expectedSubstring: "текст",
+            baselineValue: "старый текст",
+            pollInterval: 0.001,
+            timeout: 1.0,
+            valueReader: alreadyContainsSubstringThenChanges
+        )
+        try expect(confirmedOnlyAfterValueChangesFromBaseline, equals: true,
+                   "poller should eventually confirm once the value changes away from the baseline")
+        try expect(changeBox.tick > 3, equals: true,
+                   "poller must not confirm on tick one just because the pre-existing baseline already contains the expected substring")
+
+        let neverConfirmsIfValueNeverChangesFromBaseline = PasteConfirmationPoller.waitForPasteConfirmation(
+            expectedSubstring: "текст",
+            baselineValue: "старый текст",
+            pollInterval: 0.005,
+            timeout: 0.05,
+            valueReader: { "старый текст" }
+        )
+        try expect(neverConfirmsIfValueNeverChangesFromBaseline, equals: false,
+                   "poller must not confirm against a value that's identical to the pre-paste baseline, even though it contains the expected substring")
+
+        // Regression test for the early-bailout-on-unreadable-value fix: an
+        // app whose AX tree never exposes a readable value at all must not
+        // burn the full `timeout` -- it should give up around
+        // `unreadableValueBailout` instead.
+        let bailoutStart = Date()
+        let neverReadable = PasteConfirmationPoller.waitForPasteConfirmation(
+            expectedSubstring: "текст",
+            baselineValue: nil,
+            pollInterval: 0.005,
+            timeout: 5.0,
+            unreadableValueBailout: 0.05,
+            valueReader: { nil }
+        )
+        let bailoutElapsed = Date().timeIntervalSince(bailoutStart)
+        try expect(neverReadable, equals: false,
+                   "poller should report false when the value is never readable at all")
+        try expect(bailoutElapsed < 1.0, equals: true,
+                   "poller should give up around unreadableValueBailout (0.05s) rather than waiting the full 5.0s timeout when the value is never readable")
+
+        // Once at least one readable (even if non-matching) value has been
+        // observed, the early unreadable-value bailout must no longer apply
+        // -- the target clearly CAN expose a value, so the full timeout
+        // should still be honored while waiting for it to change.
+        final class ReadableThenNilBox: @unchecked Sendable {
+            var tick = 0
+        }
+        let readableThenNilBox = ReadableThenNilBox()
+        let readableOnceThenNil: @Sendable () -> String? = {
+            defer { readableThenNilBox.tick += 1 }
+            return readableThenNilBox.tick == 0 ? "unrelated value" : nil
+        }
+        let stillWaitsFullTimeoutAfterOneReadableValue = PasteConfirmationPoller.waitForPasteConfirmation(
+            expectedSubstring: "текст",
+            baselineValue: nil,
+            pollInterval: 0.01,
+            timeout: 0.08,
+            unreadableValueBailout: 0.02,
+            valueReader: readableOnceThenNil
+        )
+        try expect(stillWaitsFullTimeoutAfterOneReadableValue, equals: false,
+                   "poller should still report false (never matched) once its own timeout elapses")
+        try expect(readableThenNilBox.tick > 3, equals: true,
+                   "once a readable value has been seen even once, the unreadable-value early bailout must not cut the wait short")
+    }
+
+    // Covers ClipboardPasteInserter's real (fileprivate, not module-public)
+    // `restorePasteboard` directly -- not a hand-duplicated copy of its
+    // guard logic -- with an injected `confirm` closure standing in for
+    // PasteConfirmationPoller, so this needs neither real Accessibility
+    // permission nor a real paste event. Calling the production function
+    // itself means a later edit to its guard (e.g. dropping the changeCount
+    // check) will actually break this suite, instead of silently keeping a
+    // separately-maintained copy green.
+    // NOTE: this deliberately does NOT use a blocking DispatchSemaphore.wait()
+    // to wait for `completion`, unlike this file's other self-test semaphore
+    // bridges (e.g. runParakeetEngineSynchronously above). Those signal from
+    // work dispatched off the main thread; restorePasteboard's completion is
+    // delivered via DispatchQueue.main.async, which cannot run while the main
+    // thread (where this self-test itself executes) is blocked inside a
+    // synchronous semaphore.wait() — that would deadlock. Pumping the run
+    // loop instead lets the pending main-queue block execute.
+    private static func waitUntilMainQueueCallback(timeout: TimeInterval, isDone: () -> Bool) {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !isDone(), Date() < deadline {
+            _ = RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
+        }
+    }
+
+    private static func testClipboardPasteInserterRestore() throws {
+        final class RestoreTestState: @unchecked Sendable {
+            var done = false
+            var confirmWasCalledWithExpectedText: String?
+        }
+
+        // Shared setup mirroring exactly what ClipboardPasteInserter.insert(_:)
+        // does before calling restorePasteboard: snapshot the "previous"
+        // clipboard contents, then write the dictated text as the transient
+        // clipboard payload.
+        func setUpTransientPaste(previousText: String, dictatedText: String, on pasteboard: NSPasteboard) -> (snapshot: PasteboardSnapshot, changeCount: Int) {
+            pasteboard.clearContents()
+            _ = pasteboard.setString(previousText, forType: .string)
+            let snapshot = PasteboardSnapshot.capture(from: pasteboard)
+            pasteboard.clearContents()
+            _ = pasteboard.setString(dictatedText, forType: .string)
+            return (snapshot, pasteboard.changeCount)
+        }
+
+        let restoresAfterConfirmSucceeds = MainActor.assumeIsolated { () -> (calledWith: String?, restored: String?) in
+            let pasteboard = NSPasteboard.withUniqueName()
+            defer { pasteboard.releaseGlobally() }
+            let (snapshot, changeCount) = setUpTransientPaste(previousText: "previous clipboard content",
+                                                              dictatedText: "dictated text",
+                                                              on: pasteboard)
+
+            let state = RestoreTestState()
+
+            ClipboardPasteInserter.restorePasteboard(
+                snapshot,
+                ifStillTemporaryText: "dictated text",
+                changeCount: changeCount,
+                pasteboard: pasteboard,
+                valueReader: { nil },
+                confirm: { expectedSubstring, _, _, _, _, _ in
+                    state.confirmWasCalledWithExpectedText = expectedSubstring
+                    return true
+                }
+            ) {
+                state.done = true
+            }
+
+            waitUntilMainQueueCallback(timeout: 1.0) { state.done }
+            return (state.confirmWasCalledWithExpectedText, pasteboard.string(forType: .string))
+        }
+        try expect(restoresAfterConfirmSucceeds.calledWith, equals: "dictated text",
+                   "restore should confirm against the dictated text that was actually pasted")
+        try expect(restoresAfterConfirmSucceeds.restored, equals: "previous clipboard content",
+                   "restore should put the user's previous clipboard content back once confirmed")
+
+        let restoresAfterConfirmTimesOut = MainActor.assumeIsolated { () -> String? in
+            let pasteboard = NSPasteboard.withUniqueName()
+            defer { pasteboard.releaseGlobally() }
+            let (snapshot, changeCount) = setUpTransientPaste(previousText: "previous clipboard content",
+                                                              dictatedText: "dictated text",
+                                                              on: pasteboard)
+
+            let state = RestoreTestState()
+
+            ClipboardPasteInserter.restorePasteboard(
+                snapshot,
+                ifStillTemporaryText: "dictated text",
+                changeCount: changeCount,
+                pasteboard: pasteboard,
+                valueReader: { nil },
+                confirm: { _, _, _, _, _, _ in false }
+            ) {
+                state.done = true
+            }
+
+            waitUntilMainQueueCallback(timeout: 1.0) { state.done }
+            return pasteboard.string(forType: .string)
+        }
+        try expect(restoresAfterConfirmTimesOut, equals: "previous clipboard content",
+                   "restore should still happen even when confirmation times out, rather than losing the user's clipboard forever")
+
+        // Safety-critical case: if the pasteboard changes out from under the
+        // restore WHILE confirmation is still pending (e.g. the user copied
+        // something else in the meantime), the restore must be skipped --
+        // not clobber the newer clipboard contents back to the stale
+        // pre-paste snapshot. Both prior tests above leave the pasteboard
+        // untouched between dispatch and restore, so the
+        // `pasteboard.changeCount == changeCount` guard was never actually
+        // proven to skip a restore; this test forces that guard to fire for
+        // real by mutating the pasteboard from inside `confirm`, before it
+        // returns.
+        let skipsRestoreIfPasteboardChangedDuringPoll = MainActor.assumeIsolated { () -> String? in
+            let pasteboard = NSPasteboard.withUniqueName()
+            defer { pasteboard.releaseGlobally() }
+            let (snapshot, changeCount) = setUpTransientPaste(previousText: "previous clipboard content",
+                                                              dictatedText: "dictated text",
+                                                              on: pasteboard)
+
+            let state = RestoreTestState()
+
+            ClipboardPasteInserter.restorePasteboard(
+                snapshot,
+                ifStillTemporaryText: "dictated text",
+                changeCount: changeCount,
+                pasteboard: pasteboard,
+                valueReader: { nil },
+                confirm: { _, _, _, _, _, _ in
+                    // Simulate the user copying something else while the
+                    // poll is still pending. `confirm` runs on the
+                    // background queue (see restorePasteboard above), so
+                    // this hops to the main queue to perform the mutation
+                    // — actual pasteboard touches stay confined to main,
+                    // matching this file's NSPasteboard: Sendable
+                    // conformance comment — and blocks until it's done, so
+                    // the mutation is guaranteed to land before `confirm`
+                    // returns and restorePasteboard's own main-queue guard
+                    // runs.
+                    DispatchQueue.main.sync {
+                        pasteboard.clearContents()
+                        _ = pasteboard.setString("something else the user copied", forType: .string)
+                    }
+                    return true
+                }
+            ) {
+                state.done = true
+            }
+
+            waitUntilMainQueueCallback(timeout: 1.0) { state.done }
+            return pasteboard.string(forType: .string)
+        }
+        try expect(skipsRestoreIfPasteboardChangedDuringPoll, equals: "something else the user copied",
+                   "restore must be skipped (not clobber newer clipboard contents back to the stale snapshot) if the pasteboard changed while confirmation was still pending")
     }
 
     private static func testRecentTranscriptLimit() throws {
