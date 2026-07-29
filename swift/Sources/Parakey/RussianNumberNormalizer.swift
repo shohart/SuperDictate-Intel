@@ -270,6 +270,86 @@ enum RussianNumberNormalizer {
         return (prefix.value + ordinalEntry.value, ordinalEntry.digitSuffix, boundary + 1)
     }
 
+    // Spoken punctuation words converted to their symbol only when a number
+    // sits on both sides — "19 точка 168" -> "19.168" (an IP-style address)
+    // or "двадцать пять запятая семь" -> "25,7" (a Russian decimal) — but
+    // NOT when used as an ordinary word ("точка зрения", "и точка",
+    // "запятая после слова"), which have no number on either side and so
+    // fall through unchanged. Same "never guess" principle as the rest of
+    // this file: this is a heuristic, not a grammar, and a contrived
+    // sentence that happens to have digits on both sides of an unrelated
+    // "точка" could still misfire -- an accepted, documented tradeoff, the
+    // same category of imperfection as `isConfidentStandaloneNumber` below.
+    static let punctuationWords: [String: Character] = [
+        "точка": ".",
+        "двоеточие": ":",
+        "запятая": ",",
+    ]
+
+    /// A raw numeral token, possibly with trailing punctuation glued on --
+    /// `tokenize(_:)` merges any run of adjacent non-word characters into
+    /// one token, so "168," (digit immediately followed by a comma, no
+    /// space) is a single `.punctuation("168,")` token, not two. Checking
+    /// only the leading character is enough to identify it as numeric; the
+    /// glued trailing comma is harmless where this is used, since a
+    /// following punctuation-word conversion re-trims trailing commas from
+    /// `result` via `trimTrailingFiller` regardless of which token they
+    /// arrived attached to.
+    private static func startsWithDigitToken(_ token: Token) -> Bool {
+        guard case .punctuation(let s) = token else { return false }
+        return s.first?.isNumber == true
+    }
+
+    /// True if `result`'s trailing content is a digit once whitespace and a
+    /// single run of stray commas are ignored -- Parakeet routinely inserts
+    /// a comma at the pause right before a spoken punctuation word ("168,
+    /// точка, 1"), and that artifact comma should not block the digit-before
+    /// check.
+    private static func endsWithDigitIgnoringFiller(_ result: String) -> Bool {
+        var chars = Substring(result)
+        while let last = chars.last, last.isWhitespace || last == "," {
+            chars.removeLast()
+        }
+        return chars.last?.isNumber == true
+    }
+
+    private static func trimTrailingFiller(_ result: inout String) {
+        while let last = result.last, last.isWhitespace || last == "," {
+            result.removeLast()
+        }
+    }
+
+    /// Scans forward from `index` past whitespace/comma filler (the same
+    /// artifact commas `endsWithDigitIgnoringFiller` looks past) to find the
+    /// next substantive token, reporting whether it's numeric -- a raw
+    /// digit token, or the start of a recognized cardinal/ordinal word --
+    /// and how many filler tokens precede it, so the caller can skip past
+    /// them without copying them to the output.
+    private static func lookaheadIsNumeric(_ tokens: [Token], from index: Int) -> (isNumeric: Bool, fillerTokenCount: Int) {
+        var cursor = index
+        var fillerCount = 0
+        while cursor < tokens.count {
+            switch tokens[cursor] {
+            case .whitespace:
+                cursor += 1
+                fillerCount += 1
+            case .punctuation(","):
+                cursor += 1
+                fillerCount += 1
+            default:
+                if startsWithDigitToken(tokens[cursor]) { return (true, fillerCount) }
+                if case .word(let w) = tokens[cursor] {
+                    let lower = w.lowercased()
+                    if numberWordValues[lower] != nil || ordinalWordSuffixes[lower] != nil {
+                        return (true, fillerCount)
+                    }
+                }
+                return (false, fillerCount)
+            }
+        }
+        return (false, fillerCount)
+    }
+
     static func normalize(_ text: String) -> String {
         let tokens = tokenize(text)
         var result = ""
@@ -277,6 +357,15 @@ enum RussianNumberNormalizer {
 
         while index < tokens.count {
             let token = tokens[index]
+            if case .word(let word) = token, let symbol = punctuationWords[word.lowercased()] {
+                let (isNumericAfter, fillerAfter) = lookaheadIsNumeric(tokens, from: index + 1)
+                if isNumericAfter, endsWithDigitIgnoringFiller(result) {
+                    trimTrailingFiller(&result)
+                    result.append(symbol)
+                    index += 1 + fillerAfter
+                    continue
+                }
+            }
             if case .word(let word) = token,
                (numberWordValues[word.lowercased()] != nil || ordinalWordSuffixes[word.lowercased()] != nil) {
                 let remainingWords: [String] = tokens[index...].compactMap {

@@ -16890,6 +16890,8 @@ private enum ParakeySelfTest {
             return runSuite("russian-number-itn-ordinal", testRussianNumberITNOrdinal)
         case "russian-number-itn-context":
             return runSuite("russian-number-itn-context", testRussianNumberITNContext)
+        case "russian-number-itn-punctuation":
+            return runSuite("russian-number-itn-punctuation", testRussianNumberITNPunctuation)
         case "russian-number-itn-pipeline":
             return runSuite("russian-number-itn-pipeline", testProcessedDictationTextITN)
         case "parakeet-vulkan":
@@ -16948,6 +16950,7 @@ private enum ParakeySelfTest {
         try testRussianNumberITNCardinal()
         try testRussianNumberITNOrdinal()
         try testRussianNumberITNContext()
+        try testRussianNumberITNPunctuation()
         try testProcessedDictationTextITN()
         try testParakeetBridge()
     }
@@ -20877,6 +20880,55 @@ private enum ParakeySelfTest {
             RussianNumberNormalizer.normalize("это стоит две тысячи пятьсот рублей"),
             equals: "это стоит 2500 рублей",
             "money amount with compound cardinal number"
+        )
+    }
+
+    private static func testRussianNumberITNPunctuation() throws {
+        // Spoken "точка"/"двоеточие"/"запятая" convert to symbols only when
+        // a number sits on both sides (an IP-style address, a time, a
+        // decimal) -- never as an ordinary word. Parakeet also routinely
+        // inserts a stray comma at the pause right before the spoken
+        // punctuation word ("168, точка, 1"); that artifact comma must be
+        // absorbed, not left dangling next to the converted symbol.
+        try expect(
+            RussianNumberNormalizer.normalize("19 точка 168 точка 1 точка 122"),
+            equals: "19.168.1.122",
+            "IP-style address, clean dictation with no stray commas"
+        )
+        try expect(
+            RussianNumberNormalizer.normalize("19, точка, 168, точка, 1, точка, 122, двоеточие, 31, 28"),
+            equals: "19.168.1.122:31, 28",
+            "IP-style address with a trailing port-like pair, reproducing Parakeet's stray pause-commas around each spoken punctuation word"
+        )
+        try expect(
+            RussianNumberNormalizer.normalize("двадцать пять запятая семь"),
+            equals: "25,7",
+            "decimal number spelled out as words on both sides of запятая"
+        )
+        try expect(
+            RussianNumberNormalizer.normalize("5 запятая 5 килограмма"),
+            equals: "5,5 килограмма",
+            "decimal number already in digit form on both sides"
+        )
+        try expect(
+            RussianNumberNormalizer.normalize("это моя точка зрения"),
+            equals: "это моя точка зрения",
+            "точка as an ordinary word (point of view), no number on either side"
+        )
+        try expect(
+            RussianNumberNormalizer.normalize("я закончил и точка"),
+            equals: "я закончил и точка",
+            "точка as emphasis at the end of a sentence, no number after it"
+        )
+        try expect(
+            RussianNumberNormalizer.normalize("это точка стиля"),
+            equals: "это точка стиля",
+            "точка as an ordinary word (matter of style), no number on either side"
+        )
+        try expect(
+            RussianNumberNormalizer.normalize("5 точка зрения"),
+            equals: "5 точка зрения",
+            "digit before точка but no number after it -- must not convert"
         )
     }
 
