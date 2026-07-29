@@ -20911,6 +20911,11 @@ private enum ParakeySelfTest {
             "decimal number already in digit form on both sides"
         )
         try expect(
+            RussianNumberNormalizer.normalize("5 точка первая"),
+            equals: "5.1-я",
+            "digit before точка, spelled-out ordinal word after -- hands off to the existing ordinal branch instead of double-processing"
+        )
+        try expect(
             RussianNumberNormalizer.normalize("это моя точка зрения"),
             equals: "это моя точка зрения",
             "точка as an ordinary word (point of view), no number on either side"
