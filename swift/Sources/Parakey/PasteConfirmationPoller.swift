@@ -10,7 +10,7 @@ enum PasteConfirmationPoller {
     static func waitForPasteConfirmation(expectedSubstring: String,
                                          pollInterval: TimeInterval = 0.05,
                                          timeout: TimeInterval = 2.0,
-                                         valueReader: () -> String?) -> Bool {
+                                         valueReader: @Sendable () -> String?) -> Bool {
         if expectedSubstring.isEmpty { return true }
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
@@ -22,7 +22,7 @@ enum PasteConfirmationPoller {
         return false
     }
 
-    static func currentFocusedElementValueReader() -> () -> String? {
+    static func currentFocusedElementValueReader() -> @Sendable () -> String? {
         {
             guard let target = try? FocusedTextTargetResolver().captureTarget() else {
                 return nil

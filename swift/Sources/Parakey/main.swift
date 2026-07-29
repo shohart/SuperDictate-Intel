@@ -7294,8 +7294,8 @@ private enum ClipboardPasteInserter {
                                           ifStillTemporaryText text: String,
                                           changeCount: Int,
                                           pasteboard: NSPasteboard,
-                                          valueReader: @escaping () -> String?,
-                                          confirm: @escaping (String, TimeInterval, TimeInterval, () -> String?) -> Bool) {
+                                          valueReader: @escaping @Sendable () -> String?,
+                                          confirm: @escaping @Sendable (String, TimeInterval, TimeInterval, @escaping @Sendable () -> String?) -> Bool) {
         DispatchQueue.global(qos: .userInitiated).async {
             _ = confirm(text, confirmationPollInterval, confirmationTimeout, valueReader)
             DispatchQueue.main.async {
@@ -7324,7 +7324,7 @@ enum ClipboardPasteInserterTestHooks {
     static func restorePasteboardForTesting(previousText: String,
                                             dictatedText: String,
                                             pasteboard: NSPasteboard,
-                                            confirm: @escaping (String, TimeInterval, TimeInterval, () -> String?) -> Bool,
+                                            confirm: @escaping @Sendable (String, TimeInterval, TimeInterval, @escaping @Sendable () -> String?) -> Bool,
                                             completion: @escaping @Sendable () -> Void) {
         let previous = PasteboardSnapshot.capture(from: pasteboard)
         pasteboard.clearContents()
@@ -17948,30 +17948,49 @@ private enum ParakeySelfTest {
     // ClipboardPasteInserterTestHooks, its test-only seam) without requiring
     // real Accessibility permission or a real paste event: an injected
     // `confirm` closure stands in for PasteConfirmationPoller.
+    // NOTE: this deliberately does NOT use a blocking DispatchSemaphore.wait()
+    // to wait for `completion`, unlike this file's other self-test semaphore
+    // bridges (e.g. runParakeetEngineSynchronously above). Those signal from
+    // work dispatched off the main thread; restorePasteboardForTesting's
+    // completion is delivered via DispatchQueue.main.async, which cannot run
+    // while the main thread (where this self-test itself executes) is
+    // blocked inside a synchronous semaphore.wait() — that would deadlock.
+    // Pumping the run loop instead lets the pending main-queue block execute.
+    private static func waitUntilMainQueueCallback(timeout: TimeInterval, isDone: () -> Bool) {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !isDone(), Date() < deadline {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
+        }
+    }
+
     private static func testClipboardPasteInserterRestore() throws {
+        final class RestoreTestState: @unchecked Sendable {
+            var done = false
+            var confirmWasCalledWithExpectedText: String?
+        }
+
         let restoresAfterConfirmSucceeds = MainActor.assumeIsolated { () -> (calledWith: String?, restored: String?) in
             let pasteboard = NSPasteboard.withUniqueName()
             defer { pasteboard.releaseGlobally() }
             pasteboard.clearContents()
-            pasteboard.setString("previous clipboard content", forType: .string)
+            _ = pasteboard.setString("previous clipboard content", forType: .string)
 
-            let semaphore = DispatchSemaphore(value: 0)
-            var confirmWasCalledWithExpectedText: String?
+            let state = RestoreTestState()
 
             ClipboardPasteInserterTestHooks.restorePasteboardForTesting(
                 previousText: "previous clipboard content",
                 dictatedText: "dictated text",
                 pasteboard: pasteboard,
                 confirm: { expectedSubstring, _, _, _ in
-                    confirmWasCalledWithExpectedText = expectedSubstring
+                    state.confirmWasCalledWithExpectedText = expectedSubstring
                     return true
                 }
             ) {
-                semaphore.signal()
+                state.done = true
             }
 
-            _ = semaphore.wait(timeout: .now() + 1.0)
-            return (confirmWasCalledWithExpectedText, pasteboard.string(forType: .string))
+            waitUntilMainQueueCallback(timeout: 1.0) { state.done }
+            return (state.confirmWasCalledWithExpectedText, pasteboard.string(forType: .string))
         }
         try expect(restoresAfterConfirmSucceeds.calledWith, equals: "dictated text",
                    "restore should confirm against the dictated text that was actually pasted")
@@ -17982,9 +18001,9 @@ private enum ParakeySelfTest {
             let pasteboard = NSPasteboard.withUniqueName()
             defer { pasteboard.releaseGlobally() }
             pasteboard.clearContents()
-            pasteboard.setString("previous clipboard content", forType: .string)
+            _ = pasteboard.setString("previous clipboard content", forType: .string)
 
-            let semaphore = DispatchSemaphore(value: 0)
+            let state = RestoreTestState()
 
             ClipboardPasteInserterTestHooks.restorePasteboardForTesting(
                 previousText: "previous clipboard content",
@@ -17992,10 +18011,10 @@ private enum ParakeySelfTest {
                 pasteboard: pasteboard,
                 confirm: { _, _, _, _ in false }
             ) {
-                semaphore.signal()
+                state.done = true
             }
 
-            _ = semaphore.wait(timeout: .now() + 1.0)
+            waitUntilMainQueueCallback(timeout: 1.0) { state.done }
             return pasteboard.string(forType: .string)
         }
         try expect(restoresAfterConfirmTimesOut, equals: "previous clipboard content",
