@@ -17899,10 +17899,21 @@ private enum ParakeySelfTest {
     // logic with injected valueReaders, so this suite needs neither real AX
     // permission nor a real paste event.
     private static func testPasteConfirmationPoller() throws {
-        var callCount = 0
+        // A plain captured `var` closure isn't convertible to
+        // waitForPasteConfirmation's `@Sendable` valueReader parameter
+        // (verified with a real Swift 6 compiler in a Docker
+        // swift:6.0-jammy container: "converting non-sendable function
+        // value to '@Sendable () -> String?' may introduce data races").
+        // A reference-type counter sidesteps that, same pattern as
+        // RestoreTestState below.
+        final class CallCountBox: @unchecked Sendable {
+            var count = 0
+        }
+        let callCountBox = CallCountBox()
         let values = ["", "старое ", "старое текст"]
-        let appearsEventually: () -> String? = {
-            defer { callCount += 1 }
+        let appearsEventually: @Sendable () -> String? = {
+            defer { callCountBox.count += 1 }
+            let callCount = callCountBox.count
             return callCount < values.count ? values[callCount] : values.last
         }
         let confirmedWhenAppears = PasteConfirmationPoller.waitForPasteConfirmation(
@@ -17913,7 +17924,7 @@ private enum ParakeySelfTest {
         )
         try expect(confirmedWhenAppears, equals: true,
                    "poller should confirm as soon as the expected substring appears")
-        try expect(callCount < values.count + 1, equals: true,
+        try expect(callCountBox.count < values.count + 1, equals: true,
                    "poller should stop polling once confirmed instead of running to the timeout")
 
         let confirmedOnTimeout = PasteConfirmationPoller.waitForPasteConfirmation(
