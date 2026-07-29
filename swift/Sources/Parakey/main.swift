@@ -16799,6 +16799,8 @@ private enum ParakeySelfTest {
             return runSuite("parakeet-text-repair", testParakeetTranscriptRepair)
         case "russian-number-itn-cardinal":
             return runSuite("russian-number-itn-cardinal", testRussianNumberITNCardinal)
+        case "russian-number-itn-ordinal":
+            return runSuite("russian-number-itn-ordinal", testRussianNumberITNOrdinal)
         case "parakeet-vulkan":
             return runSuite("parakeet-vulkan", testParakeetVulkanIntegration)
         case "parakeet-vulkan-bench":
@@ -16851,6 +16853,7 @@ private enum ParakeySelfTest {
         try testTextInsertionRouting()
         try testParakeetTranscriptRepair()
         try testRussianNumberITNCardinal()
+        try testRussianNumberITNOrdinal()
         try testParakeetBridge()
     }
 
@@ -20409,6 +20412,17 @@ private enum ParakeySelfTest {
         // explicitly, so a malformed continuation stops the run without
         // consuming the offending word.
         try expect(RussianNumberNormalizer.normalize("пять шесть"), equals: "5 6", "two standalone single-digit numbers in a row must not merge or drop a word")
+    }
+
+    private static func testRussianNumberITNOrdinal() throws {
+        try expect(RussianNumberNormalizer.normalize("пятый"), equals: "5-й", "simple ordinal: пятый")
+        try expect(RussianNumberNormalizer.normalize("третий"), equals: "3-й", "simple ordinal: третий")
+
+        try expect(RussianNumberNormalizer.normalize("двадцать пятый"), equals: "25-й", "compound ordinal masc nom: двадцать пятый")
+        try expect(RussianNumberNormalizer.normalize("двадцать пятого"), equals: "25-го", "compound ordinal gen: двадцать пятого")
+        try expect(RussianNumberNormalizer.normalize("двадцать пятое"), equals: "25-е", "compound ordinal neut nom: двадцать пятое")
+
+        try expect(RussianNumberNormalizer.normalize("это был двадцать пятый раз"), equals: "это был 25-й раз", "ordinal embedded in sentence preserves surrounding text")
     }
 
     // MARK: - Parakeet bridge (spec §18.1 — no large model required)

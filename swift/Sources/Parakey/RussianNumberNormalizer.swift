@@ -141,6 +141,71 @@ enum RussianNumberNormalizer {
         return (finalValue, consumed)
     }
 
+    // (value, [(wordform, digitSuffix)]) — units 1-3 are irregular
+    // stems; 4-10 follow the regular "cardinal-derived stem + ending"
+    // pattern. Endings covered: -ый/-ой (masc nom), -ое (neut nom),
+    // -ая (fem nom), -ого (masc/neut gen), -ому (dat), -ым (instr),
+    // -ом (prep).
+    static let ordinalWordSuffixes: [String: (value: Int, digitSuffix: String)] = {
+        var table: [String: (value: Int, digitSuffix: String)] = [:]
+
+        let entries: [(value: Int, forms: [(word: String, suffix: String)])] = [
+            (1, [("первый", "-й"), ("первое", "-е"), ("первая", "-я"), ("первого", "-го"), ("первому", "-му"), ("первым", "-м"), ("первом", "-м")]),
+            (2, [("второй", "-й"), ("второе", "-е"), ("вторая", "-я"), ("второго", "-го"), ("второму", "-му"), ("вторым", "-м"), ("втором", "-м")]),
+            (3, [("третий", "-й"), ("третье", "-е"), ("третья", "-я"), ("третьего", "-го"), ("третьему", "-му"), ("третьим", "-м"), ("третьем", "-м")]),
+            (4, [("четвёртый", "-й"), ("четвертый", "-й"), ("четвёртое", "-е"), ("четвертое", "-е"), ("четвёртая", "-я"), ("четвертая", "-я"), ("четвёртого", "-го"), ("четвертого", "-го"), ("четвёртому", "-му"), ("четвертому", "-му"), ("четвёртым", "-м"), ("четвертым", "-м"), ("четвёртом", "-м"), ("четвертом", "-м")]),
+            (5, [("пятый", "-й"), ("пятое", "-е"), ("пятая", "-я"), ("пятого", "-го"), ("пятому", "-му"), ("пятым", "-м"), ("пятом", "-м")]),
+            (6, [("шестой", "-й"), ("шестое", "-е"), ("шестая", "-я"), ("шестого", "-го"), ("шестому", "-му"), ("шестым", "-м"), ("шестом", "-м")]),
+            (7, [("седьмой", "-й"), ("седьмое", "-е"), ("седьмая", "-я"), ("седьмого", "-го"), ("седьмому", "-му"), ("седьмым", "-м"), ("седьмом", "-м")]),
+            (8, [("восьмой", "-й"), ("восьмое", "-е"), ("восьмая", "-я"), ("восьмого", "-го"), ("восьмому", "-му"), ("восьмым", "-м"), ("восьмом", "-м")]),
+            (9, [("девятый", "-й"), ("девятое", "-е"), ("девятая", "-я"), ("девятого", "-го"), ("девятому", "-му"), ("девятым", "-м"), ("девятом", "-м")]),
+            (10, [("десятый", "-й"), ("десятое", "-е"), ("десятая", "-я"), ("десятого", "-го"), ("десятому", "-му"), ("десятым", "-м"), ("десятом", "-м")]),
+            (20, [("двадцатый", "-й"), ("двадцатое", "-е"), ("двадцатая", "-я"), ("двадцатого", "-го"), ("двадцатому", "-му"), ("двадцатым", "-м"), ("двадцатом", "-м")]),
+            (30, [("тридцатый", "-й"), ("тридцатое", "-е"), ("тридцатая", "-я"), ("тридцатого", "-го"), ("тридцатому", "-му"), ("тридцатым", "-м"), ("тридцатом", "-м")]),
+        ]
+        for entry in entries {
+            for form in entry.forms {
+                table[form.word] = (entry.value, form.suffix)
+            }
+        }
+        return table
+    }()
+
+    /// Reuses `parseCardinalRun` for every word except the last (compound
+    /// Russian ordinals only inflect their final word — "двадцать пятый",
+    /// not "двадцатый пятый") and matches the last word against
+    /// `ordinalWordSuffixes`.
+    static func parseOrdinalRun(_ words: [String]) -> (value: Int, digitSuffix: String, consumedWordCount: Int)? {
+        guard !words.isEmpty else { return nil }
+
+        // Find the longest prefix (all but a trailing ordinal word) that
+        // parses as a cardinal run, then require the very next word to be
+        // a recognized ordinal wordform. Try shrinking the prefix from the
+        // full remaining span down to zero so "двадцать пятый" (prefix
+        // "двадцать" + ordinal "пятый") and "пятый" alone (empty prefix)
+        // both work.
+        var prefixLength = words.count - 1
+        while prefixLength >= 0 {
+            let prefixWords = Array(words[0..<prefixLength])
+            let prefixValue: Int
+            if prefixWords.isEmpty {
+                prefixValue = 0
+            } else if let parsed = parseCardinalRun(prefixWords), parsed.consumedWordCount == prefixWords.count {
+                prefixValue = parsed.value
+            } else {
+                prefixLength -= 1
+                continue
+            }
+
+            guard prefixLength < words.count, let ordinalEntry = ordinalWordSuffixes[words[prefixLength]] else {
+                prefixLength -= 1
+                continue
+            }
+            return (prefixValue + ordinalEntry.value, ordinalEntry.digitSuffix, prefixLength + 1)
+        }
+        return nil
+    }
+
     static func normalize(_ text: String) -> String {
         let tokens = tokenize(text)
         var result = ""
@@ -148,10 +213,16 @@ enum RussianNumberNormalizer {
 
         while index < tokens.count {
             let token = tokens[index]
-            if case .word(let word) = token, numberWordValues[word.lowercased()] != nil {
+            if case .word(let word) = token,
+               (numberWordValues[word.lowercased()] != nil || ordinalWordSuffixes[word.lowercased()] != nil) {
                 let remainingWords: [String] = tokens[index...].compactMap {
                     if case .word(let w) = $0 { return w.lowercased() }
                     return nil
+                }
+                if let ordinal = parseOrdinalRun(remainingWords) {
+                    result += "\(ordinal.value)\(ordinal.digitSuffix)"
+                    index = advance(tokens, from: index, byWordTokenCount: ordinal.consumedWordCount)
+                    continue
                 }
                 if let parsed = parseCardinalRun(remainingWords), isConfidentStandaloneNumber(tokens, at: index, consumedWordTokens: parsed.consumedWordCount) {
                     result += String(parsed.value)
