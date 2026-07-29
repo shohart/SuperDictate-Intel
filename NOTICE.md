@@ -1,4 +1,4 @@
-# Attribution
+# 📜 Attribution
 
 SuperDictate is derived from
 [Parakey](https://github.com/rcourtman/parakey), originally created by

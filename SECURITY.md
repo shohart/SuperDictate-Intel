@@ -1,9 +1,13 @@
-# Security
+# 🔒 Security
+
+## Reporting a vulnerability
 
 Please report a suspected vulnerability privately through GitHub's
 **Security > Report a vulnerability** page for this repository. Do not include
 private transcript text, audio, credentials, or full diagnostic logs in a
 public issue.
+
+## How SuperDictate is hardened
 
 SuperDictate does not require an account or cloud transcription service. The
 default installer downloads a version-pinned release bundle and verifies its
