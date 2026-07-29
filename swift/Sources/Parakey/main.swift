@@ -18125,6 +18125,7 @@ private enum ParakeySelfTest {
         // does before calling restorePasteboard: snapshot the "previous"
         // clipboard contents, then write the dictated text as the transient
         // clipboard payload.
+        @MainActor
         func setUpTransientPaste(previousText: String, dictatedText: String, on pasteboard: NSPasteboard) -> (snapshot: PasteboardSnapshot, changeCount: Int) {
             pasteboard.clearContents()
             _ = pasteboard.setString(previousText, forType: .string)
