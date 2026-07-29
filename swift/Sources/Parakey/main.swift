@@ -17276,16 +17276,28 @@ private enum ParakeySelfTest {
                    "once confirmed, continuing to observe the same pid should keep confirming it")
 
         // A transient blip to a DIFFERENT pid, then back to the original --
-        // must not spuriously confirm the blip, and must not carry over
-        // any progress toward confirming it either.
+        // must not spuriously confirm the blip, and returning to the
+        // original pid afterward must start its confirmation progress
+        // over from scratch, not resume from wherever it left off before
+        // the blip.
         debouncer.reset()
         try expect(debouncer.observe(111) == nil, equals: true, "first observation of a new pid never confirms immediately")
         try expect(debouncer.observe(333) == nil, equals: true,
-                   "a single-tick blip to a different pid must not confirm -- it resets progress toward the blip pid too")
-        try expect(debouncer.observe(333) == nil, equals: true,
-                   "after a blip, the blip pid itself needs its own 2 consecutive observations, not 1")
-        try expect(debouncer.observe(333) == 333, equals: true,
-                   "the blip pid confirms once it's genuinely been seen twice in a row")
+                   "a single-tick blip to a different pid must not confirm -- it resets progress toward the original pid too")
+        try expect(debouncer.observe(111) == nil, equals: true,
+                   "returning to the original pid after a blip is a fresh first observation, not a continuation -- must not confirm immediately")
+        try expect(debouncer.observe(111) == 111, equals: true,
+                   "the original pid confirms once it's been seen twice in a row again, after the blip")
+
+        // A genuine, sustained switch to a different pid (no return to the
+        // original) -- the new pid must confirm after its own 2
+        // consecutive observations, exactly like any other pid.
+        debouncer.reset()
+        try expect(debouncer.observe(444) == nil, equals: true, "first observation before a sustained switch")
+        try expect(debouncer.observe(666) == nil, equals: true,
+                   "switching to a different pid must not confirm immediately -- it resets progress toward the new pid too")
+        try expect(debouncer.observe(666) == 666, equals: true,
+                   "the new pid confirms once it's been seen twice in a row")
 
         // nil observation (AX resolution failed, or agreement with
         // context -- both surfaced as nil by the caller) must reset
