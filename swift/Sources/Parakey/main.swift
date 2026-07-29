@@ -2819,6 +2819,7 @@ final class Settings: @unchecked Sendable {
     private static let keySpeechModelProfile = "speech_model_profile"
     private static let keyInitialSpeechModelChoiceRequired = "initial_speech_model_choice_required"
     private static let keyRemoveFillerWords = "remove_filler_words"
+    private static let keyNormalizeNumbersToDigits = "normalize_numbers_to_digits"
     // New key, deliberately NOT the old "use_gpu" (spec §10: "Do not
     // inherit the old Whisper `useGPU` storage value... the persisted key
     // must be new so an old installation with Whisper Vulkan enabled starts
@@ -3466,6 +3467,11 @@ final class Settings: @unchecked Sendable {
     var removeFillerWords: Bool {
         get { defaults.bool(forKey: Self.keyRemoveFillerWords) }
         set { defaults.set(newValue, forKey: Self.keyRemoveFillerWords) }
+    }
+
+    var normalizeNumbersToDigits: Bool {
+        get { defaults.bool(forKey: Self.keyNormalizeNumbersToDigits) }
+        set { defaults.set(newValue, forKey: Self.keyNormalizeNumbersToDigits) }
     }
 
     // Opt-in Vulkan GPU backend for Parakeet (parakeet.cpp). Not implemented
@@ -6325,10 +6331,20 @@ private struct DictationTextProcessingResult: Equatable {
 private func processedDictationText(rawTranscript: String,
                                     corrections: [TranscriptCorrection],
                                     removeFillerWords: Bool,
+                                    normalizeNumbersToDigits: Bool = false,
                                     language: DictationLanguage = .auto) -> DictationTextProcessingResult {
     let trimmed = rawTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
     let repaired = ParakeetTranscriptRepair.apply(to: trimmed, language: language)
-    let corrected = TranscriptCorrector.apply(to: repaired, corrections: corrections)
+
+    let numberNormalized: String
+    switch language {
+    case .auto, .russian:
+        numberNormalized = normalizeNumbersToDigits ? RussianNumberNormalizer.normalize(repaired) : repaired
+    default:
+        numberNormalized = repaired
+    }
+
+    let corrected = TranscriptCorrector.apply(to: numberNormalized, corrections: corrections)
 
     guard removeFillerWords else {
         return DictationTextProcessingResult(text: corrected.text,
@@ -10867,6 +10883,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 let processed = processedDictationText(rawTranscript: transcription.text,
                                                        corrections: settings.transcriptCorrections,
                                                        removeFillerWords: settings.removeFillerWords,
+                                                       normalizeNumbersToDigits: settings.normalizeNumbersToDigits,
                                                        language: settings.dictationLanguage)
                 if !processed.text.isEmpty {
                     addToHistory(
@@ -12390,6 +12407,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     let processed = processedDictationText(rawTranscript: transcription.text,
                                                            corrections: settings.transcriptCorrections,
                                                            removeFillerWords: settings.removeFillerWords,
+                                                           normalizeNumbersToDigits: settings.normalizeNumbersToDigits,
                                                            language: settings.dictationLanguage)
                     let postprocessingCompletedAt = ProcessInfo.processInfo.systemUptime
                     if processed.appliedCorrectionCount > 0 {
@@ -12594,6 +12612,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     let processed = processedDictationText(rawTranscript: transcription.text,
                                                            corrections: settings.transcriptCorrections,
                                                            removeFillerWords: settings.removeFillerWords,
+                                                           normalizeNumbersToDigits: settings.normalizeNumbersToDigits,
                                                            language: settings.dictationLanguage)
                     if !processed.text.isEmpty {
                         addToHistory(
@@ -16803,6 +16822,8 @@ private enum ParakeySelfTest {
             return runSuite("russian-number-itn-ordinal", testRussianNumberITNOrdinal)
         case "russian-number-itn-context":
             return runSuite("russian-number-itn-context", testRussianNumberITNContext)
+        case "russian-number-itn-pipeline":
+            return runSuite("russian-number-itn-pipeline", testProcessedDictationTextITN)
         case "parakeet-vulkan":
             return runSuite("parakeet-vulkan", testParakeetVulkanIntegration)
         case "parakeet-vulkan-bench":
@@ -16857,6 +16878,7 @@ private enum ParakeySelfTest {
         try testRussianNumberITNCardinal()
         try testRussianNumberITNOrdinal()
         try testRussianNumberITNContext()
+        try testProcessedDictationTextITN()
         try testParakeetBridge()
     }
 
@@ -20453,6 +20475,36 @@ private enum ParakeySelfTest {
         )
     }
 
+    private static func testProcessedDictationTextITN() throws {
+        let enabled = processedDictationText(
+            rawTranscript: "мне двадцать пять лет",
+            corrections: [],
+            removeFillerWords: false,
+            normalizeNumbersToDigits: true,
+            language: .russian
+        )
+        try expect(enabled.text, equals: "мне 25 лет", "processedDictationText should normalize numbers when the flag is on")
+
+        let disabled = processedDictationText(
+            rawTranscript: "мне двадцать пять лет",
+            corrections: [],
+            removeFillerWords: false,
+            normalizeNumbersToDigits: false,
+            language: .russian
+        )
+        try expect(disabled.text, equals: "мне двадцать пять лет", "processedDictationText should leave numbers as words when the flag is off")
+
+        let correction = TranscriptCorrection(source: "25 лет", replacement: "25 years old")
+        let corrected = processedDictationText(
+            rawTranscript: "мне двадцать пять лет",
+            corrections: [correction],
+            removeFillerWords: false,
+            normalizeNumbersToDigits: true,
+            language: .russian
+        )
+        try expect(corrected.text, equals: "мне 25 years old", "ITN should run before user corrections so corrections can match on the digit form")
+    }
+
     // MARK: - Parakeet bridge (spec §18.1 — no large model required)
 
     private static func testParakeetBridge() throws {
@@ -22053,6 +22105,7 @@ private struct ControlPanelSettingsDraft: Equatable {
     var transcribingColor: RecordingHUDAccentColor
     var backgroundStyle: RecordingHUDBackgroundStyle
     var hudSize: RecordingHUDSize
+    var normalizeNumbersToDigits: Bool
 
     init(settings: Settings) {
         dictationHotkey = settings.configuredHotkey
@@ -22067,6 +22120,7 @@ private struct ControlPanelSettingsDraft: Equatable {
         transcribingColor = settings.recordingHUDTranscribingColor
         backgroundStyle = settings.recordingHUDBackgroundStyle
         hudSize = settings.recordingHUDSize
+        normalizeNumbersToDigits = settings.normalizeNumbersToDigits
     }
 }
 
@@ -22342,6 +22396,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         ))
         root.addArrangedSubview(primaryCompletionBehaviorRow(draft))
         root.addArrangedSubview(alternateCompletionRow(draft))
+        root.addArrangedSubview(normalizeNumbersRow(draft))
         root.addArrangedSubview(enterDelayRow(draft))
         root.addArrangedSubview(hotkeyRow(
             title: t("История", "History"),
@@ -23147,6 +23202,42 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         return row
     }
 
+    private func normalizeNumbersRow(_ draft: ControlPanelSettingsDraft) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 10
+
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        text.addArrangedSubview(panelLabel(
+            t("Числа цифрами", "Numbers as digits"),
+            size: 13,
+            weight: .semibold
+        ))
+        text.addArrangedSubview(panelLabel(
+            t("Записывать продиктованные числа цифрами (25) вместо слов (двадцать пять). Только для русского языка.",
+              "Write dictated numbers as digits (25) instead of words (twenty five). Russian only."),
+            size: 12,
+            color: .secondaryLabelColor
+        ))
+
+        let toggle = NSSwitch()
+        toggle.target = self
+        toggle.action = #selector(toggleNormalizeNumbers(_:))
+        toggle.state = draft.normalizeNumbersToDigits ? .on : .off
+        toggle.toolTip = t("Включить преобразование чисел в цифры.",
+                           "Enable converting numbers to digits.")
+        toggle.setContentHuggingPriority(.required, for: .horizontal)
+
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(toggle)
+        return row
+    }
+
     private static let enterDelayOptions: [(title: String, value: String)] = [
         ("0 ms", "0"),
         ("50 ms", "50"),
@@ -23798,6 +23889,13 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         refreshSettingsWindow()
     }
 
+    @objc private func toggleNormalizeNumbers(_ sender: NSSwitch) {
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.normalizeNumbersToDigits = sender.state == .on
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
     @objc private func selectRecordingHUDRecordingColor(_ sender: NSPopUpButton) {
         guard let raw = sender.selectedItem?.representedObject as? String,
               let color = RecordingHUDAccentColor(rawValue: raw) else { return }
@@ -23870,6 +23968,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         settings.recordingHUDTranscribingColor = draft.transcribingColor
         settings.recordingHUDBackgroundStyle = draft.backgroundStyle
         settings.recordingHUDSize = draft.hudSize
+        settings.normalizeNumbersToDigits = draft.normalizeNumbersToDigits
         settings.agentEnabled = true
         _ = settings.refreshFromDisk()
         settingsDraft = ControlPanelSettingsDraft(settings: settings)
