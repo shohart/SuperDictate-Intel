@@ -20448,6 +20448,19 @@ private enum ParakeySelfTest {
         try expect(RussianNumberNormalizer.normalize("двадцать пятое"), equals: "25-е", "compound ordinal neut nom: двадцать пятое")
 
         try expect(RussianNumberNormalizer.normalize("это был двадцать пятый раз"), equals: "это был 25-й раз", "ordinal embedded in sentence preserves surrounding text")
+
+        // Regression: ordinalWordSuffixes originally only covered 1-10, 20,
+        // 30 as given in the plan's literal table, leaving 11-19, 40-90 and
+        // 100 unconvertible — a teen-day ordinal ("одиннадцатое") is neither
+        // a recognized ordinal wordform nor a cardinal wordform (the
+        // cardinal table has "одиннадцать", not "одиннадцатое"), so it fell
+        // straight through unchanged. That silently broke roughly a third
+        // of calendar days for the plan's own flagship date example. Also
+        // covers the one irregular stem in the run: 40 is "сороковой"
+        // (-ой), not the regular "-ый" pattern every other decade uses.
+        try expect(RussianNumberNormalizer.normalize("одиннадцатое июля две тысячи двадцать шестого года"), equals: "11-е июля 2026-го года", "teen-day ordinal (11-19) in a date")
+        try expect(RussianNumberNormalizer.normalize("сороковой день"), equals: "40-й день", "irregular ordinal stem 40: сороковой")
+        try expect(RussianNumberNormalizer.normalize("сотый раз"), equals: "100-й раз", "ordinal 100: сотый")
     }
 
     private static func testRussianNumberITNContext() throws {
