@@ -12211,7 +12211,19 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// press (e.g. a rapid tap-and-release that was too short to
     /// transcribe) landing after a newer press has already reset the
     /// pending target.
+    /// Kill switch for the v0.4.1 AX-focused insertion path: real-world
+    /// testing found it regressing plain apps (reporting success while
+    /// inserting nothing visible, so the reliable global-post fallback
+    /// never ran) and still not fixing the SwiftBar case it targeted.
+    /// Disabled here rather than reverted so `FocusedTextTarget.swift`/
+    /// `TextInsertionService.swift` and their tests stay in place while the
+    /// actual bug is diagnosed. With this off, `pendingTextInsertionTarget`
+    /// stays permanently nil, so `textInsertionRoute` always resolves to
+    /// `.fallBackToGlobalInsertion` — i.e. exactly the pre-v0.4.1 behavior.
+    private static let axFocusedInsertionEnabled = false
+
     private func captureTextInsertionTargetForNextDictation() {
+        guard Self.axFocusedInsertionEnabled else { return }
         textInsertionTargetCaptureToken += 1
         let token = textInsertionTargetCaptureToken
         pendingTextInsertionTarget.capture(nil)
