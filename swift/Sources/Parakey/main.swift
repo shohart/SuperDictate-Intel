@@ -16797,6 +16797,8 @@ private enum ParakeySelfTest {
             return runSuite("parakeet-cpu", testParakeetCPUIntegration)
         case "parakeet-text-repair":
             return runSuite("parakeet-text-repair", testParakeetTranscriptRepair)
+        case "russian-number-itn-cardinal":
+            return runSuite("russian-number-itn-cardinal", testRussianNumberITNCardinal)
         case "parakeet-vulkan":
             return runSuite("parakeet-vulkan", testParakeetVulkanIntegration)
         case "parakeet-vulkan-bench":
@@ -16848,6 +16850,7 @@ private enum ParakeySelfTest {
         try testPendingTextInsertionTargetStore()
         try testTextInsertionRouting()
         try testParakeetTranscriptRepair()
+        try testRussianNumberITNCardinal()
         try testParakeetBridge()
     }
 
@@ -20365,6 +20368,47 @@ private enum ParakeySelfTest {
             equals: "No unknown tokens here.",
             "text without <unk> should pass through unchanged (the guard makes this a no-op)"
         )
+    }
+
+    // MARK: - Russian number ITN (spec 2026-07-29-clipboard-race-and-number-itn):
+    // ported from the plan's XCTest cases into this project's `--self-test`
+    // harness, since there is no XCTest target / `Tests/` directory in this
+    // package (confirmed via `find swift/Tests` and `grep testTarget
+    // Package.swift`, both empty). Same assertions, same inputs/outputs.
+    private static func testRussianNumberITNCardinal() throws {
+        try expect(RussianNumberNormalizer.normalize("двадцать девять"), equals: "29", "simple tens: двадцать девять")
+        try expect(RussianNumberNormalizer.normalize("двадцать пять"), equals: "25", "simple tens: двадцать пять")
+        try expect(RussianNumberNormalizer.normalize("двадцать шесть"), equals: "26", "simple tens: двадцать шесть")
+
+        try expect(RussianNumberNormalizer.normalize("пять"), equals: "5", "single digit: пять")
+        try expect(RussianNumberNormalizer.normalize("ноль"), equals: "0", "single digit: ноль")
+
+        try expect(RussianNumberNormalizer.normalize("пятнадцать"), equals: "15", "teen: пятнадцать")
+        try expect(RussianNumberNormalizer.normalize("девятнадцать"), equals: "19", "teen: девятнадцать")
+
+        try expect(RussianNumberNormalizer.normalize("сто пятьдесят три"), equals: "153", "hundreds and compound: сто пятьдесят три")
+        try expect(RussianNumberNormalizer.normalize("девятьсот девяносто девять"), equals: "999", "hundreds and compound: девятьсот девяносто девять")
+
+        try expect(RussianNumberNormalizer.normalize("две тысячи двадцать шесть"), equals: "2026", "thousands: две тысячи двадцать шесть")
+        try expect(RussianNumberNormalizer.normalize("один миллион"), equals: "1000000", "millions: один миллион")
+
+        try expect(RussianNumberNormalizer.normalize("привет, как дела?"), equals: "привет, как дела?", "non-number text left unchanged")
+
+        try expect(RussianNumberNormalizer.normalize("мне двадцать пять лет"), equals: "мне 25 лет", "number embedded in sentence preserves surrounding text")
+
+        try expect(RussianNumberNormalizer.normalize("один из способов"), equals: "один из способов", "ambiguous standalone 'один' before 'из' is left unchanged")
+
+        // Regression for a group-boundary bug found while reviewing
+        // parseCardinalRun: `break` inside the category `switch` only exits
+        // the switch (Swift's break targets the nearest enclosing loop OR
+        // switch), so a malformed continuation like a second same-category
+        // word used to fall through to `consumed += 1` without contributing
+        // to the value — silently eating the second word instead of leaving
+        // it for the next parse attempt. Fixed by labeling the `for` loop
+        // (`wordLoop:`) and using `break wordLoop`/`continue wordLoop`
+        // explicitly, so a malformed continuation stops the run without
+        // consuming the offending word.
+        try expect(RussianNumberNormalizer.normalize("пять шесть"), equals: "5 6", "two standalone single-digit numbers in a row must not merge or drop a word")
     }
 
     // MARK: - Parakeet bridge (spec §18.1 — no large model required)
