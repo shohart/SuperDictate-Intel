@@ -2819,6 +2819,7 @@ final class Settings: @unchecked Sendable {
     private static let keySpeechModelProfile = "speech_model_profile"
     private static let keyInitialSpeechModelChoiceRequired = "initial_speech_model_choice_required"
     private static let keyRemoveFillerWords = "remove_filler_words"
+    private static let keyNormalizeNumbersToDigits = "normalize_numbers_to_digits"
     // New key, deliberately NOT the old "use_gpu" (spec §10: "Do not
     // inherit the old Whisper `useGPU` storage value... the persisted key
     // must be new so an old installation with Whisper Vulkan enabled starts
@@ -3466,6 +3467,11 @@ final class Settings: @unchecked Sendable {
     var removeFillerWords: Bool {
         get { defaults.bool(forKey: Self.keyRemoveFillerWords) }
         set { defaults.set(newValue, forKey: Self.keyRemoveFillerWords) }
+    }
+
+    var normalizeNumbersToDigits: Bool {
+        get { defaults.bool(forKey: Self.keyNormalizeNumbersToDigits) }
+        set { defaults.set(newValue, forKey: Self.keyNormalizeNumbersToDigits) }
     }
 
     // Opt-in Vulkan GPU backend for Parakeet (parakeet.cpp). Not implemented
@@ -6325,10 +6331,20 @@ private struct DictationTextProcessingResult: Equatable {
 private func processedDictationText(rawTranscript: String,
                                     corrections: [TranscriptCorrection],
                                     removeFillerWords: Bool,
+                                    normalizeNumbersToDigits: Bool = false,
                                     language: DictationLanguage = .auto) -> DictationTextProcessingResult {
     let trimmed = rawTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
     let repaired = ParakeetTranscriptRepair.apply(to: trimmed, language: language)
-    let corrected = TranscriptCorrector.apply(to: repaired, corrections: corrections)
+
+    let numberNormalized: String
+    switch language {
+    case .auto, .russian:
+        numberNormalized = normalizeNumbersToDigits ? RussianNumberNormalizer.normalize(repaired) : repaired
+    default:
+        numberNormalized = repaired
+    }
+
+    let corrected = TranscriptCorrector.apply(to: numberNormalized, corrections: corrections)
 
     guard removeFillerWords else {
         return DictationTextProcessingResult(text: corrected.text,
@@ -10931,6 +10947,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 let processed = processedDictationText(rawTranscript: transcription.text,
                                                        corrections: settings.transcriptCorrections,
                                                        removeFillerWords: settings.removeFillerWords,
+                                                       normalizeNumbersToDigits: settings.normalizeNumbersToDigits,
                                                        language: settings.dictationLanguage)
                 if !processed.text.isEmpty {
                     addToHistory(
@@ -12454,6 +12471,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     let processed = processedDictationText(rawTranscript: transcription.text,
                                                            corrections: settings.transcriptCorrections,
                                                            removeFillerWords: settings.removeFillerWords,
+                                                           normalizeNumbersToDigits: settings.normalizeNumbersToDigits,
                                                            language: settings.dictationLanguage)
                     let postprocessingCompletedAt = ProcessInfo.processInfo.systemUptime
                     if processed.appliedCorrectionCount > 0 {
@@ -12658,6 +12676,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     let processed = processedDictationText(rawTranscript: transcription.text,
                                                            corrections: settings.transcriptCorrections,
                                                            removeFillerWords: settings.removeFillerWords,
+                                                           normalizeNumbersToDigits: settings.normalizeNumbersToDigits,
                                                            language: settings.dictationLanguage)
                     if !processed.text.isEmpty {
                         addToHistory(
@@ -16865,6 +16884,14 @@ private enum ParakeySelfTest {
             return runSuite("parakeet-cpu", testParakeetCPUIntegration)
         case "parakeet-text-repair":
             return runSuite("parakeet-text-repair", testParakeetTranscriptRepair)
+        case "russian-number-itn-cardinal":
+            return runSuite("russian-number-itn-cardinal", testRussianNumberITNCardinal)
+        case "russian-number-itn-ordinal":
+            return runSuite("russian-number-itn-ordinal", testRussianNumberITNOrdinal)
+        case "russian-number-itn-context":
+            return runSuite("russian-number-itn-context", testRussianNumberITNContext)
+        case "russian-number-itn-pipeline":
+            return runSuite("russian-number-itn-pipeline", testProcessedDictationTextITN)
         case "parakeet-vulkan":
             return runSuite("parakeet-vulkan", testParakeetVulkanIntegration)
         case "parakeet-vulkan-bench":
@@ -16918,6 +16945,10 @@ private enum ParakeySelfTest {
         try testPendingTextInsertionTargetStore()
         try testTextInsertionRouting()
         try testParakeetTranscriptRepair()
+        try testRussianNumberITNCardinal()
+        try testRussianNumberITNOrdinal()
+        try testRussianNumberITNContext()
+        try testProcessedDictationTextITN()
         try testParakeetBridge()
     }
 
@@ -20737,6 +20768,147 @@ private enum ParakeySelfTest {
         )
     }
 
+    // MARK: - Russian number ITN (spec 2026-07-29-clipboard-race-and-number-itn):
+    // ported from the plan's XCTest cases into this project's `--self-test`
+    // harness, since there is no XCTest target / `Tests/` directory in this
+    // package (confirmed via `find swift/Tests` and `grep testTarget
+    // Package.swift`, both empty). Same assertions, same inputs/outputs.
+    private static func testRussianNumberITNCardinal() throws {
+        try expect(RussianNumberNormalizer.normalize("двадцать девять"), equals: "29", "simple tens: двадцать девять")
+        try expect(RussianNumberNormalizer.normalize("двадцать пять"), equals: "25", "simple tens: двадцать пять")
+        try expect(RussianNumberNormalizer.normalize("двадцать шесть"), equals: "26", "simple tens: двадцать шесть")
+
+        try expect(RussianNumberNormalizer.normalize("пять"), equals: "5", "single digit: пять")
+        try expect(RussianNumberNormalizer.normalize("ноль"), equals: "0", "single digit: ноль")
+
+        try expect(RussianNumberNormalizer.normalize("пятнадцать"), equals: "15", "teen: пятнадцать")
+        try expect(RussianNumberNormalizer.normalize("девятнадцать"), equals: "19", "teen: девятнадцать")
+
+        try expect(RussianNumberNormalizer.normalize("сто пятьдесят три"), equals: "153", "hundreds and compound: сто пятьдесят три")
+        try expect(RussianNumberNormalizer.normalize("девятьсот девяносто девять"), equals: "999", "hundreds and compound: девятьсот девяносто девять")
+
+        try expect(RussianNumberNormalizer.normalize("две тысячи двадцать шесть"), equals: "2026", "thousands: две тысячи двадцать шесть")
+        try expect(RussianNumberNormalizer.normalize("один миллион"), equals: "1000000", "millions: один миллион")
+
+        try expect(RussianNumberNormalizer.normalize("привет, как дела?"), equals: "привет, как дела?", "non-number text left unchanged")
+
+        try expect(RussianNumberNormalizer.normalize("мне двадцать пять лет"), equals: "мне 25 лет", "number embedded in sentence preserves surrounding text")
+
+        try expect(RussianNumberNormalizer.normalize("один из способов"), equals: "один из способов", "ambiguous standalone 'один' before 'из' is left unchanged")
+
+        // Regression for a group-boundary bug found while reviewing
+        // parseCardinalRun: `break` inside the category `switch` only exits
+        // the switch (Swift's break targets the nearest enclosing loop OR
+        // switch), so a malformed continuation like a second same-category
+        // word used to fall through to `consumed += 1` without contributing
+        // to the value — silently eating the second word instead of leaving
+        // it for the next parse attempt. Fixed by labeling the `for` loop
+        // (`wordLoop:`) and using `break wordLoop`/`continue wordLoop`
+        // explicitly, so a malformed continuation stops the run without
+        // consuming the offending word.
+        try expect(RussianNumberNormalizer.normalize("пять шесть"), equals: "5 6", "two standalone single-digit numbers in a row must not merge or drop a word")
+    }
+
+    private static func testRussianNumberITNOrdinal() throws {
+        try expect(RussianNumberNormalizer.normalize("пятый"), equals: "5-й", "simple ordinal: пятый")
+        try expect(RussianNumberNormalizer.normalize("третий"), equals: "3-й", "simple ordinal: третий")
+
+        try expect(RussianNumberNormalizer.normalize("двадцать пятый"), equals: "25-й", "compound ordinal masc nom: двадцать пятый")
+        try expect(RussianNumberNormalizer.normalize("двадцать пятого"), equals: "25-го", "compound ordinal gen: двадцать пятого")
+        try expect(RussianNumberNormalizer.normalize("двадцать пятое"), equals: "25-е", "compound ordinal neut nom: двадцать пятое")
+
+        try expect(RussianNumberNormalizer.normalize("это был двадцать пятый раз"), equals: "это был 25-й раз", "ordinal embedded in sentence preserves surrounding text")
+
+        // Regression: ordinalWordSuffixes originally only covered 1-10, 20,
+        // 30 as given in the plan's literal table, leaving 11-19, 40-90 and
+        // 100 unconvertible — a teen-day ordinal ("одиннадцатое") is neither
+        // a recognized ordinal wordform nor a cardinal wordform (the
+        // cardinal table has "одиннадцать", not "одиннадцатое"), so it fell
+        // straight through unchanged. That silently broke roughly a third
+        // of calendar days for the plan's own flagship date example. Also
+        // covers the one irregular stem in the run: 40 is "сороковой"
+        // (-ой), not the regular "-ый" pattern every other decade uses.
+        try expect(RussianNumberNormalizer.normalize("одиннадцатое июля две тысячи двадцать шестого года"), equals: "11-е июля 2026-го года", "teen-day ordinal (11-19) in a date")
+        try expect(RussianNumberNormalizer.normalize("сороковой день"), equals: "40-й день", "irregular ordinal stem 40: сороковой")
+        try expect(RussianNumberNormalizer.normalize("сотый раз"), equals: "100-й раз", "ordinal 100: сотый")
+
+        // Regression (code review finding): parseOrdinalRun used to try
+        // every prefix length from the end of the ENTIRE remaining
+        // document down to zero, merging the first (longest) cardinal
+        // prefix that happened to be followed by any recognized ordinal
+        // wordform — with no check that the ordinal actually completes
+        // THAT cardinal run rather than starting an unrelated one.
+        // "сто двадцать пять" is already a complete number (125; its
+        // units slot is filled by "пять"), so a further ordinal
+        // "первого" (a unit-level ordinal, "1st") must NOT merge into it
+        // — that produced a fabricated "126-го" ("one hundred twenty six,
+        // -го") which does not correspond to anything the speaker said.
+        // Fixed by requiring the ordinal's category to be a legal
+        // continuation of the cardinal run's last category (the same
+        // rule that already stops "пять шесть" from merging into one
+        // cardinal) rather than accepting any adjacent ordinal wordform.
+        try expect(
+            RussianNumberNormalizer.normalize("сто двадцать пять первого"),
+            equals: "125 1-го",
+            "a complete cardinal (125) followed by an unrelated ordinal (1st) must not fuse into a fabricated value"
+        )
+    }
+
+    private static func testRussianNumberITNContext() throws {
+        // Date/money phrases are not special-cased: they fall out of the
+        // existing cardinal/ordinal parsing because context words like
+        // "года"/"июля"/"рублей" were deliberately never added to
+        // numberWordValues or ordinalWordSuffixes, so they pass through
+        // normalize(_:) unchanged via the "not a recognized number word"
+        // fallback. Diagnosed per the plan's Task B3 Step 3: hand-traced
+        // each case against parseCardinalRun/parseOrdinalRun and confirmed
+        // no stray context word was added to either table and no
+        // group-boundary bug is exercised here beyond the one already
+        // fixed in Task B1 (see the "пять шесть" regression test above).
+        try expect(
+            RussianNumberNormalizer.normalize("двадцать девятое июля две тысячи двадцать шестого года"),
+            equals: "29-е июля 2026-го года",
+            "date: ordinal day + cardinal year, context words untouched"
+        )
+        try expect(RussianNumberNormalizer.normalize("пятьсот рублей"), equals: "500 рублей", "money phrase: пятьсот рублей")
+        try expect(RussianNumberNormalizer.normalize("сто долларов"), equals: "100 долларов", "money phrase: сто долларов")
+        try expect(
+            RussianNumberNormalizer.normalize("это стоит две тысячи пятьсот рублей"),
+            equals: "это стоит 2500 рублей",
+            "money amount with compound cardinal number"
+        )
+    }
+
+    private static func testProcessedDictationTextITN() throws {
+        let enabled = processedDictationText(
+            rawTranscript: "мне двадцать пять лет",
+            corrections: [],
+            removeFillerWords: false,
+            normalizeNumbersToDigits: true,
+            language: .russian
+        )
+        try expect(enabled.text, equals: "мне 25 лет", "processedDictationText should normalize numbers when the flag is on")
+
+        let disabled = processedDictationText(
+            rawTranscript: "мне двадцать пять лет",
+            corrections: [],
+            removeFillerWords: false,
+            normalizeNumbersToDigits: false,
+            language: .russian
+        )
+        try expect(disabled.text, equals: "мне двадцать пять лет", "processedDictationText should leave numbers as words when the flag is off")
+
+        let correction = TranscriptCorrection(source: "25 лет", replacement: "25 years old")
+        let corrected = processedDictationText(
+            rawTranscript: "мне двадцать пять лет",
+            corrections: [correction],
+            removeFillerWords: false,
+            normalizeNumbersToDigits: true,
+            language: .russian
+        )
+        try expect(corrected.text, equals: "мне 25 years old", "ITN should run before user corrections so corrections can match on the digit form")
+    }
+
     // MARK: - Parakeet bridge (spec §18.1 — no large model required)
 
     private static func testParakeetBridge() throws {
@@ -22337,6 +22509,7 @@ private struct ControlPanelSettingsDraft: Equatable {
     var transcribingColor: RecordingHUDAccentColor
     var backgroundStyle: RecordingHUDBackgroundStyle
     var hudSize: RecordingHUDSize
+    var normalizeNumbersToDigits: Bool
 
     init(settings: Settings) {
         dictationHotkey = settings.configuredHotkey
@@ -22351,6 +22524,7 @@ private struct ControlPanelSettingsDraft: Equatable {
         transcribingColor = settings.recordingHUDTranscribingColor
         backgroundStyle = settings.recordingHUDBackgroundStyle
         hudSize = settings.recordingHUDSize
+        normalizeNumbersToDigits = settings.normalizeNumbersToDigits
     }
 }
 
@@ -22626,6 +22800,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         ))
         root.addArrangedSubview(primaryCompletionBehaviorRow(draft))
         root.addArrangedSubview(alternateCompletionRow(draft))
+        root.addArrangedSubview(normalizeNumbersRow(draft))
         root.addArrangedSubview(enterDelayRow(draft))
         root.addArrangedSubview(hotkeyRow(
             title: t("История", "History"),
@@ -23431,6 +23606,42 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         return row
     }
 
+    private func normalizeNumbersRow(_ draft: ControlPanelSettingsDraft) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 10
+
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        text.addArrangedSubview(panelLabel(
+            t("Числа цифрами", "Numbers as digits"),
+            size: 13,
+            weight: .semibold
+        ))
+        text.addArrangedSubview(panelLabel(
+            t("Записывать продиктованные числа цифрами (25) вместо слов (двадцать пять). Только для русского языка.",
+              "Write dictated numbers as digits (25) instead of words (twenty five). Russian only."),
+            size: 12,
+            color: .secondaryLabelColor
+        ))
+
+        let toggle = NSSwitch()
+        toggle.target = self
+        toggle.action = #selector(toggleNormalizeNumbers(_:))
+        toggle.state = draft.normalizeNumbersToDigits ? .on : .off
+        toggle.toolTip = t("Включить преобразование чисел в цифры.",
+                           "Enable converting numbers to digits.")
+        toggle.setContentHuggingPriority(.required, for: .horizontal)
+
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(toggle)
+        return row
+    }
+
     private static let enterDelayOptions: [(title: String, value: String)] = [
         ("0 ms", "0"),
         ("50 ms", "50"),
@@ -24082,6 +24293,13 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         refreshSettingsWindow()
     }
 
+    @objc private func toggleNormalizeNumbers(_ sender: NSSwitch) {
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.normalizeNumbersToDigits = sender.state == .on
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
     @objc private func selectRecordingHUDRecordingColor(_ sender: NSPopUpButton) {
         guard let raw = sender.selectedItem?.representedObject as? String,
               let color = RecordingHUDAccentColor(rawValue: raw) else { return }
@@ -24154,6 +24372,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         settings.recordingHUDTranscribingColor = draft.transcribingColor
         settings.recordingHUDBackgroundStyle = draft.backgroundStyle
         settings.recordingHUDSize = draft.hudSize
+        settings.normalizeNumbersToDigits = draft.normalizeNumbersToDigits
         settings.agentEnabled = true
         _ = settings.refreshFromDisk()
         settingsDraft = ControlPanelSettingsDraft(settings: settings)
