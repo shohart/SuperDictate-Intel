@@ -6591,6 +6591,46 @@ struct RecordingHUDTargetStabilizer {
     }
 }
 
+/// Requires the same value to be observed `requiredConsecutiveMatches`
+/// times in a row before confirming it, resetting on any mismatch or nil.
+/// Mirrors `RecordingHUDTargetStabilizer.observe`'s existing "don't act on
+/// a single observation" shape elsewhere in this file, generalized to a
+/// plain pid rather than a `FocusedInsertionTargetIdentity`. Used by
+/// `FocusedInsertionTargetTracker` to avoid reacting to a one-off,
+/// transient AX focus blip (Spotlight, Notification Center, another
+/// menu-bar extra momentarily owning system-wide AX focus, a race during a
+/// real app switch) as if it were a genuine, sustained focus change.
+struct PIDDebouncer {
+    private var pendingPID: pid_t?
+    private var pendingCount = 0
+    private let requiredConsecutiveMatches: Int
+
+    init(requiredConsecutiveMatches: Int) {
+        self.requiredConsecutiveMatches = requiredConsecutiveMatches
+    }
+
+    mutating func observe(_ pid: pid_t?) -> pid_t? {
+        guard let pid else {
+            pendingPID = nil
+            pendingCount = 0
+            return nil
+        }
+        if pendingPID == pid {
+            pendingCount += 1
+        } else {
+            pendingPID = pid
+            pendingCount = 1
+        }
+        guard pendingCount >= requiredConsecutiveMatches else { return nil }
+        return pid
+    }
+
+    mutating func reset() {
+        pendingPID = nil
+        pendingCount = 0
+    }
+}
+
 actor FocusedInsertionTargetTracker {
     // `NSWorkspace.frontmostApplication` (how `context` was built, on the
     // main actor) disagrees with the real AX focus for WKWebView-hosted
@@ -6606,17 +6646,39 @@ actor FocusedInsertionTargetTracker {
     // `FocusedTextTargetResolver`'s own doc comment warns callers about.
     private let axAppResolver = FocusedTextTargetResolver()
 
+    // This query runs every `RECORDING_HUD_TARGET_REFRESH_INTERVAL`
+    // (~160ms) for a recording's full duration, not once at acquisition --
+    // so a diverging pid must be seen on 2 consecutive polls before the
+    // override actually applies, or a single transient blip could yank the
+    // HUD away from an already-correct target mid-recording. A real
+    // popover focus change (SwiftBar opening and staying focused) keeps
+    // reporting the same pid on every subsequent poll, so this only costs
+    // one extra poll (~160ms) of latency for the case it targets.
+    private var overrideDebouncer = PIDDebouncer(requiredConsecutiveMatches: 2)
+
     func query(context: InsertionTargetQueryContext) -> FocusedInsertionTargetQueryResult {
-        let resolved = try? axAppResolver.captureTarget()
-        let effectiveContext = insertionTargetQueryContext(
-            overriding: context,
-            withAXFocusedApplication: resolved.map {
-                (pid: $0.applicationPID,
-                 name: $0.applicationName,
-                 bundleIdentifier: NSRunningApplication(processIdentifier: $0.applicationPID)?.bundleIdentifier)
-            }
-        )
+        // `resolveFocusedApplicationPID()` -- not the heavier
+        // `captureTarget()` -- deliberately: this runs on the same ~160ms
+        // hot-path poll for a recording's full duration, and
+        // `captureTarget()`'s retry loop over the focused UI element plus
+        // its unconditional `logCapture()` (several extra AX round-trips
+        // and a log write) are appropriate for a once-per-dictation-press
+        // call, not one repeated this often.
+        let resolved = try? axAppResolver.resolveFocusedApplicationPID()
+        let divergingPID = resolved.flatMap { $0.pid != context.applicationPID ? $0.pid : nil }
+        let confirmedPID = overrideDebouncer.observe(divergingPID)
+        let debouncedResolution = confirmedPID.map { pid -> (pid: pid_t, name: String?, bundleIdentifier: String?) in
+            (pid, resolved?.name, NSRunningApplication(processIdentifier: pid)?.bundleIdentifier)
+        }
+        let effectiveContext = insertionTargetQueryContext(overriding: context, withAXFocusedApplication: debouncedResolution)
         return FocusedInsertionTargetLocator.query(context: effectiveContext)
+    }
+
+    /// Called at the start of each new recording so a lingering debounce
+    /// count from a previous session's transient blip can never
+    /// short-circuit the debounce for a new one.
+    func resetOverrideDebounce() {
+        overrideDebouncer.reset()
     }
 }
 
@@ -11570,6 +11632,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         recordingHUDTargetQueryInFlight = false
         recordingHUDWaitingForInitialTarget = settings.showRecordingWaveform
         recordingHUDTargetStabilizer.reset(initialApplicationPID: initialContext?.applicationPID)
+        Task { [insertionTargetTracker] in
+            await insertionTargetTracker.resetOverrideDebounce()
+        }
         setMenuBarState(.recording)
         let timer = Timer(timeInterval: 1.0 / 24.0,
                           target: self,
@@ -16930,6 +16995,8 @@ private enum ParakeySelfTest {
             return runSuite("insertion-target-live", testLiveInsertionTargetProbe)
         case "insertion-target-ax-override":
             return runSuite("insertion-target-ax-override", testInsertionTargetAXOverride)
+        case "pid-debouncer":
+            return runSuite("pid-debouncer", testPIDDebouncer)
         case "text-insertion-target-store":
             return runSuite("text-insertion-target-store", testPendingTextInsertionTargetStore)
         case "text-insertion-routing":
@@ -17002,6 +17069,7 @@ private enum ParakeySelfTest {
         try testInsertionTargetTracking()
         try testPendingTextInsertionTargetStore()
         try testInsertionTargetAXOverride()
+        try testPIDDebouncer()
         try testTextInsertionRouting()
         try testParakeetTranscriptRepair()
         try testRussianNumberITNCardinal()
@@ -17190,6 +17258,54 @@ private enum ParakeySelfTest {
                    "missing resolved name should fall back to context's own name")
         try expect(partialResolution.bundleIdentifier, equals: "com.apple.Terminal",
                    "missing resolved bundleIdentifier should fall back to context's own bundleIdentifier")
+    }
+
+    /// Covers `PIDDebouncer` -- the hysteresis behind
+    /// `FocusedInsertionTargetTracker`'s AX-override, which must not react
+    /// to a single, transient diverging pid observation (see the review
+    /// finding it was added for: without it, a one-off AX focus blip could
+    /// yank the HUD away from an already-correct target mid-recording).
+    private static func testPIDDebouncer() throws {
+        var debouncer = PIDDebouncer(requiredConsecutiveMatches: 2)
+
+        try expect(debouncer.observe(222) == nil, equals: true,
+                   "a single observation must not confirm yet -- requires 2 consecutive matches")
+        try expect(debouncer.observe(222) == 222, equals: true,
+                   "the same pid observed twice in a row should confirm")
+        try expect(debouncer.observe(222) == 222, equals: true,
+                   "once confirmed, continuing to observe the same pid should keep confirming it")
+
+        // A transient blip to a DIFFERENT pid, then back to the original --
+        // must not spuriously confirm the blip, and must not carry over
+        // any progress toward confirming it either.
+        debouncer.reset()
+        try expect(debouncer.observe(111) == nil, equals: true, "first observation of a new pid never confirms immediately")
+        try expect(debouncer.observe(333) == nil, equals: true,
+                   "a single-tick blip to a different pid must not confirm -- it resets progress toward the blip pid too")
+        try expect(debouncer.observe(333) == nil, equals: true,
+                   "after a blip, the blip pid itself needs its own 2 consecutive observations, not 1")
+        try expect(debouncer.observe(333) == 333, equals: true,
+                   "the blip pid confirms once it's genuinely been seen twice in a row")
+
+        // nil observation (AX resolution failed, or agreement with
+        // context -- both surfaced as nil by the caller) must reset
+        // progress, not be silently ignored.
+        debouncer.reset()
+        _ = debouncer.observe(444)
+        try expect(debouncer.observe(nil) == nil, equals: true, "a nil observation never confirms")
+        try expect(debouncer.observe(444) == nil, equals: true,
+                   "a nil observation in between must reset progress -- this is the pid's first observation again, not its second")
+        try expect(debouncer.observe(444) == 444, equals: true,
+                   "444 confirms after being seen twice in a row following the reset")
+
+        // Explicit reset() (called at the start of each new recording)
+        // must clear any lingering progress from a previous session.
+        debouncer.reset()
+        _ = debouncer.observe(555)
+        debouncer.reset()
+        try expect(debouncer.observe(555) == nil, equals: true,
+                   "reset() must clear prior progress -- 555 needs 2 fresh observations, not 1, after a reset")
+        try expect(debouncer.observe(555) == 555, equals: true, "555 confirms on its second observation after the reset")
     }
 
     private static func testInsertionTargetTracking() throws {

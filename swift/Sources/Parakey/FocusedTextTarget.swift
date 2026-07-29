@@ -110,6 +110,35 @@ final class FocusedTextTargetResolver {
         return target
     }
 
+    /// A much cheaper sibling of `captureTarget()` for callers that only
+    /// need the AX-focused *application*'s identity (pid + name), not its
+    /// focused UI element -- e.g. `FocusedInsertionTargetTracker`'s
+    /// per-poll HUD-positioning check, which already does its own
+    /// pid-scoped element search via `FocusedInsertionTargetLocator`. Skips
+    /// `copyElementWithRetry`'s up-to-5-attempt retry loop over
+    /// `kAXFocusedUIElementAttribute` and `logCapture()`'s several extra
+    /// attribute reads plus a log write -- both appropriate for a
+    /// once-per-dictation-press call, not for a call repeated every
+    /// `RECORDING_HUD_TARGET_REFRESH_INTERVAL` for a recording's full
+    /// duration.
+    func resolveFocusedApplicationPID() throws -> (pid: pid_t, name: String?) {
+        guard AXIsProcessTrusted() else {
+            throw FocusedTargetError.accessibilityPermissionMissing
+        }
+
+        let application = try copyElement(
+            from: systemWide,
+            attribute: kAXFocusedApplicationAttribute as CFString,
+            errorBuilder: { .focusedApplicationUnavailable($0) },
+            invalidTypeError: .invalidApplicationElement
+        )
+
+        var applicationPID: pid_t = 0
+        AXUIElementGetPid(application, &applicationPID)
+        let name = NSRunningApplication(processIdentifier: applicationPID)?.localizedName
+        return (applicationPID, name)
+    }
+
     private func logCapture(_ target: FocusedTextTarget) {
         let workspaceFrontmost = NSWorkspace.shared.frontmostApplication?.localizedName ?? "nil"
         let description = stringAttribute(target.element, attribute: kAXDescriptionAttribute as CFString) ?? "nil"
