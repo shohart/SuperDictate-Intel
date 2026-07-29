@@ -3912,9 +3912,7 @@ final class Permissions {
             if status == .denied {
                 openSettings(for: p)
             } else {
-                AVCaptureDevice.requestAccess(for: .audio) { granted in
-                    log("Microphone request: granted=\(granted)")
-                }
+                AVCaptureDevice.requestAccess(for: .audio, completionHandler: logMicrophoneRequestResult)
             }
         case .accessibility:
             // The AX-trust-with-prompt API shows a native dialog
@@ -3934,6 +3932,19 @@ final class Permissions {
             // native permission prompt.
             _ = CGRequestListenEventAccess()
         }
+    }
+
+    /// AVCaptureDevice.requestAccess invokes its completion handler on an
+    /// arbitrary TCC-owned background queue, never the main thread. A
+    /// closure literal written inline inside this (`@MainActor`) class
+    /// inherits MainActor isolation from its lexical context, and Swift's
+    /// runtime isolation check then crashes (SIGILL, dispatch_assert_queue
+    /// failure) the first time TCC actually calls it off-main -- this is
+    /// exactly what happened in production. A `nonisolated` top-level
+    /// function has no such inherited isolation, so it can be called
+    /// directly from any thread.
+    private nonisolated static func logMicrophoneRequestResult(_ granted: Bool) {
+        log("Microphone request: granted=\(granted)")
     }
 
     static func openSettings(for permission: Permission) {
