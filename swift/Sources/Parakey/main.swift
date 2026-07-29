@@ -16749,6 +16749,10 @@ private enum ParakeySelfTest {
             return runSuite("readiness", testReadiness)
         case "paste":
             return runSuite("paste", testPasteSuffixFormatting)
+        case "paste-confirmation":
+            return runSuite("paste-confirmation", testPasteConfirmationPoller)
+        case "paste-restore":
+            return runSuite("paste-restore", testClipboardPasteInserterRestore)
         case "history":
             return runSuite("history", testRecentTranscriptLimit)
         case "statistics":
@@ -16828,6 +16832,8 @@ private enum ParakeySelfTest {
         try testHotkey()
         try testReadiness()
         try testPasteSuffixFormatting()
+        try testPasteConfirmationPoller()
+        try testClipboardPasteInserterRestore()
         try testRecentTranscriptLimit()
         try testDictationUsageStatistics()
         try testTranscriptCorrections()
@@ -17841,6 +17847,55 @@ private enum ParakeySelfTest {
             equals: "pasteboard probe",
             "clipboard paste should write the intended string before posting Cmd+V"
         )
+    }
+
+    // Covers PasteConfirmationPoller.waitForPasteConfirmation's pure polling
+    // logic with injected valueReaders, so this suite needs neither real AX
+    // permission nor a real paste event.
+    private static func testPasteConfirmationPoller() throws {
+        var callCount = 0
+        let values = ["", "старое ", "старое текст"]
+        let appearsEventually: () -> String? = {
+            defer { callCount += 1 }
+            return callCount < values.count ? values[callCount] : values.last
+        }
+        let confirmedWhenAppears = PasteConfirmationPoller.waitForPasteConfirmation(
+            expectedSubstring: "текст",
+            pollInterval: 0.001,
+            timeout: 1.0,
+            valueReader: appearsEventually
+        )
+        try expect(confirmedWhenAppears, equals: true,
+                   "poller should confirm as soon as the expected substring appears")
+        try expect(callCount < values.count + 1, equals: true,
+                   "poller should stop polling once confirmed instead of running to the timeout")
+
+        let confirmedOnTimeout = PasteConfirmationPoller.waitForPasteConfirmation(
+            expectedSubstring: "текст",
+            pollInterval: 0.005,
+            timeout: 0.05,
+            valueReader: { "unrelated value" }
+        )
+        try expect(confirmedOnTimeout, equals: false,
+                   "poller should give up and report false once the timeout elapses")
+
+        let confirmedWithNilReader = PasteConfirmationPoller.waitForPasteConfirmation(
+            expectedSubstring: "текст",
+            pollInterval: 0.005,
+            timeout: 0.05,
+            valueReader: { nil }
+        )
+        try expect(confirmedWithNilReader, equals: false,
+                   "poller should treat a reader that always returns nil as never-confirmed")
+
+        let confirmedWithEmptyExpectation = PasteConfirmationPoller.waitForPasteConfirmation(
+            expectedSubstring: "",
+            pollInterval: 0.005,
+            timeout: 0.05,
+            valueReader: { nil }
+        )
+        try expect(confirmedWithEmptyExpectation, equals: true,
+                   "an empty expected substring should confirm immediately without polling")
     }
 
     private static func testRecentTranscriptLimit() throws {
