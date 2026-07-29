@@ -20461,6 +20461,27 @@ private enum ParakeySelfTest {
         try expect(RussianNumberNormalizer.normalize("одиннадцатое июля две тысячи двадцать шестого года"), equals: "11-е июля 2026-го года", "teen-day ordinal (11-19) in a date")
         try expect(RussianNumberNormalizer.normalize("сороковой день"), equals: "40-й день", "irregular ordinal stem 40: сороковой")
         try expect(RussianNumberNormalizer.normalize("сотый раз"), equals: "100-й раз", "ordinal 100: сотый")
+
+        // Regression (code review finding): parseOrdinalRun used to try
+        // every prefix length from the end of the ENTIRE remaining
+        // document down to zero, merging the first (longest) cardinal
+        // prefix that happened to be followed by any recognized ordinal
+        // wordform — with no check that the ordinal actually completes
+        // THAT cardinal run rather than starting an unrelated one.
+        // "сто двадцать пять" is already a complete number (125; its
+        // units slot is filled by "пять"), so a further ordinal
+        // "первого" (a unit-level ordinal, "1st") must NOT merge into it
+        // — that produced a fabricated "126-го" ("one hundred twenty six,
+        // -го") which does not correspond to anything the speaker said.
+        // Fixed by requiring the ordinal's category to be a legal
+        // continuation of the cardinal run's last category (the same
+        // rule that already stops "пять шесть" from merging into one
+        // cardinal) rather than accepting any adjacent ordinal wordform.
+        try expect(
+            RussianNumberNormalizer.normalize("сто двадцать пять первого"),
+            equals: "125 1-го",
+            "a complete cardinal (125) followed by an unrelated ordinal (1st) must not fuse into a fabricated value"
+        )
     }
 
     private static func testRussianNumberITNContext() throws {

@@ -101,9 +101,39 @@ enum RussianNumberNormalizer {
     /// treats a shorter `consumedWordCount` as "that's as far as the number
     /// goes" and leaves the rest of the sentence untouched.
     static func parseCardinalRun(_ words: [String]) -> (value: Int, consumedWordCount: Int)? {
-        guard let first = words.first, let firstEntry = numberWordValues[first] else { return nil }
-        _ = firstEntry
+        let state = cardinalRunState(words)
+        guard state.consumedWordCount > 0 else { return nil }
+        return (state.value, state.consumedWordCount)
+    }
 
+    /// True when a word of `category`, appearing right after a run that
+    /// last consumed a word of `lastCategory`, would be an illegal/
+    /// malformed continuation of the SAME number (e.g. two unit-level
+    /// words in a row: "пять шесть" is two separate numbers, not one).
+    /// Shared between `cardinalRunState` (deciding when to stop a cardinal
+    /// run) and `parseOrdinalRun` (deciding whether a trailing ordinal word
+    /// genuinely completes the preceding cardinal run, or is an unrelated,
+    /// independent number that happens to follow it — see that function's
+    /// doc comment for why this check exists).
+    private static func blocksContinuation(category: NumberWordCategory, after lastCategory: NumberWordCategory?) -> Bool {
+        switch category {
+        case .unit, .teen:
+            return lastCategory == .unit || lastCategory == .teen
+        case .ten:
+            return lastCategory == .ten || lastCategory == .unit || lastCategory == .teen
+        case .hundred:
+            return lastCategory == .hundred || lastCategory == .ten || lastCategory == .unit || lastCategory == .teen
+        case .thousandMultiplier, .millionMultiplier:
+            return lastCategory == .thousandMultiplier || lastCategory == .millionMultiplier
+        }
+    }
+
+    /// The full state behind `parseCardinalRun`'s greedy scan, additionally
+    /// exposing the category of the last word consumed. `parseOrdinalRun`
+    /// needs that category to check whether a trailing ordinal word is a
+    /// legal continuation of this exact run, not just "any recognized
+    /// ordinal wordform" — see its doc comment.
+    private static func cardinalRunState(_ words: [String]) -> (value: Int, consumedWordCount: Int, lastCategory: NumberWordCategory?) {
         var total = 0
         var currentGroup = 0
         var consumed = 0
@@ -111,34 +141,22 @@ enum RussianNumberNormalizer {
 
         wordLoop: for word in words {
             guard let entry = numberWordValues[word] else { break wordLoop }
+            if blocksContinuation(category: entry.category, after: lastCategory) { break wordLoop }
 
             switch entry.category {
-            case .unit, .teen:
-                if lastCategory == .unit || lastCategory == .teen { break wordLoop }
-                currentGroup += entry.value
-            case .ten:
-                if lastCategory == .ten || lastCategory == .unit || lastCategory == .teen { break wordLoop }
-                currentGroup += entry.value
-            case .hundred:
-                if lastCategory == .hundred || lastCategory == .ten || lastCategory == .unit || lastCategory == .teen { break wordLoop }
+            case .unit, .teen, .ten, .hundred:
                 currentGroup += entry.value
             case .thousandMultiplier, .millionMultiplier:
-                if lastCategory == .thousandMultiplier || lastCategory == .millionMultiplier { break wordLoop }
                 let multiplier = entry.category == .thousandMultiplier ? 1_000 : 1_000_000
                 let groupValue = currentGroup == 0 ? 1 : currentGroup
                 total += groupValue * multiplier
                 currentGroup = 0
-                lastCategory = entry.category
-                consumed += 1
-                continue wordLoop
             }
             lastCategory = entry.category
             consumed += 1
         }
 
-        let finalValue = total + currentGroup
-        guard consumed > 0 else { return nil }
-        return (finalValue, consumed)
+        return (total + currentGroup, consumed, lastCategory)
     }
 
     // (value, [(wordform, digitSuffix)]) — units 1-3 are irregular
@@ -146,6 +164,12 @@ enum RussianNumberNormalizer {
     // pattern. Endings covered: -ый/-ой (masc nom), -ое (neut nom),
     // -ая (fem nom), -ого (masc/neut gen), -ому (dat), -ым (instr),
     // -ом (prep).
+    //
+    // Known gap: stops at 100 ("сотый"). Ordinal hundreds beyond that
+    // (двухсотый/трёхсотый/... for 200/300/.../900, тысячный for 1000)
+    // aren't in this table, so e.g. "двухтысячного года" (year 2000)
+    // falls through normalize(_:) unconverted — safe (never produces a
+    // wrong digit), just an incomplete date-year range for now.
     static let ordinalWordSuffixes: [String: (value: Int, digitSuffix: String)] = {
         var table: [String: (value: Int, digitSuffix: String)] = [:]
 
@@ -190,39 +214,60 @@ enum RussianNumberNormalizer {
         return table
     }()
 
-    /// Reuses `parseCardinalRun` for every word except the last (compound
-    /// Russian ordinals only inflect their final word — "двадцать пятый",
-    /// not "двадцатый пятый") and matches the last word against
-    /// `ordinalWordSuffixes`.
+    /// Maps an ordinal's numeric value to the `NumberWordCategory` its
+    /// cardinal counterpart would have (1-9 -> unit, 10-19 -> teen, the
+    /// tens 20/30/.../90 -> ten, 100 -> hundred). Used only to decide
+    /// whether a trailing ordinal word legally continues a preceding
+    /// cardinal run — see `parseOrdinalRun`.
+    private static func category(forOrdinalValue value: Int) -> NumberWordCategory {
+        switch value {
+        case 100: return .hundred
+        case 10...19: return .teen
+        case 20, 30, 40, 50, 60, 70, 80, 90: return .ten
+        default: return .unit
+        }
+    }
+
+    /// Reuses `parseCardinalRun`'s scan for every word except the last
+    /// (compound Russian ordinals only inflect their final word —
+    /// "двадцать пятый", not "двадцатый пятый") and matches the word right
+    /// after that run against `ordinalWordSuffixes`.
+    ///
+    /// Critically, the cardinal run is taken as its OWN maximal greedy
+    /// parse (not tried at every shrinking prefix length), and the
+    /// trailing ordinal word is only merged into it when the ordinal's
+    /// category would have been a legal continuation of that same run
+    /// (via `blocksContinuation`) — the identical rule `cardinalRunState`
+    /// already uses to stop a cardinal run at a duplicate/conflicting
+    /// category. Without that check, "сто двадцать пять первого" ("one
+    /// hundred twenty-five" — a complete number whose units slot is
+    /// already filled by "пять" — followed by the unrelated "первого",
+    /// e.g. "the first [item]") would wrongly fuse into "126-го": the
+    /// maximal cardinal prefix "сто двадцать пять" (125) is immediately
+    /// followed by a recognized ordinal wordform, but "первого" is a
+    /// unit-level ordinal and the run's last word ("пять") was ALSO
+    /// unit-level — the same conflict that already stops two adjacent
+    /// cardinal unit words ("пять шесть") from merging. Legitimate compound
+    /// ordinals never hit this: "двадцать пятый" ends its cardinal run at
+    /// ten-level ("двадцать"), and the trailing unit-level ordinal
+    /// ("пятый") fills the still-open units slot, exactly like "двадцать
+    /// пять" would as a plain cardinal.
     static func parseOrdinalRun(_ words: [String]) -> (value: Int, digitSuffix: String, consumedWordCount: Int)? {
         guard !words.isEmpty else { return nil }
 
-        // Find the longest prefix (all but a trailing ordinal word) that
-        // parses as a cardinal run, then require the very next word to be
-        // a recognized ordinal wordform. Try shrinking the prefix from the
-        // full remaining span down to zero so "двадцать пятый" (prefix
-        // "двадцать" + ordinal "пятый") and "пятый" alone (empty prefix)
-        // both work.
-        var prefixLength = words.count - 1
-        while prefixLength >= 0 {
-            let prefixWords = Array(words[0..<prefixLength])
-            let prefixValue: Int
-            if prefixWords.isEmpty {
-                prefixValue = 0
-            } else if let parsed = parseCardinalRun(prefixWords), parsed.consumedWordCount == prefixWords.count {
-                prefixValue = parsed.value
-            } else {
-                prefixLength -= 1
-                continue
-            }
+        let prefix = cardinalRunState(words)
+        let boundary = prefix.consumedWordCount
 
-            guard prefixLength < words.count, let ordinalEntry = ordinalWordSuffixes[words[prefixLength]] else {
-                prefixLength -= 1
-                continue
-            }
-            return (prefixValue + ordinalEntry.value, ordinalEntry.digitSuffix, prefixLength + 1)
+        guard boundary < words.count, let ordinalEntry = ordinalWordSuffixes[words[boundary]] else {
+            return nil
         }
-        return nil
+
+        let ordinalCategory = category(forOrdinalValue: ordinalEntry.value)
+        guard !blocksContinuation(category: ordinalCategory, after: prefix.lastCategory) else {
+            return nil
+        }
+
+        return (prefix.value + ordinalEntry.value, ordinalEntry.digitSuffix, boundary + 1)
     }
 
     static func normalize(_ text: String) -> String {
