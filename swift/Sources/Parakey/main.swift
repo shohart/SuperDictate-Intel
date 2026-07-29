@@ -16801,6 +16801,8 @@ private enum ParakeySelfTest {
             return runSuite("russian-number-itn-cardinal", testRussianNumberITNCardinal)
         case "russian-number-itn-ordinal":
             return runSuite("russian-number-itn-ordinal", testRussianNumberITNOrdinal)
+        case "russian-number-itn-context":
+            return runSuite("russian-number-itn-context", testRussianNumberITNContext)
         case "parakeet-vulkan":
             return runSuite("parakeet-vulkan", testParakeetVulkanIntegration)
         case "parakeet-vulkan-bench":
@@ -16854,6 +16856,7 @@ private enum ParakeySelfTest {
         try testParakeetTranscriptRepair()
         try testRussianNumberITNCardinal()
         try testRussianNumberITNOrdinal()
+        try testRussianNumberITNContext()
         try testParakeetBridge()
     }
 
@@ -20423,6 +20426,31 @@ private enum ParakeySelfTest {
         try expect(RussianNumberNormalizer.normalize("двадцать пятое"), equals: "25-е", "compound ordinal neut nom: двадцать пятое")
 
         try expect(RussianNumberNormalizer.normalize("это был двадцать пятый раз"), equals: "это был 25-й раз", "ordinal embedded in sentence preserves surrounding text")
+    }
+
+    private static func testRussianNumberITNContext() throws {
+        // Date/money phrases are not special-cased: they fall out of the
+        // existing cardinal/ordinal parsing because context words like
+        // "года"/"июля"/"рублей" were deliberately never added to
+        // numberWordValues or ordinalWordSuffixes, so they pass through
+        // normalize(_:) unchanged via the "not a recognized number word"
+        // fallback. Diagnosed per the plan's Task B3 Step 3: hand-traced
+        // each case against parseCardinalRun/parseOrdinalRun and confirmed
+        // no stray context word was added to either table and no
+        // group-boundary bug is exercised here beyond the one already
+        // fixed in Task B1 (see the "пять шесть" regression test above).
+        try expect(
+            RussianNumberNormalizer.normalize("двадцать девятое июля две тысячи двадцать шестого года"),
+            equals: "29-е июля 2026-го года",
+            "date: ordinal day + cardinal year, context words untouched"
+        )
+        try expect(RussianNumberNormalizer.normalize("пятьсот рублей"), equals: "500 рублей", "money phrase: пятьсот рублей")
+        try expect(RussianNumberNormalizer.normalize("сто долларов"), equals: "100 долларов", "money phrase: сто долларов")
+        try expect(
+            RussianNumberNormalizer.normalize("это стоит две тысячи пятьсот рублей"),
+            equals: "это стоит 2500 рублей",
+            "money amount with compound cardinal number"
+        )
     }
 
     // MARK: - Parakeet bridge (spec §18.1 — no large model required)
