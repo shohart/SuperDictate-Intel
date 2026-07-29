@@ -7247,7 +7247,8 @@ enum TextInserter {
 private enum ClipboardPasteInserter {
     private static let virtualKeyCommand: CGKeyCode = 0x37  // left Command
     private static let virtualKeyV: CGKeyCode = 0x09  // ANSI 'v'
-    private static let restoreDelay: TimeInterval = 0.35
+    private static let confirmationPollInterval: TimeInterval = 0.05
+    private static let confirmationTimeout: TimeInterval = 2.0
 
     static func write(_ text: String, to pb: NSPasteboard) -> Bool {
         pb.clearContents()
@@ -7273,20 +7274,37 @@ private enum ClipboardPasteInserter {
         restorePasteboard(previous,
                           ifStillTemporaryText: text,
                           changeCount: transientChangeCount,
-                          pasteboard: pasteboard)
+                          pasteboard: pasteboard,
+                          valueReader: PasteConfirmationPoller.currentFocusedElementValueReader(),
+                          confirm: PasteConfirmationPoller.waitForPasteConfirmation)
         return true
     }
 
+    // Waits (on a background queue, never the main actor — see the plan's
+    // threading note) for the target app's focused element to actually
+    // contain the pasted text before restoring the user's previous
+    // clipboard contents, instead of guessing a fixed delay. On slow/laggy
+    // target apps a fixed delay could fire before the paste lands, clobbering
+    // the dictated text with the restored clipboard; on fast apps it wasted
+    // up to 0.35s doing nothing. If confirmation never arrives within
+    // confirmationTimeout, this still restores anyway (better to eventually
+    // give the clipboard back than leave the user's previous clipboard
+    // contents lost forever).
     private static func restorePasteboard(_ snapshot: PasteboardSnapshot,
                                           ifStillTemporaryText text: String,
                                           changeCount: Int,
-                                          pasteboard: NSPasteboard) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + restoreDelay) {
-            guard pasteboard.changeCount == changeCount,
-                  pasteboard.string(forType: .string) == text else {
-                return
+                                          pasteboard: NSPasteboard,
+                                          valueReader: @escaping () -> String?,
+                                          confirm: @escaping (String, TimeInterval, TimeInterval, () -> String?) -> Bool) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            _ = confirm(text, confirmationPollInterval, confirmationTimeout, valueReader)
+            DispatchQueue.main.async {
+                guard pasteboard.changeCount == changeCount,
+                      pasteboard.string(forType: .string) == text else {
+                    return
+                }
+                snapshot.restore(to: pasteboard)
             }
-            snapshot.restore(to: pasteboard)
         }
     }
 
@@ -7295,6 +7313,34 @@ private enum ClipboardPasteInserter {
         // events with .maskCommand. Sleep/wake can leave session modifier
         // state unreliable for flag-only synthetic shortcuts.
         return postKeyboardEventSteps(steps)
+    }
+}
+
+// Test-only seam: exercises the confirmation-gated restore logic without
+// requiring real Accessibility permission or a real paste event. Not used
+// by production code paths.
+enum ClipboardPasteInserterTestHooks {
+    @MainActor
+    static func restorePasteboardForTesting(previousText: String,
+                                            dictatedText: String,
+                                            pasteboard: NSPasteboard,
+                                            confirm: @escaping (String, TimeInterval, TimeInterval, () -> String?) -> Bool,
+                                            completion: @escaping @Sendable () -> Void) {
+        let previous = PasteboardSnapshot.capture(from: pasteboard)
+        pasteboard.clearContents()
+        _ = pasteboard.setString(dictatedText, forType: .string)
+        let changeCount = pasteboard.changeCount
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            _ = confirm(dictatedText, 0.01, 0.2, { nil })
+            DispatchQueue.main.async {
+                if pasteboard.changeCount == changeCount,
+                   pasteboard.string(forType: .string) == dictatedText {
+                    previous.restore(to: pasteboard)
+                }
+                completion()
+            }
+        }
     }
 }
 
@@ -17896,6 +17942,64 @@ private enum ParakeySelfTest {
         )
         try expect(confirmedWithEmptyExpectation, equals: true,
                    "an empty expected substring should confirm immediately without polling")
+    }
+
+    // Covers ClipboardPasteInserter's confirmation-gated restore (via
+    // ClipboardPasteInserterTestHooks, its test-only seam) without requiring
+    // real Accessibility permission or a real paste event: an injected
+    // `confirm` closure stands in for PasteConfirmationPoller.
+    private static func testClipboardPasteInserterRestore() throws {
+        let restoresAfterConfirmSucceeds = MainActor.assumeIsolated { () -> (calledWith: String?, restored: String?) in
+            let pasteboard = NSPasteboard.withUniqueName()
+            defer { pasteboard.releaseGlobally() }
+            pasteboard.clearContents()
+            pasteboard.setString("previous clipboard content", forType: .string)
+
+            let semaphore = DispatchSemaphore(value: 0)
+            var confirmWasCalledWithExpectedText: String?
+
+            ClipboardPasteInserterTestHooks.restorePasteboardForTesting(
+                previousText: "previous clipboard content",
+                dictatedText: "dictated text",
+                pasteboard: pasteboard,
+                confirm: { expectedSubstring, _, _, _ in
+                    confirmWasCalledWithExpectedText = expectedSubstring
+                    return true
+                }
+            ) {
+                semaphore.signal()
+            }
+
+            _ = semaphore.wait(timeout: .now() + 1.0)
+            return (confirmWasCalledWithExpectedText, pasteboard.string(forType: .string))
+        }
+        try expect(restoresAfterConfirmSucceeds.calledWith, equals: "dictated text",
+                   "restore should confirm against the dictated text that was actually pasted")
+        try expect(restoresAfterConfirmSucceeds.restored, equals: "previous clipboard content",
+                   "restore should put the user's previous clipboard content back once confirmed")
+
+        let restoresAfterConfirmTimesOut = MainActor.assumeIsolated { () -> String? in
+            let pasteboard = NSPasteboard.withUniqueName()
+            defer { pasteboard.releaseGlobally() }
+            pasteboard.clearContents()
+            pasteboard.setString("previous clipboard content", forType: .string)
+
+            let semaphore = DispatchSemaphore(value: 0)
+
+            ClipboardPasteInserterTestHooks.restorePasteboardForTesting(
+                previousText: "previous clipboard content",
+                dictatedText: "dictated text",
+                pasteboard: pasteboard,
+                confirm: { _, _, _, _ in false }
+            ) {
+                semaphore.signal()
+            }
+
+            _ = semaphore.wait(timeout: .now() + 1.0)
+            return pasteboard.string(forType: .string)
+        }
+        try expect(restoresAfterConfirmTimesOut, equals: "previous clipboard content",
+                   "restore should still happen even when confirmation times out, rather than losing the user's clipboard forever")
     }
 
     private static func testRecentTranscriptLimit() throws {
