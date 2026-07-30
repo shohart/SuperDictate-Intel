@@ -5633,6 +5633,12 @@ private struct TranscriptionWorkerResult: Sendable {
     let decoderPreparationSeconds: Double
     let engineCallSeconds: Double
     let engineProcessingSeconds: Double
+    /// True iff `transcribeSegmented(...)` had at least one signal-bearing
+    /// segment that stayed empty even after a retry (see
+    /// SegmentedTranscription.swift). Always false for a plain single-call
+    /// `TranscriptionWorker.transcribe(...)` result — only
+    /// `transcribeSegmented` ever sets it true.
+    var hadSegmentFailure: Bool = false
 
     func timing(totalSeconds: Double) -> ASRTimingBreakdown {
         ASRTimingBreakdown(
@@ -6003,6 +6009,58 @@ actor TranscriptionWorker {
         ready = false
         log("ASR: unloaded")
     }
+}
+
+/// Adapts `transcribeSegments` (pure orchestration) to the real
+/// `TranscriptionWorker`: splits `samples` with `PauseSegmenter`, feeds
+/// each piece through `worker.transcribe(...)` in order (the worker's own
+/// `inFlight` guard makes concurrent calls impossible anyway, so strictly
+/// sequential segment processing costs nothing extra there), and merges
+/// the per-segment `TranscriptionWorkerResult`s into one aggregate result
+/// with the same shape a single whole-buffer call would have produced —
+/// every existing caller of `TranscriptionWorker.transcribe(...)` downstream
+/// of this (post-processing, latency logging, history) needs no changes.
+/// For a recording short enough to produce exactly one segment (the
+/// overwhelming majority of dictations), this is one ASR call, identical
+/// to today's behavior.
+func transcribeSegmented(
+    samples: [Float],
+    worker: TranscriptionWorker,
+    language: DictationLanguage?,
+    resolveViaKeyboard: Bool,
+    requestedAt: TimeInterval
+) async throws -> TranscriptionWorkerResult {
+    let segments = PauseSegmenter.segment(samples: samples, sampleRate: SAMPLE_RATE)
+
+    var totalEngineCallSeconds = 0.0
+    var totalEngineProcessingSeconds = 0.0
+    var firstWorkerQueueSeconds = 0.0
+    var haveFirstTiming = false
+
+    let outcome = await transcribeSegments(segments) { segmentSamples in
+        let result = try await worker.transcribe(
+            samples: segmentSamples,
+            language: language,
+            resolveViaKeyboard: resolveViaKeyboard,
+            requestedAt: requestedAt
+        )
+        totalEngineCallSeconds += result.engineCallSeconds
+        totalEngineProcessingSeconds += result.engineProcessingSeconds
+        if !haveFirstTiming {
+            firstWorkerQueueSeconds = result.workerQueueSeconds
+            haveFirstTiming = true
+        }
+        return result.text
+    }
+
+    return TranscriptionWorkerResult(
+        text: outcome.text,
+        workerQueueSeconds: firstWorkerQueueSeconds,
+        decoderPreparationSeconds: 0,
+        engineCallSeconds: totalEngineCallSeconds,
+        engineProcessingSeconds: totalEngineProcessingSeconds,
+        hadSegmentFailure: outcome.hadSegmentFailure
+    )
 }
 
 // MARK: - Transcript corrections
