@@ -6023,7 +6023,7 @@ actor TranscriptionWorker {
 /// For a recording short enough to produce exactly one segment (the
 /// overwhelming majority of dictations), this is one ASR call, identical
 /// to today's behavior.
-func transcribeSegmented(
+fileprivate func transcribeSegmented(
     samples: [Float],
     worker: TranscriptionWorker,
     language: DictationLanguage?,
@@ -6032,6 +6032,7 @@ func transcribeSegmented(
 ) async throws -> TranscriptionWorkerResult {
     let segments = PauseSegmenter.segment(samples: samples, sampleRate: SAMPLE_RATE)
 
+    var totalDecoderPreparationSeconds = 0.0
     var totalEngineCallSeconds = 0.0
     var totalEngineProcessingSeconds = 0.0
     var firstWorkerQueueSeconds = 0.0
@@ -6044,6 +6045,7 @@ func transcribeSegmented(
             resolveViaKeyboard: resolveViaKeyboard,
             requestedAt: requestedAt
         )
+        totalDecoderPreparationSeconds += result.decoderPreparationSeconds
         totalEngineCallSeconds += result.engineCallSeconds
         totalEngineProcessingSeconds += result.engineProcessingSeconds
         if !haveFirstTiming {
@@ -6056,7 +6058,7 @@ func transcribeSegmented(
     return TranscriptionWorkerResult(
         text: outcome.text,
         workerQueueSeconds: firstWorkerQueueSeconds,
-        decoderPreparationSeconds: 0,
+        decoderPreparationSeconds: totalDecoderPreparationSeconds,
         engineCallSeconds: totalEngineCallSeconds,
         engineProcessingSeconds: totalEngineProcessingSeconds,
         hadSegmentFailure: outcome.hadSegmentFailure
