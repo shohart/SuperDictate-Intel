@@ -12617,9 +12617,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let transcriptionWorker = asr
         let language = settings.dictationLanguage
         let transcriptionTask = Task.detached(priority: .userInitiated) {
-            let transcription = try await transcriptionWorker.transcribe(
+            let transcription = try await transcribeSegmented(
                 samples: samples,
+                worker: transcriptionWorker,
                 language: language,
+                resolveViaKeyboard: true,
                 requestedAt: asrRequestedAt
             )
             return CompletedTranscriptionWorkerResult(
@@ -12660,6 +12662,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         log("filler words removed: \(processed.removedFillerWordCount)")
                     }
                     let cleaned = processed.text
+                    if completed.transcription.hadSegmentFailure {
+                        dictationFailed = true
+                    }
                     log("\(String(format: "%.2f", dur)) s audio → \(String(format: "%.2f", asrTiming.totalSeconds)) s → \(cleaned.count) chars")
                     if !cleaned.isEmpty {
                         let historyStartedAt = ProcessInfo.processInfo.systemUptime
@@ -12779,7 +12784,19 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             enterDelaySeconds: enterDelaySeconds,
                             pasteSucceeded: inserted
                         ).logLine)
+                    } else if completed.transcription.hadSegmentFailure {
+                        // At least one segment that DID contain real speech
+                        // still came back empty after a retry — this is a
+                        // genuine loss, not an empty (silent) recording.
+                        // Keep the recovery audio on disk instead of
+                        // deleting it, and make sure the user sees an
+                        // error rather than a silent return to idle.
+                        log("dictation lost after retry: 0 chars from \(String(format: "%.2f", dur)) s audio with real speech detected — recovery audio retained at \(captured.recoveryURL?.path ?? "?")")
+                        dictationFailed = true
                     } else {
+                        // No segment had detectable speech at all — a
+                        // legitimately silent/empty recording, not a
+                        // failure. Preserve today's quiet behavior.
                         PendingDictationRecovery.remove(captured.recoveryURL)
                     }
                 }
