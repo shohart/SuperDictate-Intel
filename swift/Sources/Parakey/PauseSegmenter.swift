@@ -116,7 +116,7 @@ enum PauseSegmenter {
             windowIndex += 1
         }
 
-        makeSegment(endSample: samples.count)
+        _ = makeSegment(endSample: samples.count)
         return segments
     }
 }
