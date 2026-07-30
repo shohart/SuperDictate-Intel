@@ -12867,8 +12867,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             var recoveryFailed = false
             do {
                 let requestedAt = ProcessInfo.processInfo.systemUptime
-                let transcription = try await asr.transcribe(
+                let transcription = try await transcribeSegmented(
                     samples: captured.samples,
+                    worker: asr,
                     language: settings.dictationLanguage,
                     // See recoverPendingDictationsAfterStartup(): this is
                     // also recovering a previous session's audio, so the
@@ -12894,7 +12895,12 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                              audioSeconds: duration,
                                              asrSeconds: timing.totalSeconds)
                     }
-                    PendingDictationRecovery.remove(captured.recoveryURL)
+                    if transcription.hadSegmentFailure {
+                        log("recovered dictation lost part of its audio after retry — recovery file retained at \(captured.recoveryURL?.path ?? "?")")
+                        recoveryFailed = true
+                    } else {
+                        PendingDictationRecovery.remove(captured.recoveryURL)
+                    }
                     log("recovered dictation: \(String(format: "%.2f", duration)) s audio → \(String(format: "%.2f", timing.totalSeconds)) s → \(processed.text.count) chars in history")
                 }
             } catch {
