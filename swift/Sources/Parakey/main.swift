@@ -4887,18 +4887,57 @@ private struct CapturedRecording {
 
 private enum PendingDictationRecovery {
     private static let directoryName = "PendingDictations"
+    private static let lostDirectoryName = "LostDictations"
     private static let fileExtension = "sdaudio"
     private static let magic = Data("SDAR".utf8)
 
     static func directoryURL() throws -> URL {
+        try makeDirectory(named: directoryName)
+    }
+
+    /// Sibling of `directoryURL()` holding audio whose transcription already
+    /// partially or fully FAILED. Deliberately outside the directory
+    /// `pendingURLs()` scans: the audio stays on disk so the user can still
+    /// recover it manually, but it is never auto-replayed at startup — a
+    /// recording that failed once will fail the same way every launch, and
+    /// re-running it would append the same partial text to history forever.
+    static func lostDirectoryURL() throws -> URL {
+        try makeDirectory(named: lostDirectoryName)
+    }
+
+    private static func makeDirectory(named name: String) throws -> URL {
         let url = try superDictateApplicationSupportDirectory()
-            .appendingPathComponent(directoryName, isDirectory: true)
+            .appendingPathComponent(name, isDirectory: true)
         try FileManager.default.createDirectory(at: url,
                                                 withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
         try FileManager.default.setAttributes([.posixPermissions: 0o700],
                                               ofItemAtPath: url.path)
         return url
+    }
+
+    /// Moves a recovery journal out of the auto-replayed `PendingDictations/`
+    /// directory into `LostDictations/`, returning the file's new location
+    /// (or its original location if the move couldn't be performed — the
+    /// audio is never destroyed here, and a failed move is logged rather
+    /// than fatal). Returns nil for a nil input.
+    @discardableResult
+    static func retainAsLost(_ url: URL?) -> URL? {
+        guard let url else { return nil }
+        do {
+            let destinationDirectory = try lostDirectoryURL()
+            var destination = destinationDirectory
+                .appendingPathComponent(url.lastPathComponent)
+            if FileManager.default.fileExists(atPath: destination.path) {
+                destination = destinationDirectory
+                    .appendingPathComponent("\(UUID().uuidString)-\(url.lastPathComponent)")
+            }
+            try FileManager.default.moveItem(at: url, to: destination)
+            return destination
+        } catch {
+            log("lost dictation retention failed (leaving \(url.lastPathComponent) in place): \(error.localizedDescription)")
+            return url
+        }
     }
 
     static func createJournal() throws -> PendingDictationJournal {
@@ -11137,11 +11176,28 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                          asrSeconds: timing.totalSeconds)
                 }
                 if transcription.hadSegmentFailure {
-                    log("pending dictation recovery lost part of its audio after retry — leaving \(url.lastPathComponent) in place for the next launch")
+                    // Anything already salvaged went into history just above,
+                    // so this file must NOT stay in PendingDictations/ — it
+                    // would be re-transcribed on every future launch, fail
+                    // the same way, and append the same partial text again
+                    // each time. Move it aside instead: still on disk and
+                    // recoverable by hand, never auto-replayed.
+                    let lostURL = PendingDictationRecovery.retainAsLost(url)
+                    log("pending dictation recovery lost part of its audio after retry — moved to \(lostURL?.path ?? "?") (not retried on future launches)")
+                    // The other two failure paths call signalDictationFailure().
+                    // Here only its audible half is safe: this runs mid-startup,
+                    // where `startupStatusTitle` is overwritten milliseconds
+                    // later ("Starting audio input…"), and flashErrorFeedback()'s
+                    // auto-clear work item bails out while `isReady` is still
+                    // false — which would strand an error HUD on screen. The
+                    // error sound needs no clean-up and can't be clobbered.
+                    if settings.playFeedbackSounds {
+                        Sounds.playError()
+                    }
                 } else {
                     PendingDictationRecovery.remove(url)
+                    log("pending dictation recovered: \(String(format: "%.2f", duration)) s audio → \(String(format: "%.2f", timing.totalSeconds)) s → \(processed.text.count) chars in history")
                 }
-                log("pending dictation recovered: \(String(format: "%.2f", duration)) s audio → \(String(format: "%.2f", timing.totalSeconds)) s → \(processed.text.count) chars in history")
             } catch {
                 log("pending dictation recovery deferred: \(error.localizedDescription)")
             }
@@ -12692,7 +12748,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             // below. Keep the recovery audio on disk so the
                             // lost portion isn't unrecoverable — same
                             // retention rule as the fully-empty case below.
-                            log("dictation partially lost: some segments failed after retry from \(String(format: "%.2f", dur)) s audio — recovery audio retained at \(captured.recoveryURL?.path ?? "?")")
+                            // It moves to LostDictations/ so the next launch
+                            // doesn't re-transcribe it and append this same
+                            // partial text to history all over again.
+                            let lostURL = PendingDictationRecovery.retainAsLost(captured.recoveryURL)
+                            log("dictation partially lost: some segments failed after retry from \(String(format: "%.2f", dur)) s audio — recovery audio retained at \(lostURL?.path ?? "?")")
                         } else {
                             PendingDictationRecovery.remove(captured.recoveryURL)
                         }
@@ -12804,9 +12864,12 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         // still came back empty after a retry — this is a
                         // genuine loss, not an empty (silent) recording.
                         // Keep the recovery audio on disk instead of
-                        // deleting it, and make sure the user sees an
-                        // error rather than a silent return to idle.
-                        log("dictation lost after retry: 0 chars from \(String(format: "%.2f", dur)) s audio with real speech detected — recovery audio retained at \(captured.recoveryURL?.path ?? "?")")
+                        // deleting it (moved to LostDictations/, so startup
+                        // never auto-replays a recording that already
+                        // failed), and make sure the user sees an error
+                        // rather than a silent return to idle.
+                        let lostURL = PendingDictationRecovery.retainAsLost(captured.recoveryURL)
+                        log("dictation lost after retry: 0 chars from \(String(format: "%.2f", dur)) s audio with real speech detected — recovery audio retained at \(lostURL?.path ?? "?")")
                         dictationFailed = true
                     } else {
                         // No segment had detectable speech at all — a
@@ -12901,7 +12964,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                              asrSeconds: timing.totalSeconds)
                     }
                     if transcription.hadSegmentFailure {
-                        log("recovered dictation lost part of its audio after retry — recovery file retained at \(captured.recoveryURL?.path ?? "?")")
+                        let lostURL = PendingDictationRecovery.retainAsLost(captured.recoveryURL)
+                        log("recovered dictation lost part of its audio after retry — recovery file retained at \(lostURL?.path ?? "?")")
                         recoveryFailed = true
                     } else {
                         PendingDictationRecovery.remove(captured.recoveryURL)
