@@ -17005,6 +17005,8 @@ private enum ParakeySelfTest {
             return runSuite("parakeet-bridge", testParakeetBridge)
         case "pause-segmentation":
             return runSuite("pause-segmentation", testPauseSegmentation)
+        case "segmented-transcription":
+            return runSuite("segmented-transcription", testSegmentedTranscription)
         case "parakeet-cpu":
             return runSuite("parakeet-cpu", testParakeetCPUIntegration)
         case "parakeet-text-repair":
@@ -17081,6 +17083,7 @@ private enum ParakeySelfTest {
         try testProcessedDictationTextITN()
         try testParakeetBridge()
         try testPauseSegmentation()
+        try testSegmentedTranscription()
     }
 
     /// Covers `textInsertionRoute(for:targetElementStillValid:)` — the
@@ -21430,6 +21433,94 @@ private enum ParakeySelfTest {
         let silentSegments = PauseSegmenter.segment(samples: silence, sampleRate: sampleRate)
         try expect(silentSegments.count, equals: 1, "an all-silent buffer stays a single segment")
         try expect(silentSegments[0].hasSignal, equals: false, "an all-silent segment is flagged as having no signal")
+    }
+
+    /// Pure orchestration coverage for `transcribeSegments` using a mock
+    /// `transcribeOne` closure — no model, no engine, no audio hardware.
+    /// Bridged through `runParakeetEngineSynchronously` since this test
+    /// suite's entry point is synchronous (see that helper's doc comment).
+    private static func testSegmentedTranscription() throws {
+        // All segments succeed on the first try -> concatenated with a
+        // single space, no failure flagged.
+        let allOk: [AudioSegment] = [
+            AudioSegment(samples: [0.1], hasSignal: true),
+            AudioSegment(samples: [0.1], hasSignal: true),
+        ]
+        nonisolated(unsafe) var callIndex = 0
+        let okTexts = ["hello", "world"]
+        let okOutcome = try runParakeetEngineSynchronously {
+            await transcribeSegments(allOk) { _ in
+                defer { callIndex += 1 }
+                return okTexts[callIndex]
+            }
+        }
+        try expect(okOutcome.text, equals: "hello world", "successful segments are joined with a space")
+        try expect(okOutcome.hadSegmentFailure, equals: false, "no failure flagged when every segment succeeds")
+
+        // A signal-bearing segment that returns empty on the first call but
+        // real text on the retry -> succeeds, no failure flagged, and the
+        // closure was actually called twice for that segment.
+        let retrySucceeds: [AudioSegment] = [AudioSegment(samples: [0.1], hasSignal: true)]
+        nonisolated(unsafe) var retryCallCount = 0
+        let retryOutcome = try runParakeetEngineSynchronously {
+            await transcribeSegments(retrySucceeds) { _ in
+                retryCallCount += 1
+                return retryCallCount == 1 ? "" : "recovered"
+            }
+        }
+        try expect(retryCallCount, equals: 2, "an empty signal-bearing segment is retried exactly once")
+        try expect(retryOutcome.text, equals: "recovered", "a successful retry contributes its text")
+        try expect(retryOutcome.hadSegmentFailure, equals: false, "a retry that succeeds is not a failure")
+
+        // A signal-bearing segment that stays empty after the retry ->
+        // flagged as a failure, contributes nothing to the joined text, but
+        // does not discard an earlier segment's text.
+        let stillFails: [AudioSegment] = [
+            AudioSegment(samples: [0.1], hasSignal: true),
+            AudioSegment(samples: [0.1], hasSignal: true),
+        ]
+        nonisolated(unsafe) var stillFailsCallIndex = 0
+        let failOutcome = try runParakeetEngineSynchronously {
+            await transcribeSegments(stillFails) { _ in
+                defer { stillFailsCallIndex += 1 }
+                // Segment 0 always succeeds; segment 1 (calls 2 and 3, since
+                // segment 0 only ever calls once) always returns empty.
+                return stillFailsCallIndex == 0 ? "kept" : ""
+            }
+        }
+        try expect(failOutcome.text, equals: "kept",
+                   "a persistently-empty segment doesn't discard an earlier segment's text")
+        try expect(failOutcome.hadSegmentFailure, equals: true,
+                   "a signal-bearing segment still empty after retry is flagged as a failure")
+
+        // A segment with no signal (silence) that returns empty is NOT
+        // retried and is NOT flagged as a failure.
+        let silentSegment: [AudioSegment] = [AudioSegment(samples: [0.0], hasSignal: false)]
+        nonisolated(unsafe) var silentCallCount = 0
+        let silentOutcome = try runParakeetEngineSynchronously {
+            await transcribeSegments(silentSegment) { _ in
+                silentCallCount += 1
+                return ""
+            }
+        }
+        try expect(silentCallCount, equals: 1, "a silent segment is not retried")
+        try expect(silentOutcome.text, equals: "", "a silent segment contributes no text")
+        try expect(silentOutcome.hadSegmentFailure, equals: false, "a silent segment is never a failure")
+
+        // A segment whose transcribeOne throws is treated like an empty
+        // result: retried once (since it has signal), and doesn't crash the
+        // whole run.
+        let throwing: [AudioSegment] = [AudioSegment(samples: [0.1], hasSignal: true)]
+        nonisolated(unsafe) var throwCallCount = 0
+        struct DummyError: Error {}
+        let throwOutcome = try runParakeetEngineSynchronously {
+            await transcribeSegments(throwing) { _ in
+                throwCallCount += 1
+                throw DummyError()
+            }
+        }
+        try expect(throwCallCount, equals: 2, "a throwing segment is retried exactly once, same as empty text")
+        try expect(throwOutcome.hadSegmentFailure, equals: true, "a segment that keeps throwing is flagged as a failure")
     }
 
     // MARK: - Parakeet CPU integration (spec §18.2 — real model, opt-in via env var)
