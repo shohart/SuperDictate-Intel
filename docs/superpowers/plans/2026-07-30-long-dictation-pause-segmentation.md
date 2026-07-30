@@ -14,7 +14,7 @@
 - Do **not** modify `swift/Sources/parakeet_cpp/**` (vendored, commit-pinned upstream) — the fix is entirely on the Swift side.
 - Do **not** implement fixed-time chunking — cuts must only happen at detected silence, or as a last-resort forced cut at the safety cap (25s) when no pause is found in time.
 - Safety cap: 25 seconds per segment (`PauseSegmenter.defaultMaxSegmentSeconds`).
-- Pause qualification: a silent run of at least 0.4 seconds (`PauseSegmenter.defaultPauseThresholdSeconds`), and the current segment must already hold at least 3 seconds (`PauseSegmenter.defaultMinSegmentSeconds`) before a pause is allowed to end it — avoids fragmenting on ordinary short breaths/word gaps.
+- Pause qualification: a silent run of at least 0.4 seconds (`PauseSegmenter.defaultPauseThresholdSeconds`), and the current segment must already hold at least 15 seconds (`PauseSegmenter.defaultMinSegmentSeconds`) before a pause is allowed to end it — keeps ordinary short dictations (which have plenty of normal inter-sentence pauses) as a single ASR call, so only genuinely long dictations are ever split.
 - All builds/tests run on the real Intel Mac used throughout this project (`shohart@192.168.1.246`), synced via `git archive HEAD | ssh ... tar -x` into a scratch directory — never `git clone`. This matches the workflow already used earlier in this session and documented project-wide.
 - `SAMPLE_RATE` is `16_000.0` (`main.swift:41`) — all new code takes sample rate as a parameter rather than hardcoding it, but production call sites always pass `SAMPLE_RATE`.
 - New Swift files go under `swift/Sources/Parakey/` (same target as `main.swift`, so `internal` default access is sufficient — no `public` needed).
@@ -29,7 +29,7 @@
 - Test: self-test group `pause-segmentation` added to `swift/Sources/Parakey/main.swift` (inside the existing `#if DEBUG` `ParakeySelfTest` block)
 
 **Interfaces:**
-- Produces: `struct AudioSegment: Sendable, Equatable { let samples: [Float]; let hasSignal: Bool }` and `enum PauseSegmenter { static func segment(samples: [Float], sampleRate: Double, maxSegmentSeconds: Double = 25.0, minSegmentSeconds: Double = 3.0, pauseThresholdSeconds: Double = 0.4, windowSeconds: Double = 0.02, silenceRMSThreshold: Float = 0.02) -> [AudioSegment] }` — consumed by Task 2 and Task 3.
+- Produces: `struct AudioSegment: Sendable, Equatable { let samples: [Float]; let hasSignal: Bool }` and `enum PauseSegmenter { static func segment(samples: [Float], sampleRate: Double, maxSegmentSeconds: Double = 25.0, minSegmentSeconds: Double = 15.0, pauseThresholdSeconds: Double = 0.4, windowSeconds: Double = 0.02, silenceRMSThreshold: Float = 0.02) -> [AudioSegment] }` — consumed by Task 2 and Task 3.
 
 - [ ] **Step 1: Write `PauseSegmenter.swift`**
 
@@ -217,7 +217,7 @@ Add the test function itself near `testParakeetBridge` (search for `private stat
         try expect(pausedSegments.reduce(0) { $0 + $1.samples.count }, equals: withPause.count,
                    "pause-split segments cover the whole buffer with no gaps or overlap")
 
-        // A pause shorter than the 3s minimum segment length is NOT a
+        // A pause before the minimum segment length is NOT a
         // qualifying cut point -> stays a single segment.
         var earlyPause = [Float](repeating: 0.2, count: Int(1.0 * sampleRate))
         earlyPause.append(contentsOf: [Float](repeating: 0.0, count: Int(0.6 * sampleRate)))

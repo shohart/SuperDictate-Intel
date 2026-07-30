@@ -21559,18 +21559,57 @@ private enum ParakeySelfTest {
         try expect(longSegments.reduce(0) { $0 + $1.samples.count }, equals: longSpeech.count,
                    "forced-cut segments cover the whole buffer with no gaps or overlap")
 
-        // A qualifying pause (600ms of silence) placed after 5s of speech,
-        // followed by 5 more seconds of speech -> exactly two segments,
-        // split at the pause, nothing dropped.
+        // An ORDINARY dictation — 5s of speech, a normal 600ms
+        // inter-sentence pause, 5 more seconds (10.6s total, under the 15s
+        // minimum segment length) -> must stay ONE segment. This is the
+        // whole point of the 15s minimum: everyday short dictations go
+        // through ASR exactly once, exactly as before this feature existed,
+        // so their punctuation/clause structure is never split up.
         var withPause = [Float](repeating: 0.2, count: Int(5.0 * sampleRate))
         withPause.append(contentsOf: [Float](repeating: 0.0, count: Int(0.6 * sampleRate)))
         withPause.append(contentsOf: [Float](repeating: 0.2, count: Int(5.0 * sampleRate)))
         let pausedSegments = PauseSegmenter.segment(samples: withPause, sampleRate: sampleRate)
-        try expect(pausedSegments.count, equals: 2, "a qualifying pause after the minimum splits into two segments")
+        try expect(pausedSegments.count, equals: 1,
+                   "an ordinary sub-15s dictation with a normal pause is NOT fragmented")
         try expect(pausedSegments.reduce(0) { $0 + $1.samples.count }, equals: withPause.count,
+                   "the single-segment case preserves every sample")
+
+        // The same shape, but genuinely LONG: 16s of speech (past the 15s
+        // minimum) + a 600ms pause + 5s more -> the pause now qualifies and
+        // the buffer splits in two at it. Proves cutting still happens once
+        // a recording is actually long, which is the case this feature
+        // exists for.
+        var longWithPause = [Float](repeating: 0.2, count: Int(16.0 * sampleRate))
+        longWithPause.append(contentsOf: [Float](repeating: 0.0, count: Int(0.6 * sampleRate)))
+        longWithPause.append(contentsOf: [Float](repeating: 0.2, count: Int(5.0 * sampleRate)))
+        let longPausedSegments = PauseSegmenter.segment(samples: longWithPause, sampleRate: sampleRate)
+        try expect(longPausedSegments.count, equals: 2,
+                   "a qualifying pause past the 15s minimum splits a long dictation into two segments")
+        try expect(longPausedSegments[0].samples.count, equals: Int(16.0 * sampleRate),
+                   "the cut lands at the start of the silent run, so segment 1 carries no trailing pause")
+        try expect(longPausedSegments.reduce(0) { $0 + $1.samples.count }, equals: longWithPause.count,
                    "pause-split segments cover the whole buffer with no gaps or overlap")
 
-        // A pause shorter than the 3s minimum segment length is NOT a
+        // The same 16s/0.6s/5s shape, but over a realistic low-amplitude
+        // noise floor (0.008 RMS — non-zero, yet well under the 0.02 silence
+        // threshold) instead of mathematically perfect digital silence, so
+        // the cut logic is exercised against something closer to a real
+        // microphone than 0.0/0.2 extremes. NOTE: the 0.02 threshold itself
+        // is still uncalibrated against real hardware; this test pins the
+        // algorithm's SHAPE so a future recalibration only has to move the
+        // constant.
+        var noisy = [Float](repeating: 0.2, count: Int(16.0 * sampleRate))
+        noisy.append(contentsOf: (0..<Int(0.6 * sampleRate)).map { $0 % 2 == 0 ? 0.008 : -0.008 })
+        noisy.append(contentsOf: [Float](repeating: 0.2, count: Int(5.0 * sampleRate)))
+        let noisySegments = PauseSegmenter.segment(samples: noisy, sampleRate: sampleRate)
+        try expect(noisySegments.count, equals: 2,
+                   "a pause over a realistic non-zero noise floor is still detected as a pause")
+        try expect(noisySegments[0].samples.count, equals: Int(16.0 * sampleRate),
+                   "the noise-floor pause cuts at the same place perfect silence would")
+        try expect(noisySegments.reduce(0) { $0 + $1.samples.count }, equals: noisy.count,
+                   "noise-floor-split segments cover the whole buffer with no gaps or overlap")
+
+        // A pause before the minimum segment length is NOT a
         // qualifying cut point -> stays a single segment.
         var earlyPause = [Float](repeating: 0.2, count: Int(1.0 * sampleRate))
         earlyPause.append(contentsOf: [Float](repeating: 0.0, count: Int(0.6 * sampleRate)))
@@ -21603,6 +21642,34 @@ private enum ParakeySelfTest {
         let silentSegments = PauseSegmenter.segment(samples: silence, sampleRate: sampleRate)
         try expect(silentSegments.count, equals: 1, "an all-silent buffer stays a single segment")
         try expect(silentSegments[0].hasSignal, equals: false, "an all-silent segment is flagged as having no signal")
+
+        // hasSignal needs SUSTAINED content, not one stray window: a single
+        // ~20ms blip (a mic bump, a keyboard click, a breath) in an
+        // otherwise silent buffer must NOT read as speech, or it would
+        // trigger a pointless retry and a spurious "dictation lost" signal
+        // on a recording that never contained speech at all.
+        var blip = [Float](repeating: 0.0, count: Int(4.0 * sampleRate))
+        let blipStart = Int(2.0 * sampleRate)
+        for i in blipStart..<(blipStart + Int(PauseSegmenter.defaultWindowSeconds * sampleRate)) {
+            blip[i] = 0.5
+        }
+        let blipSegments = PauseSegmenter.segment(samples: blip, sampleRate: sampleRate)
+        try expect(blipSegments.count, equals: 1, "a mostly-silent buffer with one blip stays a single segment")
+        try expect(blipSegments[0].hasSignal, equals: false,
+                   "a single non-silent window is below the minimum-signal threshold")
+
+        // A sustained run at/above the threshold (5 windows = ~100ms) in the
+        // same otherwise-silent buffer DOES count as signal.
+        var sustained = [Float](repeating: 0.0, count: Int(4.0 * sampleRate))
+        let runStart = Int(2.0 * sampleRate)
+        let runLength = PauseSegmenter.defaultSignalMinWindows * Int(PauseSegmenter.defaultWindowSeconds * sampleRate)
+        for i in runStart..<(runStart + runLength) {
+            sustained[i] = 0.5
+        }
+        let sustainedSegments = PauseSegmenter.segment(samples: sustained, sampleRate: sampleRate)
+        try expect(sustainedSegments.count, equals: 1, "the sustained-signal buffer stays a single segment")
+        try expect(sustainedSegments[0].hasSignal, equals: true,
+                   "a run at the minimum-signal threshold is flagged as having signal")
     }
 
     /// Pure orchestration coverage for `transcribeSegments` using a mock

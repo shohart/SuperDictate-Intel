@@ -1,8 +1,11 @@
 import Foundation
 
 /// One contiguous slice of a captured recording, produced by
-/// `PauseSegmenter.segment(...)`. `hasSignal` is true iff at least one
-/// analysis window inside this segment was NOT judged silent — used
+/// `PauseSegmenter.segment(...)`. `hasSignal` is true iff at least
+/// `signalMinWindows` analysis windows inside this segment were NOT judged
+/// silent — a single non-silent window (a breath, a mic bump, a keyboard
+/// click) is deliberately NOT enough, since that would flag a spurious
+/// failure on a dictation that actually succeeded. Used
 /// downstream (see `SegmentedTranscription.swift`) to tell "the model
 /// returned nothing because this really was silence" apart from "the
 /// model returned nothing despite real speech being present," which is
@@ -21,10 +24,22 @@ struct AudioSegment: Sendable, Equatable {
 /// safe to unit test directly.
 enum PauseSegmenter {
     static let defaultMaxSegmentSeconds: Double = 25.0
-    static let defaultMinSegmentSeconds: Double = 3.0
+    /// How much audio the current segment must already hold before a pause
+    /// is even *considered* as a cut point. Deliberately large: an ordinary
+    /// short dictation (a couple of sentences with normal inter-sentence
+    /// pauses) must go through ASR as ONE segment, exactly as before this
+    /// feature existed — cutting it up would reintroduce the clause-splitting
+    /// punctuation damage that fixed-size chunking was rejected for. Only a
+    /// genuinely long dictation (the case this feature targets) reaches this
+    /// threshold and starts cutting at its natural pauses.
+    static let defaultMinSegmentSeconds: Double = 15.0
     static let defaultPauseThresholdSeconds: Double = 0.4
     static let defaultWindowSeconds: Double = 0.02
     static let defaultSilenceRMSThreshold: Float = 0.02
+    /// Minimum number of non-silent analysis windows (~100ms at the default
+    /// 20ms window) a segment needs before it counts as carrying real
+    /// signal. One stray window is a click or a breath, not speech.
+    static let defaultSignalMinWindows: Int = 5
 
     static func segment(
         samples: [Float],
@@ -33,7 +48,8 @@ enum PauseSegmenter {
         minSegmentSeconds: Double = defaultMinSegmentSeconds,
         pauseThresholdSeconds: Double = defaultPauseThresholdSeconds,
         windowSeconds: Double = defaultWindowSeconds,
-        silenceRMSThreshold: Float = defaultSilenceRMSThreshold
+        silenceRMSThreshold: Float = defaultSilenceRMSThreshold,
+        signalMinWindows: Int = defaultSignalMinWindows
     ) -> [AudioSegment] {
         guard !samples.isEmpty else { return [] }
 
@@ -62,12 +78,15 @@ enum PauseSegmenter {
 
         func sampleIndex(forWindow w: Int) -> Int { w * windowSize }
 
-        func allWindowsSilent(in range: Range<Int>) -> Bool {
-            guard range.lowerBound < range.upperBound else { return true }
+        /// True iff the range contains at least `signalMinWindows` non-silent
+        /// analysis windows — see `defaultSignalMinWindows`.
+        func hasSignal(in range: Range<Int>) -> Bool {
+            guard range.lowerBound < range.upperBound else { return false }
             let startWindow = range.lowerBound / windowSize
             let endWindow = min(windowIsSilent.count, (range.upperBound + windowSize - 1) / windowSize)
-            guard startWindow < endWindow else { return true }
-            return windowIsSilent[startWindow..<endWindow].allSatisfy { $0 }
+            guard startWindow < endWindow else { return false }
+            let nonSilentCount = windowIsSilent[startWindow..<endWindow].reduce(0) { $0 + ($1 ? 0 : 1) }
+            return nonSilentCount >= max(1, signalMinWindows)
         }
 
         var segments: [AudioSegment] = []
@@ -78,7 +97,7 @@ enum PauseSegmenter {
             guard end > segmentStartSample else { return false }
             let range = segmentStartSample..<end
             segments.append(AudioSegment(samples: Array(samples[range]),
-                                         hasSignal: !allWindowsSilent(in: range)))
+                                         hasSignal: hasSignal(in: range)))
             segmentStartSample = end
             return true
         }
@@ -95,27 +114,29 @@ enum PauseSegmenter {
 
             let currentSegmentLength = sampleIndex(forWindow: windowIndex + 1) - segmentStartSample
 
-            var madeAnycut = false
+            var madeAnyCut = false
 
             if let runStart = silentRunStart,
                (windowIndex - runStart + 1) >= pauseWindowCount,
                currentSegmentLength >= minSegmentSamples {
                 // A long-enough pause, and the segment so far is already
-                // substantial — cut at the START of the silent run so the
-                // pause itself doesn't get glued onto either segment.
+                // substantial — cut at the START of the silent run, so the
+                // segment that just ended carries no trailing silence and
+                // the pause itself becomes the leading silence of the NEXT
+                // segment (harmless there; ASR ignores leading quiet).
                 if makeSegment(endSample: sampleIndex(forWindow: runStart)) {
                     silentRunStart = nil
-                    madeAnycut = true
+                    madeAnyCut = true
                 }
             }
 
-            if !madeAnycut && currentSegmentLength >= maxSegmentSamples {
+            if !madeAnyCut && currentSegmentLength >= maxSegmentSamples {
                 // No qualifying pause arrived before the safety cap — force
                 // a cut here so a single unbroken run of speech can never
                 // exceed the cap.
                 if makeSegment(endSample: sampleIndex(forWindow: windowIndex + 1)) {
                     silentRunStart = nil
-                    madeAnycut = true
+                    madeAnyCut = true
                 }
             }
 
