@@ -11106,8 +11106,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 }
                 let duration = Double(samples.count) / SAMPLE_RATE
                 let requestedAt = ProcessInfo.processInfo.systemUptime
-                let transcription = try await asr.transcribe(
+                let transcription = try await transcribeSegmented(
                     samples: samples,
+                    worker: asr,
                     language: settings.dictationLanguage,
                     // Recovered audio is from a *previous* session — the
                     // keyboard layout active right now at recovery time has
@@ -11135,7 +11136,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                          audioSeconds: duration,
                                          asrSeconds: timing.totalSeconds)
                 }
-                PendingDictationRecovery.remove(url)
+                if transcription.hadSegmentFailure {
+                    log("pending dictation recovery lost part of its audio after retry — leaving \(url.lastPathComponent) in place for the next launch")
+                } else {
+                    PendingDictationRecovery.remove(url)
+                }
                 log("pending dictation recovered: \(String(format: "%.2f", duration)) s audio → \(String(format: "%.2f", timing.totalSeconds)) s → \(processed.text.count) chars in history")
             } catch {
                 log("pending dictation recovery deferred: \(error.localizedDescription)")
