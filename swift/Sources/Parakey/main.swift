@@ -6094,6 +6094,14 @@ fileprivate func transcribeSegmented(
         return result.text
     }
 
+    // `transcribeSegments` deliberately absorbs per-segment throws so one
+    // bad segment can't discard the rest of the dictation, which would
+    // otherwise make the underlying engine error unreachable by every
+    // caller. Surface it here, once, for all three call sites.
+    if let lastErrorDescription = outcome.lastErrorDescription {
+        log("segmented transcription ASR error: \(lastErrorDescription)")
+    }
+
     return TranscriptionWorkerResult(
         text: outcome.text,
         workerQueueSeconds: firstWorkerQueueSeconds,
@@ -21683,6 +21691,54 @@ private enum ParakeySelfTest {
         }
         try expect(throwCallCount, equals: 2, "a throwing segment is retried exactly once, same as empty text")
         try expect(throwOutcome.hadSegmentFailure, equals: true, "a segment that keeps throwing is flagged as a failure")
+        try expect(throwOutcome.lastErrorDescription != nil, equals: true,
+                   "a thrown error's description is surfaced for logging")
+
+        // REGRESSION GUARD: a segment with NO detected signal whose closure
+        // THROWS is a broken engine, not legitimate silence. It must still be
+        // retried and must still be flagged as a failure — otherwise a
+        // recording where every segment fell under the RMS threshold (or a
+        // nil engine) silently deletes the user's recovery audio with no
+        // failure signal at all, which is the exact bug this feature exists
+        // to prevent.
+        let silentThrowing: [AudioSegment] = [AudioSegment(samples: [0.0], hasSignal: false)]
+        nonisolated(unsafe) var silentThrowCallCount = 0
+        struct EngineUnavailable: LocalizedError {
+            var errorDescription: String? { "engine unavailable" }
+        }
+        let silentThrowOutcome = try runParakeetEngineSynchronously {
+            await transcribeSegments(silentThrowing) { _ in
+                silentThrowCallCount += 1
+                throw EngineUnavailable()
+            }
+        }
+        try expect(silentThrowCallCount, equals: 2,
+                   "a THROWING segment is retried even when it carries no detected signal")
+        try expect(silentThrowOutcome.hadSegmentFailure, equals: true,
+                   "a throw is never treated as legitimate silence, even with hasSignal == false")
+        try expect(silentThrowOutcome.lastErrorDescription ?? "", equals: "engine unavailable",
+                   "the most recent thrown error's description is captured verbatim")
+
+        // A throw whose retry SUCCEEDS is not a failure — but the error is
+        // still reported so it can be logged. Non-nil error != failure.
+        let throwThenSucceed: [AudioSegment] = [AudioSegment(samples: [0.1], hasSignal: true)]
+        nonisolated(unsafe) var mixedCallCount = 0
+        let mixedOutcome = try runParakeetEngineSynchronously {
+            await transcribeSegments(throwThenSucceed) { _ in
+                mixedCallCount += 1
+                if mixedCallCount == 1 { throw EngineUnavailable() }
+                return "second try"
+            }
+        }
+        try expect(mixedOutcome.text, equals: "second try", "a throw whose retry succeeds keeps its text")
+        try expect(mixedOutcome.hadSegmentFailure, equals: false,
+                   "a throw whose retry succeeds is not a failure")
+        try expect(mixedOutcome.lastErrorDescription ?? "", equals: "engine unavailable",
+                   "a recovered throw still reports its error for logging")
+
+        // Nothing ever threw -> no error description at all.
+        try expect(okOutcome.lastErrorDescription == nil, equals: true,
+                   "lastErrorDescription is nil when no call ever threw")
     }
 
     // MARK: - Parakeet CPU integration (spec §18.2 — real model, opt-in via env var)
