@@ -109,6 +109,11 @@ static void whisper_log_internal(ggml_log_level level, const char * format, ...)
 static void whisper_log_callback_default(ggml_log_level level, const char * text, void * user_data) {
     (void) level;
     (void) user_data;
+#ifndef WHISPER_DEBUG
+    if (level == GGML_LOG_LEVEL_DEBUG) {
+        return;
+    }
+#endif
     fputs(text, stderr);
     fflush(stderr);
 }

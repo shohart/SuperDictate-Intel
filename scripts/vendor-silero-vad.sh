@@ -35,11 +35,15 @@
 #      read_safe(), whisper_context_params + whisper_context_default_params).
 #      These are not mechanically extracted because they are NOT contiguous
 #      with the VAD block and are shared verbatim with whisper.cpp's ASR
-#      code — see WHISPER_VAD_SHARED_HELPERS.md in the generated tree for
-#      the exact upstream symbol list and file:line at the pinned commit.
-#      This script verifies each helper's exact signature still exists in
-#      the freshly fetched upstream source before writing the vendored
-#      copy, so silent drift is caught (FATAL) rather than shipped stale.
+#      code — see PROVENANCE.md in the generated tree, and this script's
+#      REQUIRED_HELPER_SIGNATURES/CHECKS tables, for the exact upstream
+#      symbol list at the pinned commit. This script verifies (a) each
+#      helper's declaration/signature still exists verbatim in the freshly
+#      fetched upstream source (Step 3 below), and (b) each helper's full
+#      BODY still matches upstream token-for-token after stripping comments
+#      and whitespace (Step 4b below, after the vendored files are written)
+#      — so silent drift, whether in a signature or inside a function body,
+#      is caught (FATAL) rather than shipped stale.
 set -euo pipefail
 
 SILERO_VAD_SOURCE_COMMIT="4523d0ce373ee4b2176b3251fff29fd4864fcf38"
@@ -50,17 +54,19 @@ SILERO_VAD_SOURCE_REMOTE="https://github.com/ggml-org/whisper.cpp.git"
 # resolved SHA is verified to match this constant before anything is
 # extracted).
 
-SILERO_VAD_MODEL_URL="https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v6.2.0.bin"
+SILERO_VAD_MODEL_REVISION="9ffd54a1e1ee413ddf265af9913beaf518d1639b"
+SILERO_VAD_MODEL_URL="https://huggingface.co/ggml-org/whisper-vad/resolve/${SILERO_VAD_MODEL_REVISION}/ggml-silero-v6.2.0.bin"
 SILERO_VAD_MODEL_SHA256="2aa269b785eeb53a82983a20501ddf7c1d9c48e33ab63a41391ac6c9f7fb6987"
 SILERO_VAD_MODEL_SIZE_BYTES=885098
 # Verified by downloading the file and independently computing sha256sum on
-# 2026-07-30 (not copied from any cached research note). Pinned to the
-# immutable per-file resolve URL of a specific filename in the ggml-org/
-# whisper-vad model repo (not `main`/`latest` in the sense of a moving ref —
-# HF resolve URLs by filename are effectively content-addressed for a given
-# repo state; the sha256/size check below is the actual integrity guarantee
-# regardless). v6.2.0 chosen over v5.1.2 (same repo, same byte size) as the
-# newer Silero VAD model generation.
+# 2026-07-30 (not copied from any cached research note). Pinned to a specific
+# HF revision commit (repo ggml-org/whisper-vad, lastModified 2025-11-17),
+# NOT `main`/`latest` -- matching both this task's brief ("immutable URL, no
+# main/latest") and this project's own established convention for the
+# Parakeet model itself (see PARAKEET_MODEL_REVISION in
+# swift/Sources/Parakey/main.swift). The file bytes are identical to what was
+# hashed above (same content, only the URL's ref changed from a floating
+# branch name to an immutable revision SHA).
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST="$ROOT_DIR/swift/Sources/parakeet_cpp/upstream-vad"
@@ -176,7 +182,6 @@ echo "vendor-silero-vad.sh: all shared-helper signatures verified present at $AC
 # Step 4: assemble the vendored tree.
 # ---------------------------------------------------------------------------
 
-cp "$ARCH_BLOCK" "$DEST/whisper_vad_arch.h"
 # Prepend a small header to the extracted arch block.
 cat > "$DEST/whisper_vad_arch.h.tmp" <<'EOF'
 // Extracted verbatim (mechanically, via scripts/vendor-silero-vad.sh) from
@@ -440,6 +445,11 @@ static void whisper_log_internal(ggml_log_level level, const char * format, ...)
 static void whisper_log_callback_default(ggml_log_level level, const char * text, void * user_data) {
     (void) level;
     (void) user_data;
+#ifndef WHISPER_DEBUG
+    if (level == GGML_LOG_LEVEL_DEBUG) {
+        return;
+    }
+#endif
     fputs(text, stderr);
     fflush(stderr);
 }
@@ -724,6 +734,229 @@ static void read_safe(whisper_model_loader * loader, T & dest) {
 EOF
 cat "$VAD_BLOCK" >> "$DEST/whisper_vad.cpp"
 
+# ---------------------------------------------------------------------------
+# Step 4b: body-level drift detection for the hand-transcribed helpers.
+#
+# Step 3 above only checked each helper's DECLARATION/signature line, which
+# cannot catch drift inside a function BODY (a real incident: an earlier
+# version of this script hand-transcribed whisper_log_callback_default()
+# with an identical signature but had silently dropped the
+# `#ifndef WHISPER_DEBUG ... return; #endif` guard from its body -- the
+# signature-only gate above passed even though the vendored copy was
+# behaviorally wrong). This step brace-matches each hand-transcribed
+# helper's full body (from its first `{` to the matching `}`, skipping
+# braces inside string/char literals and comments) out of BOTH the freshly
+# fetched upstream source and the just-written $DEST files, strips comments,
+# collapses whitespace, and compares the two token streams -- so
+# indentation/formatting differences (expected, since these are
+# hand-transcribed, not sed-extracted) are tolerated, but any real code
+# difference (a missing branch, a changed constant, a dropped guard) is
+# FATAL.
+# ---------------------------------------------------------------------------
+VERIFY_HELPER_BODIES_PY="$WORK_DIR/verify_helper_bodies.py"
+cat > "$VERIFY_HELPER_BODIES_PY" <<'PYEOF'
+import sys
+
+def extract_body(text, marker):
+    idx = text.find(marker)
+    if idx == -1:
+        return None
+    brace_start = text.find('{', idx)
+    if brace_start == -1:
+        return None
+    depth = 0
+    i = brace_start
+    n = len(text)
+    in_string = in_char = in_line_comment = in_block_comment = False
+    while i < n:
+        c = text[i]
+        if in_line_comment:
+            if c == '\n':
+                in_line_comment = False
+        elif in_block_comment:
+            if c == '*' and i + 1 < n and text[i+1] == '/':
+                in_block_comment = False
+                i += 1
+        elif in_string:
+            if c == '\\':
+                i += 1
+            elif c == '"':
+                in_string = False
+        elif in_char:
+            if c == '\\':
+                i += 1
+            elif c == "'":
+                in_char = False
+        else:
+            if c == '/' and i + 1 < n and text[i+1] == '/':
+                in_line_comment = True
+            elif c == '/' and i + 1 < n and text[i+1] == '*':
+                in_block_comment = True
+                i += 1
+            elif c == '"':
+                in_string = True
+            elif c == "'":
+                in_char = True
+            elif c == '{':
+                depth += 1
+            elif c == '}':
+                depth -= 1
+                if depth == 0:
+                    return text[brace_start:i+1]
+        i += 1
+    return None
+
+def strip_comments(body):
+    out = []
+    i = 0
+    n = len(body)
+    in_string = in_char = in_line_comment = in_block_comment = False
+    while i < n:
+        c = body[i]
+        if in_line_comment:
+            if c == '\n':
+                in_line_comment = False
+        elif in_block_comment:
+            if c == '*' and i + 1 < n and body[i+1] == '/':
+                in_block_comment = False
+                i += 1
+        elif in_string:
+            out.append(c)
+            if c == '\\':
+                if i + 1 < n:
+                    out.append(body[i+1])
+                i += 1
+            elif c == '"':
+                in_string = False
+        elif in_char:
+            out.append(c)
+            if c == '\\':
+                if i + 1 < n:
+                    out.append(body[i+1])
+                i += 1
+            elif c == "'":
+                in_char = False
+        else:
+            if c == '/' and i + 1 < n and body[i+1] == '/':
+                in_line_comment = True
+            elif c == '/' and i + 1 < n and body[i+1] == '*':
+                in_block_comment = True
+                i += 1
+            elif c == '"':
+                in_string = True
+                out.append(c)
+            elif c == "'":
+                in_char = True
+                out.append(c)
+            else:
+                out.append(c)
+        i += 1
+    return ''.join(out)
+
+def normalize(body):
+    return ' '.join(strip_comments(body).split())
+
+def main():
+    whisper_cpp_path, whisper_h_path, dest_cpp_path, dest_h_path, checks_path = sys.argv[1:6]
+    upstream_text = {
+        'cpp': open(whisper_cpp_path, encoding='utf-8').read(),
+        'h':   open(whisper_h_path, encoding='utf-8').read(),
+    }
+    dest_text = {
+        'cpp': open(dest_cpp_path, encoding='utf-8').read(),
+        'h':   open(dest_h_path, encoding='utf-8').read(),
+    }
+    failures = []
+    checks = 0
+    with open(checks_path, encoding='utf-8') as f:
+        # Each check is 3 lines: name, "upstream_kind our_kind", marker
+        # (marker may itself be empty lines are not used as separators
+        # within a marker -- markers are single logical lines here, joined
+        # with the literal sequence \n where a real newline is needed).
+        lines = f.read().split('\x00')
+    for rec in lines:
+        if not rec.strip():
+            continue
+        name, kinds, marker = rec.split('\x01', 2)
+        up_kind, our_kind = kinds.split(' ')
+        marker = marker.replace('\\n', '\n')
+        checks += 1
+        up_body = extract_body(upstream_text[up_kind], marker)
+        our_body = extract_body(dest_text[our_kind], marker)
+        if up_body is None:
+            failures.append(f"{name}: marker not found in freshly fetched upstream source (upstream drifted -- update this script's CHECKS table)")
+            continue
+        if our_body is None:
+            failures.append(f"{name}: marker not found in vendored output (generation bug in this script)")
+            continue
+        if normalize(up_body) != normalize(our_body):
+            failures.append(f"{name}: BODY MISMATCH between upstream and vendored copy (code-level drift, not just formatting)\n  --- upstream (normalized) ---\n  {normalize(up_body)[:400]}\n  --- vendored (normalized) ---\n  {normalize(our_body)[:400]}")
+    if failures:
+        sys.stderr.write("vendor-silero-vad.sh: FATAL: %d/%d hand-transcribed helper bodies failed drift verification:\n\n" % (len(failures), checks))
+        for msg in failures:
+            sys.stderr.write(msg + "\n\n")
+        sys.exit(1)
+    sys.stdout.write("vendor-silero-vad.sh: all %d hand-transcribed helper BODIES verified byte-for-token-identical to upstream at pin time\n" % checks)
+
+if __name__ == '__main__':
+    main()
+PYEOF
+
+# CHECKS table: name \x01 "<upstream_kind> <our_kind>" \x01 marker, records
+# separated by \x00. upstream_kind/our_kind are 'cpp' (src/whisper.cpp) or
+# 'h' (include/whisper.h); our_kind reflects where THIS script placed the
+# hand-transcribed copy (whisper_context_params and friends live inside
+# whisper_vad.cpp even though upstream declares them in whisper.h, since
+# they are internal-only here, not part of the public whisper_vad.h API).
+CHECKS_FILE="$WORK_DIR/checks.txt"
+python3 - "$CHECKS_FILE" <<'PYEOF'
+import sys
+checks = [
+    ("whisper_log_internal (definition)", "cpp", "cpp",
+     "static void whisper_log_internal(ggml_log_level level, const char * format, ...) {"),
+    ("whisper_log_callback_default", "cpp", "cpp",
+     "static void whisper_log_callback_default(ggml_log_level level, const char * text, void * user_data) {"),
+    ("format()", "cpp", "cpp",
+     "static std::string format(const char * fmt, ...) {"),
+    ("ggml_graph_compute_helper (sched overload)", "cpp", "cpp",
+     "static bool ggml_graph_compute_helper(\\n      ggml_backend_sched_t   sched,"),
+    ("whisper_sched struct", "cpp", "cpp",
+     "struct whisper_sched {"),
+    ("whisper_sched_size", "cpp", "cpp",
+     "static size_t whisper_sched_size(struct whisper_sched & allocr) {"),
+    ("whisper_sched_graph_init", "cpp", "cpp",
+     "static bool whisper_sched_graph_init(struct whisper_sched & allocr, std::vector<ggml_backend_t> backends, std::function<struct ggml_cgraph *()> && get_graph) {"),
+    ("make_buft_list", "cpp", "cpp",
+     "static buft_list_t make_buft_list(whisper_context_params & params) {"),
+    ("whisper_backend_init_gpu", "cpp", "cpp",
+     "static ggml_backend_t whisper_backend_init_gpu(const whisper_context_params & params) {"),
+    ("whisper_backend_init", "cpp", "cpp",
+     "static std::vector<ggml_backend_t> whisper_backend_init(const whisper_context_params & params) {"),
+    ("read_safe<T>", "cpp", "cpp",
+     "static void read_safe(whisper_model_loader * loader, T & dest) {"),
+    ("whisper_context_default_params", "cpp", "cpp",
+     "struct whisper_context_params whisper_context_default_params() {"),
+    ("whisper_context_params struct", "h", "cpp",
+     "struct whisper_context_params {"),
+    ("whisper_model_loader typedef", "h", "h",
+     "typedef struct whisper_model_loader {"),
+    ("whisper_alignment_heads_preset enum", "h", "cpp",
+     "enum whisper_alignment_heads_preset {"),
+    ("whisper_ahead struct", "h", "cpp",
+     "typedef struct whisper_ahead {"),
+    ("whisper_aheads struct", "h", "cpp",
+     "typedef struct whisper_aheads {"),
+]
+out_path = sys.argv[1]
+with open(out_path, "w", encoding="utf-8") as f:
+    records = []
+    for name, up_kind, our_kind, marker in checks:
+        records.append(name + "\x01" + up_kind + " " + our_kind + "\x01" + marker)
+    f.write("\x00".join(records))
+PYEOF
+
+python3 "$VERIFY_HELPER_BODIES_PY" "$WHISPER_CPP" "$WHISPER_H" "$DEST/whisper_vad.cpp" "$DEST/include/whisper_vad.h" "$CHECKS_FILE"
+
 # --- provenance metadata (generated, never hand-edited) ---
 cat > "$DEST/PROVENANCE.md" <<EOF
 # Vendored upstream provenance (generated by scripts/vendor-silero-vad.sh)
@@ -761,6 +994,29 @@ Do not hand-edit anything under this directory — re-run the vendor script.
     preserved verbatim) but trimmed to be self-contained — it does not
     include the rest of \`whisper.h\`'s much larger ASR-oriented public API
     surface, which this project does not vendor.
+- Hand-transcribed shared-helper upstream locations at the pinned commit
+  (each verified — signature AND body, see the vendor script's Step 3 /
+  Step 4b — against the freshly fetched source before being written; use
+  these file:line references to audit \`whisper_vad.cpp\`'s "Part 1" section
+  by eye against a real \`src/whisper.cpp\`/\`include/whisper.h\` checkout at
+  this commit):
+  - \`whisper_log_internal\` — \`src/whisper.cpp:9161\` (forward-declared \`:118\`)
+  - \`whisper_log_callback_default\` — \`src/whisper.cpp:9178\`
+  - \`format()\` — \`src/whisper.cpp:146\`
+  - \`ggml_graph_compute_helper\` (sched overload) — \`src/whisper.cpp:190\`
+  - \`whisper_sched\` struct — \`src/whisper.cpp:538\`
+  - \`whisper_sched_size\` — \`src/whisper.cpp:544\`
+  - \`whisper_sched_graph_init\` — \`src/whisper.cpp:554\`
+  - \`make_buft_list\` (+ \`buft_list_t\`) — \`src/whisper.cpp:1361,1363\`
+  - \`whisper_backend_init_gpu\` — \`src/whisper.cpp:1290\`
+  - \`whisper_backend_init\` — \`src/whisper.cpp:1329\`
+  - \`read_safe<T>()\` — \`src/whisper.cpp:963\`
+  - \`whisper_context_default_params\` — \`src/whisper.cpp:3606\`
+  - \`whisper_context_params\` struct — \`include/whisper.h:116\`
+  - \`whisper_model_loader\` typedef — \`include/whisper.h:153\`
+  - \`whisper_alignment_heads_preset\` enum — \`include/whisper.h:88\`
+  - \`whisper_ahead\` struct — \`include/whisper.h:106\`
+  - \`whisper_aheads\` struct — \`include/whisper.h:111\`
 - NOT extracted / explicitly out of scope: anything related to
   mel-spectrogram computation, the ASR encoder/decoder graph, KV-cache,
   beam search/decoding, grammar, DTW token alignment, or any other

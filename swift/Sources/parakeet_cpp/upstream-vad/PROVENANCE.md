@@ -33,6 +33,29 @@ Do not hand-edit anything under this directory — re-run the vendor script.
     preserved verbatim) but trimmed to be self-contained — it does not
     include the rest of `whisper.h`'s much larger ASR-oriented public API
     surface, which this project does not vendor.
+- Hand-transcribed shared-helper upstream locations at the pinned commit
+  (each verified — signature AND body, see the vendor script's Step 3 /
+  Step 4b — against the freshly fetched source before being written; use
+  these file:line references to audit `whisper_vad.cpp`'s "Part 1" section
+  by eye against a real `src/whisper.cpp`/`include/whisper.h` checkout at
+  this commit):
+  - `whisper_log_internal` — `src/whisper.cpp:9161` (forward-declared `:118`)
+  - `whisper_log_callback_default` — `src/whisper.cpp:9178`
+  - `format()` — `src/whisper.cpp:146`
+  - `ggml_graph_compute_helper` (sched overload) — `src/whisper.cpp:190`
+  - `whisper_sched` struct — `src/whisper.cpp:538`
+  - `whisper_sched_size` — `src/whisper.cpp:544`
+  - `whisper_sched_graph_init` — `src/whisper.cpp:554`
+  - `make_buft_list` (+ `buft_list_t`) — `src/whisper.cpp:1361,1363`
+  - `whisper_backend_init_gpu` — `src/whisper.cpp:1290`
+  - `whisper_backend_init` — `src/whisper.cpp:1329`
+  - `read_safe<T>()` — `src/whisper.cpp:963`
+  - `whisper_context_default_params` — `src/whisper.cpp:3606`
+  - `whisper_context_params` struct — `include/whisper.h:116`
+  - `whisper_model_loader` typedef — `include/whisper.h:153`
+  - `whisper_alignment_heads_preset` enum — `include/whisper.h:88`
+  - `whisper_ahead` struct — `include/whisper.h:106`
+  - `whisper_aheads` struct — `include/whisper.h:111`
 - NOT extracted / explicitly out of scope: anything related to
   mel-spectrogram computation, the ASR encoder/decoder graph, KV-cache,
   beam search/decoding, grammar, DTW token alignment, or any other
@@ -59,7 +82,7 @@ Do not hand-edit anything under this directory — re-run the vendor script.
 - Model: https://huggingface.co/ggml-org/whisper-vad (MIT-licensed repo),
   converted from `snakers4/silero-vad` (MIT-licensed) PyTorch weights by
   whisper.cpp's own `models/convert-silero-vad-to-ggml.py`.
-  - URL: https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v6.2.0.bin
+  - URL: https://huggingface.co/ggml-org/whisper-vad/resolve/9ffd54a1e1ee413ddf265af9913beaf518d1639b/ggml-silero-v6.2.0.bin
   - SHA-256: 2aa269b785eeb53a82983a20501ddf7c1d9c48e33ab63a41391ac6c9f7fb6987
   - Size: 885098 bytes
   - Verified by downloading the file and independently computing
@@ -90,4 +113,4 @@ Do not hand-edit anything under this directory — re-run the vendor script.
   to that task's implementer.
 - License: both whisper.cpp and Silero VAD are MIT-licensed. See
   `LICENSE-whisper-cpp.txt` and `LICENSE-silero-vad.txt` in this directory.
-- Vendored on: 2026-07-30T21:31:25Z
+- Vendored on: 2026-07-30T21:51:10Z
