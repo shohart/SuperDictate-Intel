@@ -12680,7 +12680,17 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         let historyCompletedAt = ProcessInfo.processInfo.systemUptime
 
                         let journalCleanupStartedAt = ProcessInfo.processInfo.systemUptime
-                        PendingDictationRecovery.remove(captured.recoveryURL)
+                        if completed.transcription.hadSegmentFailure {
+                            // At least one signal-bearing segment was lost
+                            // even after retry, even though other segments
+                            // produced text that's about to be inserted
+                            // below. Keep the recovery audio on disk so the
+                            // lost portion isn't unrecoverable — same
+                            // retention rule as the fully-empty case below.
+                            log("dictation partially lost: some segments failed after retry from \(String(format: "%.2f", dur)) s audio — recovery audio retained at \(captured.recoveryURL?.path ?? "?")")
+                        } else {
+                            PendingDictationRecovery.remove(captured.recoveryURL)
+                        }
                         let journalCleanupCompletedAt = ProcessInfo.processInfo.systemUptime
 
                         let permissionRecheckStartedAt = ProcessInfo.processInfo.systemUptime
