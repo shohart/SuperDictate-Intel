@@ -73,13 +73,14 @@ enum PauseSegmenter {
         var segments: [AudioSegment] = []
         var segmentStartSample = 0
 
-        func makeSegment(endSample: Int) {
+        func makeSegment(endSample: Int) -> Bool {
             let end = min(endSample, samples.count)
-            guard end > segmentStartSample else { return }
+            guard end > segmentStartSample else { return false }
             let range = segmentStartSample..<end
             segments.append(AudioSegment(samples: Array(samples[range]),
                                          hasSignal: !allWindowsSilent(in: range)))
             segmentStartSample = end
+            return true
         }
 
         var windowIndex = 0
@@ -100,14 +101,16 @@ enum PauseSegmenter {
                 // A long-enough pause, and the segment so far is already
                 // substantial — cut at the START of the silent run so the
                 // pause itself doesn't get glued onto either segment.
-                makeSegment(endSample: sampleIndex(forWindow: runStart))
-                silentRunStart = nil
+                if makeSegment(endSample: sampleIndex(forWindow: runStart)) {
+                    silentRunStart = nil
+                }
             } else if currentSegmentLength >= maxSegmentSamples {
                 // No qualifying pause arrived before the safety cap — force
                 // a cut here so a single unbroken run of speech can never
                 // exceed the cap.
-                makeSegment(endSample: sampleIndex(forWindow: windowIndex + 1))
-                silentRunStart = nil
+                if makeSegment(endSample: sampleIndex(forWindow: windowIndex + 1)) {
+                    silentRunStart = nil
+                }
             }
 
             windowIndex += 1
