@@ -17003,6 +17003,8 @@ private enum ParakeySelfTest {
             return runSuite("text-insertion-routing", testTextInsertionRouting)
         case "parakeet-bridge":
             return runSuite("parakeet-bridge", testParakeetBridge)
+        case "pause-segmentation":
+            return runSuite("pause-segmentation", testPauseSegmentation)
         case "parakeet-cpu":
             return runSuite("parakeet-cpu", testParakeetCPUIntegration)
         case "parakeet-text-repair":
@@ -17078,6 +17080,7 @@ private enum ParakeySelfTest {
         try testRussianNumberITNPunctuation()
         try testProcessedDictationTextITN()
         try testParakeetBridge()
+        try testPauseSegmentation()
     }
 
     /// Covers `textInsertionRoute(for:targetElementStillValid:)` — the
@@ -21344,6 +21347,70 @@ private enum ParakeySelfTest {
                    "pinned Parakeet model SHA-256 must match the value verified in Phase 2")
         try expect(PARAKEET_MODEL_FILENAME, equals: "tdt-0.6b-v3-q8_0.gguf",
                    "pinned Parakeet model filename must not drift silently")
+    }
+
+    /// Pure algorithm coverage for `PauseSegmenter.segment` — no model, no
+    /// audio hardware. Every case asserts the coverage invariant (segments
+    /// exactly tile the input, no samples dropped or duplicated) plus the
+    /// specific behavior under test.
+    private static func testPauseSegmentation() throws {
+        let sampleRate = 16_000.0
+
+        // Empty input -> no segments.
+        try expect(PauseSegmenter.segment(samples: [], sampleRate: sampleRate).count,
+                   equals: 0, "empty input produces zero segments")
+
+        // Short, uninterrupted "speech" (no silence anywhere) well under
+        // both the min and max thresholds -> exactly one segment, and nothing
+        // is dropped.
+        let shortSpeech = [Float](repeating: 0.2, count: Int(2.0 * sampleRate))
+        let shortSegments = PauseSegmenter.segment(samples: shortSpeech, sampleRate: sampleRate)
+        try expect(shortSegments.count, equals: 1, "short uninterrupted speech stays a single segment")
+        try expect(shortSegments.reduce(0) { $0 + $1.samples.count }, equals: shortSpeech.count,
+                   "single-segment case preserves every sample")
+        try expect(shortSegments[0].hasSignal, equals: true, "non-silent audio is flagged as having signal")
+
+        // Continuous non-silent audio longer than the safety cap -> forced
+        // cuts, no segment exceeds the cap, and total sample count is
+        // preserved exactly (coverage invariant).
+        let longSpeech = [Float](repeating: 0.2, count: Int(70.0 * sampleRate))
+        let longSegments = PauseSegmenter.segment(samples: longSpeech, sampleRate: sampleRate,
+                                                   maxSegmentSeconds: 25.0)
+        try expect(longSegments.count >= 3, equals: true,
+                   "70s of unbroken speech with a 25s cap forces at least 3 segments")
+        let maxAllowedSamples = Int(25.0 * sampleRate)
+        for seg in longSegments {
+            try expect(seg.samples.count <= maxAllowedSamples, equals: true,
+                       "no forced segment exceeds the safety cap")
+        }
+        try expect(longSegments.reduce(0) { $0 + $1.samples.count }, equals: longSpeech.count,
+                   "forced-cut segments cover the whole buffer with no gaps or overlap")
+
+        // A qualifying pause (600ms of silence) placed after 5s of speech,
+        // followed by 5 more seconds of speech -> exactly two segments,
+        // split at the pause, nothing dropped.
+        var withPause = [Float](repeating: 0.2, count: Int(5.0 * sampleRate))
+        withPause.append(contentsOf: [Float](repeating: 0.0, count: Int(0.6 * sampleRate)))
+        withPause.append(contentsOf: [Float](repeating: 0.2, count: Int(5.0 * sampleRate)))
+        let pausedSegments = PauseSegmenter.segment(samples: withPause, sampleRate: sampleRate)
+        try expect(pausedSegments.count, equals: 2, "a qualifying pause after the minimum splits into two segments")
+        try expect(pausedSegments.reduce(0) { $0 + $1.samples.count }, equals: withPause.count,
+                   "pause-split segments cover the whole buffer with no gaps or overlap")
+
+        // A pause shorter than the 3s minimum segment length is NOT a
+        // qualifying cut point -> stays a single segment.
+        var earlyPause = [Float](repeating: 0.2, count: Int(1.0 * sampleRate))
+        earlyPause.append(contentsOf: [Float](repeating: 0.0, count: Int(0.6 * sampleRate)))
+        earlyPause.append(contentsOf: [Float](repeating: 0.2, count: Int(1.0 * sampleRate)))
+        let earlyPauseSegments = PauseSegmenter.segment(samples: earlyPause, sampleRate: sampleRate)
+        try expect(earlyPauseSegments.count, equals: 1,
+                   "a pause before the minimum segment length is not a qualifying cut point")
+
+        // All-silent buffer -> a single segment flagged as having no signal.
+        let silence = [Float](repeating: 0.0, count: Int(4.0 * sampleRate))
+        let silentSegments = PauseSegmenter.segment(samples: silence, sampleRate: sampleRate)
+        try expect(silentSegments.count, equals: 1, "an all-silent buffer stays a single segment")
+        try expect(silentSegments[0].hasSignal, equals: false, "an all-silent segment is flagged as having no signal")
     }
 
     // MARK: - Parakeet CPU integration (spec §18.2 — real model, opt-in via env var)
