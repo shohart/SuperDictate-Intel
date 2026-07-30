@@ -5,3 +5,4 @@ dist/
 *.xcuserstate
 
 .worktrees/
+.superpowers/sdd/

@@ -91,16 +91,21 @@ candidate pause boundary is a run of low-RMS windows lasting at least
 clauses rather than between words or a normal breath pause.
 
 **Cut rule.** Grow the current segment until either:
-- a candidate pause boundary is found and the segment has reached a
-  reasonable minimum size (avoid over-fragmenting on every short pause), or
+- a candidate pause boundary is found and the segment has already reached
+  a substantial minimum size (15s as shipped —
+  `PauseSegmenter.defaultMinSegmentSeconds`; large on purpose, so an
+  ordinary dictation's normal inter-sentence pauses can't fragment it), or
 - the segment reaches a safety cap (~25s, chosen with margin below the
   empirically-observed ~30-40s danger zone) — if no pause boundary has
   occurred by the cap, force a cut at the cap so a single unbroken speech
   run longer than the cap still can't reach the expensive compute regime.
 
-**Recordings shorter than the cap** produce exactly one segment — i.e., the
-overwhelming majority of everyday dictations go through the ASR exactly
-once, exactly as today, with no behavior change and no added latency.
+**Recordings shorter than the 15s minimum segment length** produce exactly
+one segment — no pause in them is ever a cut point. So the overwhelming
+majority of everyday dictations go through the ASR exactly once, exactly as
+today, with no behavior change and no added latency. Beyond 15s a recording
+is split only at genuine pauses, and only past the ~25s cap is a cut ever
+forced without one.
 
 ### 2. Sequential per-segment transcription (modified call site)
 

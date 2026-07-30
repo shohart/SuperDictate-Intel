@@ -4887,18 +4887,57 @@ private struct CapturedRecording {
 
 private enum PendingDictationRecovery {
     private static let directoryName = "PendingDictations"
+    private static let lostDirectoryName = "LostDictations"
     private static let fileExtension = "sdaudio"
     private static let magic = Data("SDAR".utf8)
 
     static func directoryURL() throws -> URL {
+        try makeDirectory(named: directoryName)
+    }
+
+    /// Sibling of `directoryURL()` holding audio whose transcription already
+    /// partially or fully FAILED. Deliberately outside the directory
+    /// `pendingURLs()` scans: the audio stays on disk so the user can still
+    /// recover it manually, but it is never auto-replayed at startup — a
+    /// recording that failed once will fail the same way every launch, and
+    /// re-running it would append the same partial text to history forever.
+    static func lostDirectoryURL() throws -> URL {
+        try makeDirectory(named: lostDirectoryName)
+    }
+
+    private static func makeDirectory(named name: String) throws -> URL {
         let url = try superDictateApplicationSupportDirectory()
-            .appendingPathComponent(directoryName, isDirectory: true)
+            .appendingPathComponent(name, isDirectory: true)
         try FileManager.default.createDirectory(at: url,
                                                 withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
         try FileManager.default.setAttributes([.posixPermissions: 0o700],
                                               ofItemAtPath: url.path)
         return url
+    }
+
+    /// Moves a recovery journal out of the auto-replayed `PendingDictations/`
+    /// directory into `LostDictations/`, returning the file's new location
+    /// (or its original location if the move couldn't be performed — the
+    /// audio is never destroyed here, and a failed move is logged rather
+    /// than fatal). Returns nil for a nil input.
+    @discardableResult
+    static func retainAsLost(_ url: URL?) -> URL? {
+        guard let url else { return nil }
+        do {
+            let destinationDirectory = try lostDirectoryURL()
+            var destination = destinationDirectory
+                .appendingPathComponent(url.lastPathComponent)
+            if FileManager.default.fileExists(atPath: destination.path) {
+                destination = destinationDirectory
+                    .appendingPathComponent("\(UUID().uuidString)-\(url.lastPathComponent)")
+            }
+            try FileManager.default.moveItem(at: url, to: destination)
+            return destination
+        } catch {
+            log("lost dictation retention failed (leaving \(url.lastPathComponent) in place): \(error.localizedDescription)")
+            return url
+        }
     }
 
     static func createJournal() throws -> PendingDictationJournal {
@@ -5633,6 +5672,12 @@ private struct TranscriptionWorkerResult: Sendable {
     let decoderPreparationSeconds: Double
     let engineCallSeconds: Double
     let engineProcessingSeconds: Double
+    /// True iff `transcribeSegmented(...)` had at least one signal-bearing
+    /// segment that stayed empty even after a retry (see
+    /// SegmentedTranscription.swift). Always false for a plain single-call
+    /// `TranscriptionWorker.transcribe(...)` result — only
+    /// `transcribeSegmented` ever sets it true.
+    var hadSegmentFailure: Bool = false
 
     func timing(totalSeconds: Double) -> ASRTimingBreakdown {
         ASRTimingBreakdown(
@@ -6003,6 +6048,68 @@ actor TranscriptionWorker {
         ready = false
         log("ASR: unloaded")
     }
+}
+
+/// Adapts `transcribeSegments` (pure orchestration) to the real
+/// `TranscriptionWorker`: splits `samples` with `PauseSegmenter`, feeds
+/// each piece through `worker.transcribe(...)` in order (the worker's own
+/// `inFlight` guard makes concurrent calls impossible anyway, so strictly
+/// sequential segment processing costs nothing extra there), and merges
+/// the per-segment `TranscriptionWorkerResult`s into one aggregate result
+/// with the same shape a single whole-buffer call would have produced —
+/// every existing caller of `TranscriptionWorker.transcribe(...)` downstream
+/// of this (post-processing, latency logging, history) needs no changes.
+/// For a recording short enough to produce exactly one segment (the
+/// overwhelming majority of dictations), this is one ASR call, identical
+/// to today's behavior.
+fileprivate func transcribeSegmented(
+    samples: [Float],
+    worker: TranscriptionWorker,
+    language: DictationLanguage?,
+    resolveViaKeyboard: Bool,
+    requestedAt: TimeInterval
+) async throws -> TranscriptionWorkerResult {
+    let segments = PauseSegmenter.segment(samples: samples, sampleRate: SAMPLE_RATE)
+
+    var totalDecoderPreparationSeconds = 0.0
+    var totalEngineCallSeconds = 0.0
+    var totalEngineProcessingSeconds = 0.0
+    var firstWorkerQueueSeconds = 0.0
+    var haveFirstTiming = false
+
+    let outcome = await transcribeSegments(segments) { segmentSamples in
+        let result = try await worker.transcribe(
+            samples: segmentSamples,
+            language: language,
+            resolveViaKeyboard: resolveViaKeyboard,
+            requestedAt: requestedAt
+        )
+        totalDecoderPreparationSeconds += result.decoderPreparationSeconds
+        totalEngineCallSeconds += result.engineCallSeconds
+        totalEngineProcessingSeconds += result.engineProcessingSeconds
+        if !haveFirstTiming {
+            firstWorkerQueueSeconds = result.workerQueueSeconds
+            haveFirstTiming = true
+        }
+        return result.text
+    }
+
+    // `transcribeSegments` deliberately absorbs per-segment throws so one
+    // bad segment can't discard the rest of the dictation, which would
+    // otherwise make the underlying engine error unreachable by every
+    // caller. Surface it here, once, for all three call sites.
+    if let lastErrorDescription = outcome.lastErrorDescription {
+        log("segmented transcription ASR error: \(lastErrorDescription)")
+    }
+
+    return TranscriptionWorkerResult(
+        text: outcome.text,
+        workerQueueSeconds: firstWorkerQueueSeconds,
+        decoderPreparationSeconds: totalDecoderPreparationSeconds,
+        engineCallSeconds: totalEngineCallSeconds,
+        engineProcessingSeconds: totalEngineProcessingSeconds,
+        hadSegmentFailure: outcome.hadSegmentFailure
+    )
 }
 
 // MARK: - Transcript corrections
@@ -11046,8 +11153,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 }
                 let duration = Double(samples.count) / SAMPLE_RATE
                 let requestedAt = ProcessInfo.processInfo.systemUptime
-                let transcription = try await asr.transcribe(
+                let transcription = try await transcribeSegmented(
                     samples: samples,
+                    worker: asr,
                     language: settings.dictationLanguage,
                     // Recovered audio is from a *previous* session — the
                     // keyboard layout active right now at recovery time has
@@ -11075,8 +11183,29 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                          audioSeconds: duration,
                                          asrSeconds: timing.totalSeconds)
                 }
-                PendingDictationRecovery.remove(url)
-                log("pending dictation recovered: \(String(format: "%.2f", duration)) s audio → \(String(format: "%.2f", timing.totalSeconds)) s → \(processed.text.count) chars in history")
+                if transcription.hadSegmentFailure {
+                    // Anything already salvaged went into history just above,
+                    // so this file must NOT stay in PendingDictations/ — it
+                    // would be re-transcribed on every future launch, fail
+                    // the same way, and append the same partial text again
+                    // each time. Move it aside instead: still on disk and
+                    // recoverable by hand, never auto-replayed.
+                    let lostURL = PendingDictationRecovery.retainAsLost(url)
+                    log("pending dictation recovery lost part of its audio after retry — moved to \(lostURL?.path ?? "?") (not retried on future launches)")
+                    // The other two failure paths call signalDictationFailure().
+                    // Here only its audible half is safe: this runs mid-startup,
+                    // where `startupStatusTitle` is overwritten milliseconds
+                    // later ("Starting audio input…"), and flashErrorFeedback()'s
+                    // auto-clear work item bails out while `isReady` is still
+                    // false — which would strand an error HUD on screen. The
+                    // error sound needs no clean-up and can't be clobbered.
+                    if settings.playFeedbackSounds {
+                        Sounds.playError()
+                    }
+                } else {
+                    PendingDictationRecovery.remove(url)
+                    log("pending dictation recovered: \(String(format: "%.2f", duration)) s audio → \(String(format: "%.2f", timing.totalSeconds)) s → \(processed.text.count) chars in history")
+                }
             } catch {
                 log("pending dictation recovery deferred: \(error.localizedDescription)")
             }
@@ -12557,9 +12686,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let transcriptionWorker = asr
         let language = settings.dictationLanguage
         let transcriptionTask = Task.detached(priority: .userInitiated) {
-            let transcription = try await transcriptionWorker.transcribe(
+            let transcription = try await transcribeSegmented(
                 samples: samples,
+                worker: transcriptionWorker,
                 language: language,
+                resolveViaKeyboard: true,
                 requestedAt: asrRequestedAt
             )
             return CompletedTranscriptionWorkerResult(
@@ -12600,6 +12731,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         log("filler words removed: \(processed.removedFillerWordCount)")
                     }
                     let cleaned = processed.text
+                    if completed.transcription.hadSegmentFailure {
+                        dictationFailed = true
+                    }
                     log("\(String(format: "%.2f", dur)) s audio → \(String(format: "%.2f", asrTiming.totalSeconds)) s → \(cleaned.count) chars")
                     if !cleaned.isEmpty {
                         let historyStartedAt = ProcessInfo.processInfo.systemUptime
@@ -12615,7 +12749,21 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         let historyCompletedAt = ProcessInfo.processInfo.systemUptime
 
                         let journalCleanupStartedAt = ProcessInfo.processInfo.systemUptime
-                        PendingDictationRecovery.remove(captured.recoveryURL)
+                        if completed.transcription.hadSegmentFailure {
+                            // At least one signal-bearing segment was lost
+                            // even after retry, even though other segments
+                            // produced text that's about to be inserted
+                            // below. Keep the recovery audio on disk so the
+                            // lost portion isn't unrecoverable — same
+                            // retention rule as the fully-empty case below.
+                            // It moves to LostDictations/ so the next launch
+                            // doesn't re-transcribe it and append this same
+                            // partial text to history all over again.
+                            let lostURL = PendingDictationRecovery.retainAsLost(captured.recoveryURL)
+                            log("dictation partially lost: some segments failed after retry from \(String(format: "%.2f", dur)) s audio — recovery audio retained at \(lostURL?.path ?? "?")")
+                        } else {
+                            PendingDictationRecovery.remove(captured.recoveryURL)
+                        }
                         let journalCleanupCompletedAt = ProcessInfo.processInfo.systemUptime
 
                         let permissionRecheckStartedAt = ProcessInfo.processInfo.systemUptime
@@ -12719,7 +12867,22 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             enterDelaySeconds: enterDelaySeconds,
                             pasteSucceeded: inserted
                         ).logLine)
+                    } else if completed.transcription.hadSegmentFailure {
+                        // At least one segment that DID contain real speech
+                        // still came back empty after a retry — this is a
+                        // genuine loss, not an empty (silent) recording.
+                        // Keep the recovery audio on disk instead of
+                        // deleting it (moved to LostDictations/, so startup
+                        // never auto-replays a recording that already
+                        // failed), and make sure the user sees an error
+                        // rather than a silent return to idle.
+                        let lostURL = PendingDictationRecovery.retainAsLost(captured.recoveryURL)
+                        log("dictation lost after retry: 0 chars from \(String(format: "%.2f", dur)) s audio with real speech detected — recovery audio retained at \(lostURL?.path ?? "?")")
+                        dictationFailed = true
                     } else {
+                        // No segment had detectable speech at all — a
+                        // legitimately silent/empty recording, not a
+                        // failure. Preserve today's quiet behavior.
                         PendingDictationRecovery.remove(captured.recoveryURL)
                     }
                 }
@@ -12780,8 +12943,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             var recoveryFailed = false
             do {
                 let requestedAt = ProcessInfo.processInfo.systemUptime
-                let transcription = try await asr.transcribe(
+                let transcription = try await transcribeSegmented(
                     samples: captured.samples,
+                    worker: asr,
                     language: settings.dictationLanguage,
                     // See recoverPendingDictationsAfterStartup(): this is
                     // also recovering a previous session's audio, so the
@@ -12807,7 +12971,13 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                              audioSeconds: duration,
                                              asrSeconds: timing.totalSeconds)
                     }
-                    PendingDictationRecovery.remove(captured.recoveryURL)
+                    if transcription.hadSegmentFailure {
+                        let lostURL = PendingDictationRecovery.retainAsLost(captured.recoveryURL)
+                        log("recovered dictation lost part of its audio after retry — recovery file retained at \(lostURL?.path ?? "?")")
+                        recoveryFailed = true
+                    } else {
+                        PendingDictationRecovery.remove(captured.recoveryURL)
+                    }
                     log("recovered dictation: \(String(format: "%.2f", duration)) s audio → \(String(format: "%.2f", timing.totalSeconds)) s → \(processed.text.count) chars in history")
                 }
             } catch {
@@ -17003,6 +17173,10 @@ private enum ParakeySelfTest {
             return runSuite("text-insertion-routing", testTextInsertionRouting)
         case "parakeet-bridge":
             return runSuite("parakeet-bridge", testParakeetBridge)
+        case "pause-segmentation":
+            return runSuite("pause-segmentation", testPauseSegmentation)
+        case "segmented-transcription":
+            return runSuite("segmented-transcription", testSegmentedTranscription)
         case "parakeet-cpu":
             return runSuite("parakeet-cpu", testParakeetCPUIntegration)
         case "parakeet-text-repair":
@@ -17078,6 +17252,8 @@ private enum ParakeySelfTest {
         try testRussianNumberITNPunctuation()
         try testProcessedDictationTextITN()
         try testParakeetBridge()
+        try testPauseSegmentation()
+        try testSegmentedTranscription()
     }
 
     /// Covers `textInsertionRoute(for:targetElementStillValid:)` — the
@@ -21344,6 +21520,292 @@ private enum ParakeySelfTest {
                    "pinned Parakeet model SHA-256 must match the value verified in Phase 2")
         try expect(PARAKEET_MODEL_FILENAME, equals: "tdt-0.6b-v3-q8_0.gguf",
                    "pinned Parakeet model filename must not drift silently")
+    }
+
+    /// Pure algorithm coverage for `PauseSegmenter.segment` — no model, no
+    /// audio hardware. Every case asserts the coverage invariant (segments
+    /// exactly tile the input, no samples dropped or duplicated) plus the
+    /// specific behavior under test.
+    private static func testPauseSegmentation() throws {
+        let sampleRate = 16_000.0
+
+        // Empty input -> no segments.
+        try expect(PauseSegmenter.segment(samples: [], sampleRate: sampleRate).count,
+                   equals: 0, "empty input produces zero segments")
+
+        // Short, uninterrupted "speech" (no silence anywhere) well under
+        // both the min and max thresholds -> exactly one segment, and nothing
+        // is dropped.
+        let shortSpeech = [Float](repeating: 0.2, count: Int(2.0 * sampleRate))
+        let shortSegments = PauseSegmenter.segment(samples: shortSpeech, sampleRate: sampleRate)
+        try expect(shortSegments.count, equals: 1, "short uninterrupted speech stays a single segment")
+        try expect(shortSegments.reduce(0) { $0 + $1.samples.count }, equals: shortSpeech.count,
+                   "single-segment case preserves every sample")
+        try expect(shortSegments[0].hasSignal, equals: true, "non-silent audio is flagged as having signal")
+
+        // Continuous non-silent audio longer than the safety cap -> forced
+        // cuts, no segment exceeds the cap, and total sample count is
+        // preserved exactly (coverage invariant).
+        let longSpeech = [Float](repeating: 0.2, count: Int(70.0 * sampleRate))
+        let longSegments = PauseSegmenter.segment(samples: longSpeech, sampleRate: sampleRate,
+                                                   maxSegmentSeconds: 25.0)
+        try expect(longSegments.count >= 3, equals: true,
+                   "70s of unbroken speech with a 25s cap forces at least 3 segments")
+        let maxAllowedSamples = Int(25.0 * sampleRate)
+        for seg in longSegments {
+            try expect(seg.samples.count <= maxAllowedSamples, equals: true,
+                       "no forced segment exceeds the safety cap")
+        }
+        try expect(longSegments.reduce(0) { $0 + $1.samples.count }, equals: longSpeech.count,
+                   "forced-cut segments cover the whole buffer with no gaps or overlap")
+
+        // An ORDINARY dictation — 5s of speech, a normal 600ms
+        // inter-sentence pause, 5 more seconds (10.6s total, under the 15s
+        // minimum segment length) -> must stay ONE segment. This is the
+        // whole point of the 15s minimum: everyday short dictations go
+        // through ASR exactly once, exactly as before this feature existed,
+        // so their punctuation/clause structure is never split up.
+        var withPause = [Float](repeating: 0.2, count: Int(5.0 * sampleRate))
+        withPause.append(contentsOf: [Float](repeating: 0.0, count: Int(0.6 * sampleRate)))
+        withPause.append(contentsOf: [Float](repeating: 0.2, count: Int(5.0 * sampleRate)))
+        let pausedSegments = PauseSegmenter.segment(samples: withPause, sampleRate: sampleRate)
+        try expect(pausedSegments.count, equals: 1,
+                   "an ordinary sub-15s dictation with a normal pause is NOT fragmented")
+        try expect(pausedSegments.reduce(0) { $0 + $1.samples.count }, equals: withPause.count,
+                   "the single-segment case preserves every sample")
+
+        // The same shape, but genuinely LONG: 16s of speech (past the 15s
+        // minimum) + a 600ms pause + 5s more -> the pause now qualifies and
+        // the buffer splits in two at it. Proves cutting still happens once
+        // a recording is actually long, which is the case this feature
+        // exists for.
+        var longWithPause = [Float](repeating: 0.2, count: Int(16.0 * sampleRate))
+        longWithPause.append(contentsOf: [Float](repeating: 0.0, count: Int(0.6 * sampleRate)))
+        longWithPause.append(contentsOf: [Float](repeating: 0.2, count: Int(5.0 * sampleRate)))
+        let longPausedSegments = PauseSegmenter.segment(samples: longWithPause, sampleRate: sampleRate)
+        try expect(longPausedSegments.count, equals: 2,
+                   "a qualifying pause past the 15s minimum splits a long dictation into two segments")
+        try expect(longPausedSegments[0].samples.count, equals: Int(16.0 * sampleRate),
+                   "the cut lands at the start of the silent run, so segment 1 carries no trailing pause")
+        try expect(longPausedSegments.reduce(0) { $0 + $1.samples.count }, equals: longWithPause.count,
+                   "pause-split segments cover the whole buffer with no gaps or overlap")
+
+        // The same 16s/0.6s/5s shape, but over a realistic low-amplitude
+        // noise floor (0.008 RMS — non-zero, yet well under the 0.02 silence
+        // threshold) instead of mathematically perfect digital silence, so
+        // the cut logic is exercised against something closer to a real
+        // microphone than 0.0/0.2 extremes. NOTE: the 0.02 threshold itself
+        // is still uncalibrated against real hardware; this test pins the
+        // algorithm's SHAPE so a future recalibration only has to move the
+        // constant.
+        var noisy = [Float](repeating: 0.2, count: Int(16.0 * sampleRate))
+        noisy.append(contentsOf: (0..<Int(0.6 * sampleRate)).map { $0 % 2 == 0 ? 0.008 : -0.008 })
+        noisy.append(contentsOf: [Float](repeating: 0.2, count: Int(5.0 * sampleRate)))
+        let noisySegments = PauseSegmenter.segment(samples: noisy, sampleRate: sampleRate)
+        try expect(noisySegments.count, equals: 2,
+                   "a pause over a realistic non-zero noise floor is still detected as a pause")
+        try expect(noisySegments[0].samples.count, equals: Int(16.0 * sampleRate),
+                   "the noise-floor pause cuts at the same place perfect silence would")
+        try expect(noisySegments.reduce(0) { $0 + $1.samples.count }, equals: noisy.count,
+                   "noise-floor-split segments cover the whole buffer with no gaps or overlap")
+
+        // A pause before the minimum segment length is NOT a
+        // qualifying cut point -> stays a single segment.
+        var earlyPause = [Float](repeating: 0.2, count: Int(1.0 * sampleRate))
+        earlyPause.append(contentsOf: [Float](repeating: 0.0, count: Int(0.6 * sampleRate)))
+        earlyPause.append(contentsOf: [Float](repeating: 0.2, count: Int(1.0 * sampleRate)))
+        let earlyPauseSegments = PauseSegmenter.segment(samples: earlyPause, sampleRate: sampleRate)
+        try expect(earlyPauseSegments.count, equals: 1,
+                   "a pause before the minimum segment length is not a qualifying cut point")
+
+        // Long leading silence (60s, well past the 25s max cap) must still be
+        // split into segments respecting the max cap, NOT bundled into a
+        // single unbounded segment. This is the critical safety invariant
+        // that prevents a single ASR call from growing long enough to hit
+        // the Parakeet encoder's superlinear-cost regime, even when the
+        // recording opens with dead air (background noise, mic left on).
+        let longSilence = [Float](repeating: 0.0, count: Int(60.0 * sampleRate))
+        let longSilentSegments = PauseSegmenter.segment(samples: longSilence, sampleRate: sampleRate,
+                                                        maxSegmentSeconds: 25.0)
+        try expect(longSilentSegments.count >= 2, equals: true,
+                   "60s of silence with a 25s cap must force-cut into multiple segments (max safety enforced even through silence)")
+        let maxAllowedSamplesLong = Int(25.0 * sampleRate)
+        for seg in longSilentSegments {
+            try expect(seg.samples.count <= maxAllowedSamplesLong, equals: true,
+                       "no silence segment exceeds the safety cap, even leading silence")
+        }
+        try expect(longSilentSegments.reduce(0) { $0 + $1.samples.count }, equals: longSilence.count,
+                   "leading-silence segments cover the whole buffer with no gaps or overlap")
+
+        // All-silent buffer -> a single segment flagged as having no signal.
+        let silence = [Float](repeating: 0.0, count: Int(4.0 * sampleRate))
+        let silentSegments = PauseSegmenter.segment(samples: silence, sampleRate: sampleRate)
+        try expect(silentSegments.count, equals: 1, "an all-silent buffer stays a single segment")
+        try expect(silentSegments[0].hasSignal, equals: false, "an all-silent segment is flagged as having no signal")
+
+        // hasSignal needs SUSTAINED content, not one stray window: a single
+        // ~20ms blip (a mic bump, a keyboard click, a breath) in an
+        // otherwise silent buffer must NOT read as speech, or it would
+        // trigger a pointless retry and a spurious "dictation lost" signal
+        // on a recording that never contained speech at all.
+        var blip = [Float](repeating: 0.0, count: Int(4.0 * sampleRate))
+        let blipStart = Int(2.0 * sampleRate)
+        for i in blipStart..<(blipStart + Int(PauseSegmenter.defaultWindowSeconds * sampleRate)) {
+            blip[i] = 0.5
+        }
+        let blipSegments = PauseSegmenter.segment(samples: blip, sampleRate: sampleRate)
+        try expect(blipSegments.count, equals: 1, "a mostly-silent buffer with one blip stays a single segment")
+        try expect(blipSegments[0].hasSignal, equals: false,
+                   "a single non-silent window is below the minimum-signal threshold")
+
+        // A sustained run at/above the threshold (5 windows = ~100ms) in the
+        // same otherwise-silent buffer DOES count as signal.
+        var sustained = [Float](repeating: 0.0, count: Int(4.0 * sampleRate))
+        let runStart = Int(2.0 * sampleRate)
+        let runLength = PauseSegmenter.defaultSignalMinWindows * Int(PauseSegmenter.defaultWindowSeconds * sampleRate)
+        for i in runStart..<(runStart + runLength) {
+            sustained[i] = 0.5
+        }
+        let sustainedSegments = PauseSegmenter.segment(samples: sustained, sampleRate: sampleRate)
+        try expect(sustainedSegments.count, equals: 1, "the sustained-signal buffer stays a single segment")
+        try expect(sustainedSegments[0].hasSignal, equals: true,
+                   "a run at the minimum-signal threshold is flagged as having signal")
+    }
+
+    /// Pure orchestration coverage for `transcribeSegments` using a mock
+    /// `transcribeOne` closure — no model, no engine, no audio hardware.
+    /// Bridged through `runParakeetEngineSynchronously` since this test
+    /// suite's entry point is synchronous (see that helper's doc comment).
+    private static func testSegmentedTranscription() throws {
+        // All segments succeed on the first try -> concatenated with a
+        // single space, no failure flagged.
+        let allOk: [AudioSegment] = [
+            AudioSegment(samples: [0.1], hasSignal: true),
+            AudioSegment(samples: [0.1], hasSignal: true),
+        ]
+        nonisolated(unsafe) var callIndex = 0
+        let okTexts = ["hello", "world"]
+        let okOutcome = try runParakeetEngineSynchronously {
+            await transcribeSegments(allOk) { _ in
+                defer { callIndex += 1 }
+                return okTexts[callIndex]
+            }
+        }
+        try expect(okOutcome.text, equals: "hello world", "successful segments are joined with a space")
+        try expect(okOutcome.hadSegmentFailure, equals: false, "no failure flagged when every segment succeeds")
+
+        // A signal-bearing segment that returns empty on the first call but
+        // real text on the retry -> succeeds, no failure flagged, and the
+        // closure was actually called twice for that segment.
+        let retrySucceeds: [AudioSegment] = [AudioSegment(samples: [0.1], hasSignal: true)]
+        nonisolated(unsafe) var retryCallCount = 0
+        let retryOutcome = try runParakeetEngineSynchronously {
+            await transcribeSegments(retrySucceeds) { _ in
+                retryCallCount += 1
+                return retryCallCount == 1 ? "" : "recovered"
+            }
+        }
+        try expect(retryCallCount, equals: 2, "an empty signal-bearing segment is retried exactly once")
+        try expect(retryOutcome.text, equals: "recovered", "a successful retry contributes its text")
+        try expect(retryOutcome.hadSegmentFailure, equals: false, "a retry that succeeds is not a failure")
+
+        // A signal-bearing segment that stays empty after the retry ->
+        // flagged as a failure, contributes nothing to the joined text, but
+        // does not discard an earlier segment's text.
+        let stillFails: [AudioSegment] = [
+            AudioSegment(samples: [0.1], hasSignal: true),
+            AudioSegment(samples: [0.1], hasSignal: true),
+        ]
+        nonisolated(unsafe) var stillFailsCallIndex = 0
+        let failOutcome = try runParakeetEngineSynchronously {
+            await transcribeSegments(stillFails) { _ in
+                defer { stillFailsCallIndex += 1 }
+                // Segment 0 always succeeds; segment 1 (calls 2 and 3, since
+                // segment 0 only ever calls once) always returns empty.
+                return stillFailsCallIndex == 0 ? "kept" : ""
+            }
+        }
+        try expect(failOutcome.text, equals: "kept",
+                   "a persistently-empty segment doesn't discard an earlier segment's text")
+        try expect(failOutcome.hadSegmentFailure, equals: true,
+                   "a signal-bearing segment still empty after retry is flagged as a failure")
+
+        // A segment with no signal (silence) that returns empty is NOT
+        // retried and is NOT flagged as a failure.
+        let silentSegment: [AudioSegment] = [AudioSegment(samples: [0.0], hasSignal: false)]
+        nonisolated(unsafe) var silentCallCount = 0
+        let silentOutcome = try runParakeetEngineSynchronously {
+            await transcribeSegments(silentSegment) { _ in
+                silentCallCount += 1
+                return ""
+            }
+        }
+        try expect(silentCallCount, equals: 1, "a silent segment is not retried")
+        try expect(silentOutcome.text, equals: "", "a silent segment contributes no text")
+        try expect(silentOutcome.hadSegmentFailure, equals: false, "a silent segment is never a failure")
+
+        // A segment whose transcribeOne throws is treated like an empty
+        // result: retried once (since it has signal), and doesn't crash the
+        // whole run.
+        let throwing: [AudioSegment] = [AudioSegment(samples: [0.1], hasSignal: true)]
+        nonisolated(unsafe) var throwCallCount = 0
+        struct DummyError: Error {}
+        let throwOutcome = try runParakeetEngineSynchronously {
+            await transcribeSegments(throwing) { _ in
+                throwCallCount += 1
+                throw DummyError()
+            }
+        }
+        try expect(throwCallCount, equals: 2, "a throwing segment is retried exactly once, same as empty text")
+        try expect(throwOutcome.hadSegmentFailure, equals: true, "a segment that keeps throwing is flagged as a failure")
+        try expect(throwOutcome.lastErrorDescription != nil, equals: true,
+                   "a thrown error's description is surfaced for logging")
+
+        // REGRESSION GUARD: a segment with NO detected signal whose closure
+        // THROWS is a broken engine, not legitimate silence. It must still be
+        // retried and must still be flagged as a failure — otherwise a
+        // recording where every segment fell under the RMS threshold (or a
+        // nil engine) silently deletes the user's recovery audio with no
+        // failure signal at all, which is the exact bug this feature exists
+        // to prevent.
+        let silentThrowing: [AudioSegment] = [AudioSegment(samples: [0.0], hasSignal: false)]
+        nonisolated(unsafe) var silentThrowCallCount = 0
+        struct EngineUnavailable: LocalizedError {
+            var errorDescription: String? { "engine unavailable" }
+        }
+        let silentThrowOutcome = try runParakeetEngineSynchronously {
+            await transcribeSegments(silentThrowing) { _ in
+                silentThrowCallCount += 1
+                throw EngineUnavailable()
+            }
+        }
+        try expect(silentThrowCallCount, equals: 2,
+                   "a THROWING segment is retried even when it carries no detected signal")
+        try expect(silentThrowOutcome.hadSegmentFailure, equals: true,
+                   "a throw is never treated as legitimate silence, even with hasSignal == false")
+        try expect(silentThrowOutcome.lastErrorDescription ?? "", equals: "engine unavailable",
+                   "the most recent thrown error's description is captured verbatim")
+
+        // A throw whose retry SUCCEEDS is not a failure — but the error is
+        // still reported so it can be logged. Non-nil error != failure.
+        let throwThenSucceed: [AudioSegment] = [AudioSegment(samples: [0.1], hasSignal: true)]
+        nonisolated(unsafe) var mixedCallCount = 0
+        let mixedOutcome = try runParakeetEngineSynchronously {
+            await transcribeSegments(throwThenSucceed) { _ in
+                mixedCallCount += 1
+                if mixedCallCount == 1 { throw EngineUnavailable() }
+                return "second try"
+            }
+        }
+        try expect(mixedOutcome.text, equals: "second try", "a throw whose retry succeeds keeps its text")
+        try expect(mixedOutcome.hadSegmentFailure, equals: false,
+                   "a throw whose retry succeeds is not a failure")
+        try expect(mixedOutcome.lastErrorDescription ?? "", equals: "engine unavailable",
+                   "a recovered throw still reports its error for logging")
+
+        // Nothing ever threw -> no error description at all.
+        try expect(okOutcome.lastErrorDescription == nil, equals: true,
+                   "lastErrorDescription is nil when no call ever threw")
     }
 
     // MARK: - Parakeet CPU integration (spec §18.2 — real model, opt-in via env var)
