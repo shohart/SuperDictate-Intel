@@ -95,6 +95,8 @@ enum PauseSegmenter {
 
             let currentSegmentLength = sampleIndex(forWindow: windowIndex + 1) - segmentStartSample
 
+            var madeAnycut = false
+
             if let runStart = silentRunStart,
                (windowIndex - runStart + 1) >= pauseWindowCount,
                currentSegmentLength >= minSegmentSamples {
@@ -103,13 +105,17 @@ enum PauseSegmenter {
                 // pause itself doesn't get glued onto either segment.
                 if makeSegment(endSample: sampleIndex(forWindow: runStart)) {
                     silentRunStart = nil
+                    madeAnycut = true
                 }
-            } else if currentSegmentLength >= maxSegmentSamples {
+            }
+
+            if !madeAnycut && currentSegmentLength >= maxSegmentSamples {
                 // No qualifying pause arrived before the safety cap — force
                 // a cut here so a single unbroken run of speech can never
                 // exceed the cap.
                 if makeSegment(endSample: sampleIndex(forWindow: windowIndex + 1)) {
                     silentRunStart = nil
+                    madeAnycut = true
                 }
             }
 

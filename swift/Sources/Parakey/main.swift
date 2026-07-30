@@ -21406,6 +21406,25 @@ private enum ParakeySelfTest {
         try expect(earlyPauseSegments.count, equals: 1,
                    "a pause before the minimum segment length is not a qualifying cut point")
 
+        // Long leading silence (60s, well past the 25s max cap) must still be
+        // split into segments respecting the max cap, NOT bundled into a
+        // single unbounded segment. This is the critical safety invariant
+        // that prevents a single ASR call from growing long enough to hit
+        // the Parakeet encoder's superlinear-cost regime, even when the
+        // recording opens with dead air (background noise, mic left on).
+        let longSilence = [Float](repeating: 0.0, count: Int(60.0 * sampleRate))
+        let longSilentSegments = PauseSegmenter.segment(samples: longSilence, sampleRate: sampleRate,
+                                                        maxSegmentSeconds: 25.0)
+        try expect(longSilentSegments.count >= 2, equals: true,
+                   "60s of silence with a 25s cap must force-cut into multiple segments (max safety enforced even through silence)")
+        let maxAllowedSamplesLong = Int(25.0 * sampleRate)
+        for seg in longSilentSegments {
+            try expect(seg.samples.count <= maxAllowedSamplesLong, equals: true,
+                       "no silence segment exceeds the safety cap, even leading silence")
+        }
+        try expect(longSilentSegments.reduce(0) { $0 + $1.samples.count }, equals: longSilence.count,
+                   "leading-silence segments cover the whole buffer with no gaps or overlap")
+
         // All-silent buffer -> a single segment flagged as having no signal.
         let silence = [Float](repeating: 0.0, count: Int(4.0 * sampleRate))
         let silentSegments = PauseSegmenter.segment(samples: silence, sampleRate: sampleRate)
