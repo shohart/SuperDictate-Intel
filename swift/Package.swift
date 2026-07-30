@@ -84,6 +84,18 @@ let package = Package(
                 // same-directory-as-includer tier and doesn't need this,
                 // but include/parakeet_cpp_module.h does).
                 .headerSearchPath("upstream/ggml-vulkan"),
+                // Silero VAD (scripts/vendor-silero-vad.sh), a SEPARATE,
+                // additive vendor tree from upstream/ above (see
+                // upstream-vad/PROVENANCE.md) -- not yet wired into the
+                // umbrella header/bridge (that's a later task), but its
+                // translation unit (upstream-vad/whisper_vad.cpp) is
+                // auto-discovered and compiled as part of this same target,
+                // so its own quote-includes ("include/whisper_vad.h",
+                // "whisper_vad_arch.h") need to resolve, plus the ggml
+                // headers it depends on (already reachable via the
+                // "upstream/include" search path above).
+                .headerSearchPath("upstream-vad"),
+                .headerSearchPath("upstream-vad/include"),
                 // Same Intel-ISA flags this fork already carries for
                 // whisper_cpp's ggml build (see git history / the removed
                 // whisper_cpp target this replaces) — proven on the real
@@ -121,6 +133,10 @@ let package = Package(
                 // same-directory-as-includer tier and doesn't need this,
                 // but include/parakeet_cpp_module.h does).
                 .headerSearchPath("upstream/ggml-vulkan"),
+                // Silero VAD (scripts/vendor-silero-vad.sh) -- see the
+                // matching comment in cSettings above.
+                .headerSearchPath("upstream-vad"),
+                .headerSearchPath("upstream-vad/include"),
                 .unsafeFlags([
                     "-mavx2", "-mfma", "-mf16c", "-mbmi2", "-msse4.2",
                     "-I/usr/local/opt/vulkan-headers/include",
