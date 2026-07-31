@@ -24780,6 +24780,7 @@ private struct ControlPanelSettingsDraft: Equatable {
     var transcribingColor: RecordingHUDAccentColor
     var backgroundStyle: RecordingHUDBackgroundStyle
     var hudSize: RecordingHUDSize
+    var hudDisplayMode: RecordingHUDDisplayMode
     var normalizeNumbersToDigits: Bool
 
     init(settings: Settings) {
@@ -24795,6 +24796,7 @@ private struct ControlPanelSettingsDraft: Equatable {
         transcribingColor = settings.recordingHUDTranscribingColor
         backgroundStyle = settings.recordingHUDBackgroundStyle
         hudSize = settings.recordingHUDSize
+        hudDisplayMode = settings.recordingHUDDisplayMode
         normalizeNumbersToDigits = settings.normalizeNumbersToDigits
     }
 }
@@ -25101,6 +25103,16 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             options: RecordingHUDAccentColor.allCases.map { (localizedColorName($0), $0.rawValue) },
             action: #selector(selectRecordingHUDRecordingColor(_:)),
             toolTip: t("Цвет индикатора во время записи.", "Indicator color while recording.")
+        ))
+        root.addArrangedSubview(popupRow(
+            title: t("Индикатор записи", "Recording indicator"),
+            detail: t("Полоски уровня громкости или таймер длительности после 10 секунд записи.",
+                      "Volume level bars, or an elapsed-time timer after 10 seconds of recording."),
+            selectedValue: draft.hudDisplayMode.rawValue,
+            options: RecordingHUDDisplayMode.allCases.map { (localizedDisplayModeName($0), $0.rawValue) },
+            action: #selector(selectRecordingHUDDisplayMode(_:)),
+            toolTip: t("Переключить вид плавающего индикатора во время записи.",
+                       "Switch how the floating recording indicator looks while recording.")
         ))
         root.addArrangedSubview(popupRow(
             title: t("Цвет транскрибации", "Transcribing color"),
@@ -26343,6 +26355,14 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         }
     }
 
+    private func localizedDisplayModeName(_ mode: RecordingHUDDisplayMode) -> String {
+        guard language == .russian else { return mode.displayName }
+        switch mode {
+        case .levelBars: return "Полоски уровня"
+        case .timerOutline: return "Таймер"
+        }
+    }
+
     private func beginServiceOperation(_ operation: ControlPanelServiceOperation) {
         guard serviceOperation == nil else { return }
         serviceOperation = operation
@@ -26624,6 +26644,15 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         refreshSettingsWindow()
     }
 
+    @objc private func selectRecordingHUDDisplayMode(_ sender: NSPopUpButton) {
+        guard let raw = sender.selectedItem?.representedObject as? String,
+              let mode = RecordingHUDDisplayMode(rawValue: raw) else { return }
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.hudDisplayMode = mode
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
     @objc private func discardSettingsClicked(_ sender: NSButton) {
         settingsDraft = ControlPanelSettingsDraft(settings: settings)
         refreshSettingsWindow()
@@ -26643,6 +26672,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         settings.recordingHUDTranscribingColor = draft.transcribingColor
         settings.recordingHUDBackgroundStyle = draft.backgroundStyle
         settings.recordingHUDSize = draft.hudSize
+        settings.recordingHUDDisplayMode = draft.hudDisplayMode
         settings.normalizeNumbersToDigits = draft.normalizeNumbersToDigits
         settings.agentEnabled = true
         _ = settings.refreshFromDisk()
