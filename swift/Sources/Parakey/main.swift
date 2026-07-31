@@ -17184,6 +17184,8 @@ private enum ParakeySelfTest {
             return runSuite("overlap-windowing", testOverlapWindowing)
         case "segmented-transcription":
             return runSuite("segmented-transcription", testSegmentedTranscription)
+        case "boundary-oracle":
+            return runSuite("boundary-oracle", testBoundaryOracle)
         case "parakeet-cpu":
             return runSuite("parakeet-cpu", testParakeetCPUIntegration)
         case "parakeet-text-repair":
@@ -17265,6 +17267,7 @@ private enum ParakeySelfTest {
         try testPauseSegmentation()
         try testSegmentedTranscription()
         try testTokenTranscriptionDecode()
+        try testBoundaryOracle()
     }
 
     /// Covers `textInsertionRoute(for:targetElementStillValid:)` — the
@@ -22094,6 +22097,73 @@ private enum ParakeySelfTest {
                    "the last window's ownedEndSample is its own true end, with nothing borrowed past it")
         try expect(last.startSample + last.samples.count, equals: last.ownedEndSample,
                    "the last window's samples end exactly at its own ownedEndSample -- no trailing overlap exists to overrun it")
+    }
+
+    /// Coverage for the `BoundaryOracle` chain (Task 6): `MidpointBoundaryOracle`,
+    /// `MelEnergyBoundaryOracle`, and `chainBoundaryOracle`'s fallthrough +
+    /// defensive clamping. No VAD oracle exists yet -- that's Task 7.
+    private static func testBoundaryOracle() throws {
+        let sampleRate = 16_000.0
+
+        // 1) MidpointBoundaryOracle: zone [100, 200) -> 150.
+        let midpointOracle = MidpointBoundaryOracle()
+        let midpointSplit = midpointOracle.chooseSplit(samples: [], zoneStartSample: 100, zoneEndSample: 200, sampleRate: sampleRate)
+        try expect(midpointSplit, equals: 150, "midpoint of [100, 200) is 150")
+
+        // Zero-width zone -> returns the zone start, doesn't crash.
+        let zeroWidthSplit = midpointOracle.chooseSplit(samples: [], zoneStartSample: 300, zoneEndSample: 300, sampleRate: sampleRate)
+        try expect(zeroWidthSplit, equals: 300, "a zero-width zone's midpoint is its own start")
+
+        // 2) MelEnergyBoundaryOracle: loud-quiet-loud synthetic buffer, same
+        // style as PauseSegmenter's own silence tests -- the returned offset
+        // must land inside the quiet stretch.
+        let loudSeconds = 1.0
+        let quietSeconds = 1.0
+        var meZone = [Float](repeating: 0.2, count: Int(loudSeconds * sampleRate))
+        let quietStartOffset = meZone.count
+        meZone.append(contentsOf: [Float](repeating: 0.0, count: Int(quietSeconds * sampleRate)))
+        let quietEndOffset = meZone.count
+        meZone.append(contentsOf: [Float](repeating: 0.2, count: Int(loudSeconds * sampleRate)))
+
+        let zoneStart = 5_000
+        let zoneEnd = zoneStart + meZone.count
+        let melOracle = MelEnergyBoundaryOracle()
+        guard let melSplit = melOracle.chooseSplit(samples: meZone, zoneStartSample: zoneStart, zoneEndSample: zoneEnd, sampleRate: sampleRate) else {
+            throw SelfTestFailure.failed("MelEnergyBoundaryOracle declined on a non-empty zone")
+        }
+        let melSplitOffsetInZone = melSplit - zoneStart
+        try expect(melSplitOffsetInZone >= quietStartOffset && melSplitOffsetInZone < quietEndOffset, equals: true,
+                   "MelEnergyBoundaryOracle picks an offset inside the quiet stretch (got offset \(melSplitOffsetInZone), quiet range [\(quietStartOffset), \(quietEndOffset)))")
+
+        // 3) chainBoundaryOracle: a declining (always-nil) oracle is skipped
+        // in favor of the next one in the chain.
+        struct DecliningOracle: BoundaryOracle {
+            func chooseSplit(samples: [Float], zoneStartSample: Int, zoneEndSample: Int, sampleRate: Double) -> Int? { nil }
+        }
+        struct FixedOracle: BoundaryOracle {
+            let answer: Int
+            func chooseSplit(samples: [Float], zoneStartSample: Int, zoneEndSample: Int, sampleRate: Double) -> Int? { answer }
+        }
+        let fallthroughChain = chainBoundaryOracle([DecliningOracle(), FixedOracle(answer: 175)])
+        let fallthroughResult = fallthroughChain([], 100, 200, sampleRate)
+        try expect(fallthroughResult, equals: 175, "a declining oracle is skipped in favor of the next oracle in the chain")
+
+        // An empty oracle list still produces an answer -- falls through to
+        // the always-appended MidpointBoundaryOracle.
+        let emptyChain = chainBoundaryOracle([])
+        let emptyChainResult = emptyChain([], 100, 200, sampleRate)
+        try expect(emptyChainResult, equals: 150, "a chain with zero oracles still falls through to MidpointBoundaryOracle")
+
+        // 4) Clamping: a deliberately-broken oracle that returns an offset
+        // OUTSIDE [zoneStartSample, zoneEndSample] gets clamped before being
+        // returned, both above the top and below the bottom of the zone.
+        let tooHighChain = chainBoundaryOracle([FixedOracle(answer: 9_999)])
+        try expect(tooHighChain([], 100, 200, sampleRate), equals: 200,
+                   "an out-of-range answer above the zone is clamped to zoneEndSample")
+
+        let tooLowChain = chainBoundaryOracle([FixedOracle(answer: -5)])
+        try expect(tooLowChain([], 100, 200, sampleRate), equals: 100,
+                   "an out-of-range answer below the zone is clamped to zoneStartSample")
     }
 
     /// Pure orchestration coverage for `transcribeSegments` using a mock
