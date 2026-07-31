@@ -9306,6 +9306,77 @@ final class CorrectionShareCleanupDelegate: NSObject, @preconcurrency NSSharingS
     }
 }
 
+/// Builds the portion of a capsule's rounded-rect outline that should be lit,
+/// growing from the bottom center point symmetrically up both the left and
+/// right sides as `fraction` (0...1) increases, tracing the same rounded-rect
+/// path geometry as the full capsule outline (bottom-half straight run, then
+/// the end-cap arc, then the top-half straight run back to top-center).
+///
+/// Pure geometry, no view/window/context dependency, so it can be exercised
+/// directly by self-tests.
+private func recordingHUDOutlineFillPath(in capsuleRect: NSRect, fraction: CGFloat) -> NSBezierPath {
+    let clamped = max(0, min(1, fraction))
+    let fullPath = NSBezierPath(roundedRect: capsuleRect,
+                                xRadius: capsuleRect.height / 2,
+                                yRadius: capsuleRect.height / 2)
+    guard clamped < 1 else { return fullPath }
+
+    let radius = capsuleRect.height / 2
+    let bottomCenter = NSPoint(x: capsuleRect.midX, y: capsuleRect.maxY)
+    let topCenter = NSPoint(x: capsuleRect.midX, y: capsuleRect.minY)
+    let straightLength = max(0, capsuleRect.width - capsuleRect.height)
+    let halfStraight = straightLength / 2
+    let arcLength = CGFloat.pi * radius
+    // Full traversal from bottom-center up one side to top-center covers the
+    // bottom-half straight run, the full end-cap arc, and the top-half
+    // straight run: halfStraight + arcLength + halfStraight == straightLength + arcLength.
+    let halfPerimeter = straightLength + arcLength
+    let litLength = clamped * halfPerimeter
+
+    let path = NSBezierPath()
+    path.lineJoinStyle = .round
+
+    func appendSide(direction: CGFloat) {
+        // direction: -1 for left side, +1 for right side.
+        var remaining = litLength
+        path.move(to: bottomCenter)
+
+        // Segment 1: bottom-half straight run.
+        let seg1 = min(remaining, halfStraight)
+        let straightEnd = NSPoint(x: bottomCenter.x + (direction * seg1), y: bottomCenter.y)
+        path.line(to: straightEnd)
+        remaining -= seg1
+        guard remaining > 0 else { return }
+
+        // Segment 2: the end-cap arc, starting at the visual bottom of the
+        // cap (matching where segment 1 left off) and sweeping toward the
+        // visual top of the cap.
+        let arcTraversed = min(remaining, arcLength)
+        let arcFraction = arcTraversed / arcLength
+        let center = NSPoint(x: capsuleRect.midX + (direction * halfStraight), y: capsuleRect.midY)
+        let startAngle: CGFloat = 90
+        let sweep = direction > 0 ? -180 * arcFraction : 180 * arcFraction
+        path.appendArc(withCenter: center,
+                       radius: radius,
+                       startAngle: startAngle,
+                       endAngle: startAngle + sweep,
+                       clockwise: direction > 0)
+        remaining -= arcTraversed
+        guard remaining > 0 else { return }
+
+        // Segment 3: top-half straight run, from the arc's end point inward
+        // toward top-center.
+        let seg3 = min(remaining, halfStraight)
+        let arcEnd = NSPoint(x: capsuleRect.midX + (direction * halfStraight), y: topCenter.y)
+        let topEnd = NSPoint(x: arcEnd.x - (direction * seg3), y: topCenter.y)
+        path.line(to: topEnd)
+    }
+
+    appendSide(direction: -1)
+    appendSide(direction: 1)
+    return path
+}
+
 private final class RecordingHUDView: NSView {
     var visualScale: CGFloat = RecordingHUDSize.standard.visualScale {
         didSet {
@@ -9364,7 +9435,7 @@ private final class RecordingHUDView: NSView {
     }
 
     var recordingStartedAt: Date? {
-        didSet { needsDisplay = true }
+        didSet { if oldValue != recordingStartedAt { needsDisplay = true } }
     }
 
     var displayMode: RecordingHUDDisplayMode = .levelBars {
@@ -9469,13 +9540,17 @@ private final class RecordingHUDView: NSView {
 
         if timerModeTransition < 1 {
             NSGraphicsContext.saveGraphicsState()
-            NSGraphicsContext.current?.cgContext.setAlpha(1 - timerModeTransition)
+            // `setAlpha` REPLACES the graphics-state alpha rather than
+            // composing with it, so it must be multiplied by `contentAlpha`
+            // here or the reveal fade-in gets discarded (a hard-1.0 pop) in
+            // the default .levelBars mode, where timerModeTransition is 0.
+            context.setAlpha(contentAlpha * (1 - timerModeTransition))
             drawRecordingLevelBars(audio: audio, vividAccent: vividAccent, visualScale: visualScale, capsuleRect: capsuleRect)
             NSGraphicsContext.restoreGraphicsState()
         }
         if timerModeTransition > 0 {
             NSGraphicsContext.saveGraphicsState()
-            NSGraphicsContext.current?.cgContext.setAlpha(timerModeTransition)
+            context.setAlpha(contentAlpha * timerModeTransition)
             drawTimerOutlineFill(in: capsuleRect, accent: vividAccent, level: CGFloat(max(0, min(1, level))), elapsed: elapsedForMode)
             NSGraphicsContext.restoreGraphicsState()
         }
@@ -9532,17 +9607,28 @@ private final class RecordingHUDView: NSView {
     private func drawTimerOutlineFill(in capsuleRect: NSRect, accent: NSColor, level: CGFloat, elapsed: TimeInterval) {
         // Outline stroke, filled fraction of the perimeter grows from the
         // bottom center point symmetrically up both sides with `level`.
-        let capsule = NSBezierPath(roundedRect: capsuleRect,
-                                   xRadius: capsuleRect.height / 2,
-                                   yRadius: capsuleRect.height / 2)
+        //
+        // The outer clip region (see `capsule.addClip()` in
+        // `drawFloatingWaveformOnly`) is the un-inset capsule, so a stroke
+        // centered on that same path would have half its width — and the
+        // glow's outward half — clipped away. Inset by half of the widest
+        // stroke used here (the fully-widened glow, worst case at level==1)
+        // so the whole glow stays inside the clip region.
         let strokeWidth: CGFloat = 2.4 * visualScale
+        let maxGlowWidth = strokeWidth + (3.0 * visualScale)
+        let halfMaxStrokeWidth = maxGlowWidth / 2
+        let outlineRect = capsuleRect.insetBy(dx: halfMaxStrokeWidth, dy: halfMaxStrokeWidth)
+
+        let capsule = NSBezierPath(roundedRect: outlineRect,
+                                   xRadius: outlineRect.height / 2,
+                                   yRadius: outlineRect.height / 2)
         let unfilledColor = accent.withAlphaComponent(0.14)
         unfilledColor.setStroke()
         capsule.lineWidth = strokeWidth
         capsule.stroke()
 
         if level > 0.001 {
-            let filledPath = outlineFillPath(in: capsuleRect, fraction: level)
+            let filledPath = recordingHUDOutlineFillPath(in: outlineRect, fraction: level)
             let glowAlpha = 0.18 + (0.55 * level)
             let glowWidth = strokeWidth + (3.0 * visualScale * level)
             accent.withAlphaComponent(glowAlpha).setStroke()
@@ -9560,9 +9646,17 @@ private final class RecordingHUDView: NSView {
         let font = NSFont.monospacedDigitSystemFont(ofSize: 12 * visualScale, weight: .semibold)
         let paragraph = NSMutableParagraphStyle()
         paragraph.alignment = .center
+        // Explicit light/dark-bubble-derived color, matching the same
+        // `shouldUseLightBackground()` idiom `backgroundPalette` uses below —
+        // `NSColor.labelColor` resolves against system appearance, which can
+        // mismatch the bubble's actual background (e.g. a forced-light bubble
+        // on a Dark-mode Mac would render unreadable white-on-white text).
+        let textColor: NSColor = shouldUseLightBackground()
+            ? NSColor(calibratedWhite: 0.0, alpha: 0.85)
+            : NSColor(calibratedWhite: 1.0, alpha: 0.92)
         let attributes: [NSAttributedString.Key: Any] = [
             .font: font,
-            .foregroundColor: NSColor.labelColor,
+            .foregroundColor: textColor,
             .paragraphStyle: paragraph,
         ]
         let attributed = NSAttributedString(string: text, attributes: attributes)
@@ -9572,56 +9666,6 @@ private final class RecordingHUDView: NSView {
                               width: textSize.width,
                               height: textSize.height)
         attributed.draw(in: textRect)
-    }
-
-    /// Builds the portion of the capsule's outline that should be lit, growing
-    /// from the bottom center point symmetrically up both the left and right
-    /// sides as `fraction` (0...1) increases, tracing the same rounded-rect
-    /// path geometry as the full capsule outline.
-    private func outlineFillPath(in capsuleRect: NSRect, fraction: CGFloat) -> NSBezierPath {
-        let clamped = max(0, min(1, fraction))
-        let fullPath = NSBezierPath(roundedRect: capsuleRect,
-                                    xRadius: capsuleRect.height / 2,
-                                    yRadius: capsuleRect.height / 2)
-        guard clamped < 1 else { return fullPath }
-
-        // Approximate perimeter traversal by sampling the full path's element
-        // list is not directly available via NSBezierPath, so build the lit
-        // portion from two mirrored arcs starting at the bottom center point
-        // and sweeping up each side by `clamped * halfPerimeter`.
-        let radius = capsuleRect.height / 2
-        let bottomCenter = NSPoint(x: capsuleRect.midX, y: capsuleRect.maxY)
-        let straightLength = max(0, capsuleRect.width - capsuleRect.height)
-        let halfStraight = straightLength / 2
-        let halfPerimeter = halfStraight + (.pi * radius)
-        let litLength = clamped * halfPerimeter
-
-        let path = NSBezierPath()
-        path.lineJoinStyle = .round
-
-        func appendSide(direction: CGFloat) {
-            // direction: -1 for left side, +1 for right side.
-            var remaining = litLength
-            path.move(to: bottomCenter)
-            let straightEnd = NSPoint(x: bottomCenter.x + (direction * min(remaining, halfStraight)),
-                                      y: bottomCenter.y)
-            path.line(to: straightEnd)
-            remaining -= min(remaining, halfStraight)
-            guard remaining > 0 else { return }
-            let arcFraction = min(1, remaining / (.pi * radius))
-            let center = NSPoint(x: capsuleRect.midX + (direction * halfStraight), y: capsuleRect.midY)
-            let startAngle: CGFloat = direction > 0 ? -90 : 270
-            let sweep = direction > 0 ? -180 * arcFraction : 180 * arcFraction
-            path.appendArc(withCenter: center,
-                           radius: radius,
-                           startAngle: startAngle,
-                           endAngle: startAngle + sweep,
-                           clockwise: direction > 0)
-        }
-
-        appendSide(direction: -1)
-        appendSide(direction: 1)
-        return path
     }
 
     private func drawTranscribingWave(in capsuleRect: NSRect, alpha: CGFloat) {
@@ -17584,6 +17628,8 @@ private enum ParakeySelfTest {
             return runSuite("recording-hud-display-mode", testRecordingHUDDisplayMode)
         case "recording-hud-elapsed-format":
             return runSuite("recording-hud-elapsed-format", testFormatRecordingHUDElapsed)
+        case "recording-hud-outline-path":
+            return runSuite("recording-hud-outline-path", testRecordingHUDOutlineFillPath)
         case "all":
             return runSuite("all", testAll)
         default:
@@ -17616,6 +17662,7 @@ private enum ParakeySelfTest {
         try testRecentTranscriptLimit()
         try testRecordingHUDDisplayMode()
         try testFormatRecordingHUDElapsed()
+        try testRecordingHUDOutlineFillPath()
         try testDictationUsageStatistics()
         try testTranscriptCorrections()
         try testFillerWordRemoval()
@@ -19321,6 +19368,160 @@ private enum ParakeySelfTest {
             let actual = formatRecordingHUDElapsed(input)
             guard actual == expected else {
                 throw SelfTestFailure.failed("formatRecordingHUDElapsed(\(input)) = \(actual), expected \(expected)")
+            }
+        }
+    }
+
+    /// `recordingHUDOutlineFillPath` is pure geometry — exercise it directly
+    /// without instantiating a window, per the final-review finding that both
+    /// Critical geometry bugs (chord across the bubble, missing top edge)
+    /// were self-test-catchable this way.
+    private static func testRecordingHUDOutlineFillPath() throws {
+        let capsuleRect = NSRect(x: 0, y: 0, width: 72, height: 26)
+        let bottomCenter = NSPoint(x: capsuleRect.midX, y: capsuleRect.maxY)
+        let topCenter = NSPoint(x: capsuleRect.midX, y: capsuleRect.minY)
+        let tolerance: CGFloat = 0.5
+
+        func subpaths(_ path: NSBezierPath) -> [[NSPoint]] {
+            var result: [[NSPoint]] = []
+            var current: [NSPoint] = []
+            var associated = [NSPoint](repeating: .zero, count: 3)
+            for i in 0..<path.elementCount {
+                let type = path.element(at: i, associatedPoints: &associated)
+                switch type {
+                case .moveTo:
+                    if !current.isEmpty { result.append(current) }
+                    current = [associated[0]]
+                case .lineTo:
+                    current.append(associated[0])
+                case .curveTo:
+                    current.append(contentsOf: associated[0..<3])
+                default:
+                    break
+                }
+            }
+            if !current.isEmpty { result.append(current) }
+            return result
+        }
+
+        func allPoints(_ path: NSBezierPath) -> [NSPoint] {
+            subpaths(path).flatMap { $0 }
+        }
+
+        func approxLength(_ path: NSBezierPath) -> CGFloat {
+            let points = allPoints(path)
+            guard points.count > 1 else { return 0 }
+            var total: CGFloat = 0
+            for i in 1..<points.count {
+                let dx = points[i].x - points[i - 1].x
+                let dy = points[i].y - points[i - 1].y
+                total += (dx * dx + dy * dy).squareRoot()
+            }
+            return total
+        }
+
+        func near(_ a: NSPoint, _ b: NSPoint, _ tol: CGFloat = tolerance) -> Bool {
+            abs(a.x - b.x) < tol && abs(a.y - b.y) < tol
+        }
+
+        // fraction = 0: degenerate (caller already gates on level > 0.001
+        // before calling this), but must still produce a valid path that
+        // starts at bottom-center.
+        let zeroPath = recordingHUDOutlineFillPath(in: capsuleRect, fraction: 0)
+        guard let zeroFirst = allPoints(zeroPath).first, near(zeroFirst, bottomCenter) else {
+            throw SelfTestFailure.failed("fraction=0 path should start at bottom-center \(bottomCenter)")
+        }
+
+        // Every element's associated points stay within the capsule rect
+        // (small tolerance for floating point) at a spread of fractions.
+        let containment = capsuleRect.insetBy(dx: -tolerance, dy: -tolerance)
+        for fraction: CGFloat in [0, 0.25, 0.5, 0.75, 0.999] {
+            let path = recordingHUDOutlineFillPath(in: capsuleRect, fraction: fraction)
+            for point in allPoints(path) {
+                guard containment.contains(point) else {
+                    throw SelfTestFailure.failed("fraction=\(fraction) produced point \(point) outside \(capsuleRect)")
+                }
+                guard point.x.isFinite, point.y.isFinite else {
+                    throw SelfTestFailure.failed("fraction=\(fraction) produced a non-finite point")
+                }
+            }
+            // Bottom-center is always the start point of both side subpaths.
+            for side in subpaths(path) {
+                guard let first = side.first, near(first, bottomCenter) else {
+                    throw SelfTestFailure.failed("fraction=\(fraction) subpath should start at bottom-center, got \(side.first.map(String.init(describing:)) ?? "nil")")
+                }
+            }
+        }
+
+        // fraction = 0.5 is analytically exact for this rect (radius 13,
+        // straightLength 46): the lit length lands exactly at the arc's
+        // horizontal midpoint on each side. This is the one check that pins
+        // down the arc's sweep direction -- containment alone would pass
+        // even if the arc swept the wrong way, since a <=180 degree arc
+        // about the cap center stays inside capsuleRect regardless.
+        let halfPath = recordingHUDOutlineFillPath(in: capsuleRect, fraction: 0.5)
+        let halfSides = subpaths(halfPath)
+        guard halfSides.count == 2 else {
+            throw SelfTestFailure.failed("fraction=0.5 path should have two side subpaths, got \(halfSides.count)")
+        }
+        let leftEnd = halfSides[0].last!
+        let rightEnd = halfSides[1].last!
+        let expectedLeft = NSPoint(x: capsuleRect.minX, y: capsuleRect.midY)
+        let expectedRight = NSPoint(x: capsuleRect.maxX, y: capsuleRect.midY)
+        guard near(leftEnd, expectedLeft) else {
+            throw SelfTestFailure.failed("fraction=0.5 left side should end at \(expectedLeft), got \(leftEnd)")
+        }
+        guard near(rightEnd, expectedRight) else {
+            throw SelfTestFailure.failed("fraction=0.5 right side should end at \(expectedRight), got \(rightEnd)")
+        }
+
+        // fraction = 0.999: both sides should have traversed the bottom
+        // straight run, the full arc, and nearly all of the top straight run
+        // -- i.e. nearly reached top-center. This is the check that catches
+        // a halfPerimeter that omits the top edge (Critical 2): with the bug
+        // present, the arc end point (not top-center) would be the ceiling
+        // any fraction below 1.0 could reach.
+        let almostFullPath = recordingHUDOutlineFillPath(in: capsuleRect, fraction: 0.999)
+        let almostFullSides = subpaths(almostFullPath)
+        guard almostFullSides.count == 2 else {
+            throw SelfTestFailure.failed("fraction=0.999 path should have two side subpaths, got \(almostFullSides.count)")
+        }
+        for side in almostFullSides {
+            guard let end = side.last, near(end, topCenter, 1.0) else {
+                throw SelfTestFailure.failed("fraction=0.999 side should nearly reach top-center \(topCenter), got \(side.last.map(String.init(describing:)) ?? "nil")")
+            }
+        }
+
+        // fraction = 1.0 should equal the full capsule outline (bounds match).
+        let fullPath = recordingHUDOutlineFillPath(in: capsuleRect, fraction: 1.0)
+        let fullBounds = fullPath.bounds
+        guard abs(fullBounds.minX - capsuleRect.minX) < tolerance,
+              abs(fullBounds.minY - capsuleRect.minY) < tolerance,
+              abs(fullBounds.maxX - capsuleRect.maxX) < tolerance,
+              abs(fullBounds.maxY - capsuleRect.maxY) < tolerance else {
+            throw SelfTestFailure.failed("fraction=1.0 path bounds \(fullBounds) should match capsuleRect \(capsuleRect)")
+        }
+
+        // Traversed length should increase monotonically with fraction.
+        let fractions: [CGFloat] = [0, 0.25, 0.5, 0.75, 0.999]
+        var previousLength: CGFloat = -1
+        for fraction in fractions {
+            let length = approxLength(recordingHUDOutlineFillPath(in: capsuleRect, fraction: fraction))
+            guard length >= previousLength else {
+                throw SelfTestFailure.failed("traversed length should increase monotonically with fraction, regressed at \(fraction)")
+            }
+            previousLength = length
+        }
+
+        // A perfect circle (width == height, straightLength == 0) should not
+        // divide by zero or produce NaNs.
+        let circleRect = NSRect(x: 0, y: 0, width: 26, height: 26)
+        for fraction: CGFloat in [0, 0.5, 0.999, 1.0] {
+            let path = recordingHUDOutlineFillPath(in: circleRect, fraction: fraction)
+            for point in allPoints(path) {
+                guard point.x.isFinite, point.y.isFinite else {
+                    throw SelfTestFailure.failed("circle case fraction=\(fraction) produced a non-finite point")
+                }
             }
         }
     }
