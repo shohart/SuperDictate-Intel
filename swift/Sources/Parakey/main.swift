@@ -9363,7 +9363,15 @@ private final class RecordingHUDView: NSView {
         }
     }
 
-    var recordingStartedAt: Date?
+    var recordingStartedAt: Date? {
+        didSet { needsDisplay = true }
+    }
+
+    var displayMode: RecordingHUDDisplayMode = .levelBars {
+        didSet {
+            if oldValue != displayMode { needsDisplay = true }
+        }
+    }
 
     var phase: CGFloat = 0 {
         didSet {
@@ -9448,6 +9456,32 @@ private final class RecordingHUDView: NSView {
             return
         }
 
+        let elapsedForMode: TimeInterval = recordingStartedAt.map { Date().timeIntervalSince($0) } ?? 0
+        let timerActivationSeconds: TimeInterval = 10
+        let transitionDuration: TimeInterval = 0.5
+        let timerModeTransition: CGFloat
+        if displayMode == .timerOutline {
+            let progress = (elapsedForMode - timerActivationSeconds) / transitionDuration
+            timerModeTransition = smootherstep(0, 1, CGFloat(max(0, min(1, progress))))
+        } else {
+            timerModeTransition = 0
+        }
+
+        if timerModeTransition < 1 {
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current?.cgContext.setAlpha(1 - timerModeTransition)
+            drawRecordingLevelBars(audio: audio, vividAccent: vividAccent, visualScale: visualScale, capsuleRect: capsuleRect)
+            NSGraphicsContext.restoreGraphicsState()
+        }
+        if timerModeTransition > 0 {
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current?.cgContext.setAlpha(timerModeTransition)
+            drawTimerOutlineFill(in: capsuleRect, accent: vividAccent, level: CGFloat(max(0, min(1, level))), elapsed: elapsedForMode)
+            NSGraphicsContext.restoreGraphicsState()
+        }
+    }
+
+    private func drawRecordingLevelBars(audio: CGFloat, vividAccent: NSColor, visualScale: CGFloat, capsuleRect: NSRect) {
         let barCount = 8
         let barWidth: CGFloat = 2.05 * visualScale
         let barGap: CGFloat = 2.55 * visualScale
@@ -9493,6 +9527,101 @@ private final class RecordingHUDView: NSView {
             vividAccent.withAlphaComponent(0.74 + (0.26 * activity)).setFill()
             path.fill()
         }
+    }
+
+    private func drawTimerOutlineFill(in capsuleRect: NSRect, accent: NSColor, level: CGFloat, elapsed: TimeInterval) {
+        // Outline stroke, filled fraction of the perimeter grows from the
+        // bottom center point symmetrically up both sides with `level`.
+        let capsule = NSBezierPath(roundedRect: capsuleRect,
+                                   xRadius: capsuleRect.height / 2,
+                                   yRadius: capsuleRect.height / 2)
+        let strokeWidth: CGFloat = 2.4 * visualScale
+        let unfilledColor = accent.withAlphaComponent(0.14)
+        unfilledColor.setStroke()
+        capsule.lineWidth = strokeWidth
+        capsule.stroke()
+
+        if level > 0.001 {
+            let filledPath = outlineFillPath(in: capsuleRect, fraction: level)
+            let glowAlpha = 0.18 + (0.55 * level)
+            let glowWidth = strokeWidth + (3.0 * visualScale * level)
+            accent.withAlphaComponent(glowAlpha).setStroke()
+            filledPath.lineWidth = glowWidth
+            filledPath.lineCapStyle = .round
+            filledPath.stroke()
+
+            accent.withAlphaComponent(0.85 + (0.15 * level)).setStroke()
+            filledPath.lineWidth = strokeWidth
+            filledPath.lineCapStyle = .round
+            filledPath.stroke()
+        }
+
+        let text = formatRecordingHUDElapsed(elapsed)
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 12 * visualScale, weight: .semibold)
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: NSColor.labelColor,
+            .paragraphStyle: paragraph,
+        ]
+        let attributed = NSAttributedString(string: text, attributes: attributes)
+        let textSize = attributed.size()
+        let textRect = NSRect(x: capsuleRect.midX - (textSize.width / 2),
+                              y: capsuleRect.midY - (textSize.height / 2),
+                              width: textSize.width,
+                              height: textSize.height)
+        attributed.draw(in: textRect)
+    }
+
+    /// Builds the portion of the capsule's outline that should be lit, growing
+    /// from the bottom center point symmetrically up both the left and right
+    /// sides as `fraction` (0...1) increases, tracing the same rounded-rect
+    /// path geometry as the full capsule outline.
+    private func outlineFillPath(in capsuleRect: NSRect, fraction: CGFloat) -> NSBezierPath {
+        let clamped = max(0, min(1, fraction))
+        let fullPath = NSBezierPath(roundedRect: capsuleRect,
+                                    xRadius: capsuleRect.height / 2,
+                                    yRadius: capsuleRect.height / 2)
+        guard clamped < 1 else { return fullPath }
+
+        // Approximate perimeter traversal by sampling the full path's element
+        // list is not directly available via NSBezierPath, so build the lit
+        // portion from two mirrored arcs starting at the bottom center point
+        // and sweeping up each side by `clamped * halfPerimeter`.
+        let radius = capsuleRect.height / 2
+        let bottomCenter = NSPoint(x: capsuleRect.midX, y: capsuleRect.maxY)
+        let straightLength = max(0, capsuleRect.width - capsuleRect.height)
+        let halfStraight = straightLength / 2
+        let halfPerimeter = halfStraight + (.pi * radius)
+        let litLength = clamped * halfPerimeter
+
+        let path = NSBezierPath()
+        path.lineJoinStyle = .round
+
+        func appendSide(direction: CGFloat) {
+            // direction: -1 for left side, +1 for right side.
+            var remaining = litLength
+            path.move(to: bottomCenter)
+            let straightEnd = NSPoint(x: bottomCenter.x + (direction * min(remaining, halfStraight)),
+                                      y: bottomCenter.y)
+            path.line(to: straightEnd)
+            remaining -= min(remaining, halfStraight)
+            guard remaining > 0 else { return }
+            let arcFraction = min(1, remaining / (.pi * radius))
+            let center = NSPoint(x: capsuleRect.midX + (direction * halfStraight), y: capsuleRect.midY)
+            let startAngle: CGFloat = direction > 0 ? -90 : 270
+            let sweep = direction > 0 ? -180 * arcFraction : 180 * arcFraction
+            path.appendArc(withCenter: center,
+                           radius: radius,
+                           startAngle: startAngle,
+                           endAngle: startAngle + sweep,
+                           clockwise: direction > 0)
+        }
+
+        appendSide(direction: -1)
+        appendSide(direction: 1)
+        return path
     }
 
     private func drawTranscribingWave(in capsuleRect: NSRect, alpha: CGFloat) {
@@ -12246,6 +12375,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         view.recordingColor = settings.recordingHUDRecordingColor.nsColor
         view.transcribingColor = settings.recordingHUDTranscribingColor.nsColor
         view.backgroundStyle = settings.recordingHUDBackgroundStyle
+        view.displayMode = settings.recordingHUDDisplayMode
     }
 
     private func animateRecordingHUDIn(_ panel: NSPanel) {
