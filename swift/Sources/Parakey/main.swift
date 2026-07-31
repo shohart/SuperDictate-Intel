@@ -17184,6 +17184,8 @@ private enum ParakeySelfTest {
             return runSuite("overlap-windowing", testOverlapWindowing)
         case "segmented-transcription":
             return runSuite("segmented-transcription", testSegmentedTranscription)
+        case "seam-dedup":
+            return runSuite("seam-dedup", testSeamDedup)
         case "boundary-oracle":
             return runSuite("boundary-oracle", testBoundaryOracle)
         case "vad-boundary-oracle":
@@ -17270,6 +17272,7 @@ private enum ParakeySelfTest {
         try testSileroVadBridge()
         try testPauseSegmentation()
         try testSegmentedTranscription()
+        try testSeamDedup()
         try testTokenTranscriptionDecode()
         try testBoundaryOracle()
         try testVadBoundaryOracle()
@@ -22434,6 +22437,78 @@ private enum ParakeySelfTest {
         // Nothing ever threw -> no error description at all.
         try expect(okOutcome.lastErrorDescription == nil, equals: true,
                    "lastErrorDescription is nil when no call ever threw")
+    }
+
+    // MARK: - Seam token dedup (achetronic/parakeet DD-014 port)
+
+    /// Tests timestamp-based deduplication of tokens at overlap boundaries.
+    /// Pure and deterministic — no model, no I/O.
+    private static func testSeamDedup() throws {
+        let tolerance = 0.24
+        let lookbackCount = 3
+
+        // 1. Exact duplicate: two tokens with identical text and timestamps
+        // within tolerance -> only the first is kept
+        let exactDupInput = [
+            AbsoluteToken(text: "hello", absoluteSeconds: 1.0),
+            AbsoluteToken(text: "hello", absoluteSeconds: 1.0),
+        ]
+        let exactDupOutput = dedupSeam(exactDupInput, toleranceSeconds: tolerance, lookbackCount: lookbackCount)
+        try expect(exactDupOutput.count, equals: 1, "exact duplicate should keep only the first token")
+        try expect(exactDupOutput[0].text, equals: "hello", "exact duplicate should keep the first token's text")
+        try expect(exactDupOutput[0].absoluteSeconds, equals: 1.0, "exact duplicate should keep the first token's timestamp")
+
+        // 2. Collision: two tokens with DIFFERENT text but timestamps within
+        // tolerance -> only the first (earlier) is kept, regardless of text
+        let collisionInput = [
+            AbsoluteToken(text: "hello", absoluteSeconds: 1.0),
+            AbsoluteToken(text: "helo", absoluteSeconds: 1.15),  // within tolerance, different text
+        ]
+        let collisionOutput = dedupSeam(collisionInput, toleranceSeconds: tolerance, lookbackCount: lookbackCount)
+        try expect(collisionOutput.count, equals: 1, "collision should keep only the earlier token")
+        try expect(collisionOutput[0].text, equals: "hello", "collision should keep the earlier token's text")
+
+        // 3. Correctly-kept-far-token: two tokens whose timestamps differ by
+        // MORE than toleranceSeconds -> both kept
+        let farTokenInput = [
+            AbsoluteToken(text: "hello", absoluteSeconds: 1.0),
+            AbsoluteToken(text: "world", absoluteSeconds: 1.5),  // more than tolerance apart
+        ]
+        let farTokenOutput = dedupSeam(farTokenInput, toleranceSeconds: tolerance, lookbackCount: lookbackCount)
+        try expect(farTokenOutput.count, equals: 2, "tokens further apart than tolerance should both be kept")
+        try expect(farTokenOutput[0].text, equals: "hello", "first token should be preserved")
+        try expect(farTokenOutput[1].text, equals: "world", "second token should be preserved")
+
+        // 4. Empty input: dedupSeam([]) returns []
+        let emptyInput: [AbsoluteToken] = []
+        let emptyOutput = dedupSeam(emptyInput, toleranceSeconds: tolerance, lookbackCount: lookbackCount)
+        try expect(emptyOutput.count, equals: 0, "empty input should produce empty output")
+
+        // 5. Lookback window respected: a token that collides in TIME with
+        // something more than lookbackCount POSITIONS back should NOT be
+        // deduped against it (positional lookback, not time window).
+        // Construct: 5 tokens where token[0] and token[4] collide in time
+        // (both at 1.0s) but token[4] is more than lookbackCount=3 positions
+        // away. Tokens 1-3 have distinct timestamps to fill the gap.
+        let lookbackInput = [
+            AbsoluteToken(text: "token0", absoluteSeconds: 1.0),
+            AbsoluteToken(text: "token1", absoluteSeconds: 2.0),  // distinct, will be kept
+            AbsoluteToken(text: "token2", absoluteSeconds: 3.0),  // distinct, will be kept
+            AbsoluteToken(text: "token3", absoluteSeconds: 4.0),  // distinct, will be kept
+            AbsoluteToken(text: "token4", absoluteSeconds: 1.0),  // collides in TIME with token0 (at 1.0s)
+            // but token0 is 4 positions back, outside lookbackCount=3 window
+        ]
+        let lookbackOutput = dedupSeam(lookbackInput, toleranceSeconds: tolerance, lookbackCount: lookbackCount)
+        // Expected: token0, token1, token2, token3, token4 ALL kept
+        // because token4's collision is with token0 which is outside the
+        // lookback window of 3 preceding tokens (only token1, token2, token3 are checked)
+        try expect(lookbackOutput.count, equals: 5,
+                   "token colliding with something beyond lookbackCount positions back should not be deduped")
+        try expect(lookbackOutput[0].text, equals: "token0", "token0 kept")
+        try expect(lookbackOutput[1].text, equals: "token1", "token1 kept")
+        try expect(lookbackOutput[2].text, equals: "token2", "token2 kept")
+        try expect(lookbackOutput[3].text, equals: "token3", "token3 kept")
+        try expect(lookbackOutput[4].text, equals: "token4", "token4 kept (collision outside lookback window)")
     }
 
     // MARK: - Parakeet CPU integration (spec §18.2 — real model, opt-in via env var)
