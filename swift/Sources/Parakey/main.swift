@@ -21593,15 +21593,27 @@ private enum ParakeySelfTest {
                    "a NULL_ARGUMENT failure must set *out_window_size_samples to zero")
 
         // sd_silero_vad_speech_probabilities: NULL samples -> NULL_ARGUMENT.
-        // Uses OpaquePointer(bitPattern:) to fabricate a non-NULL-looking
-        // (but never dereferenced, since samples == NULL fails first)
-        // context pointer, isolating the `samples` check from the
-        // `context` check exercised above.
-        let fakeContext = OpaquePointer(bitPattern: 0xdead_beef)
+        //
+        // The context argument here is NULL too, and deliberately so: the
+        // bridge's guard is a single short-circuiting
+        // `!context || !context->native || !samples || ...` (mirroring
+        // sd_parakeet_transcribe:247), so ANY non-NULL context value is
+        // read as a real SDSileroVadContext and `context->native` is
+        // dereferenced before `samples` is ever looked at. Fabricating a
+        // plausible-looking handle (e.g. OpaquePointer(bitPattern: 0xdeadbeef))
+        // to "isolate" the samples check therefore does not isolate anything
+        // — it is simply a wild pointer dereference, and it crashed this
+        // very self-test with EXC_BAD_ACCESS at 0x00000000deadbeef. There is
+        // no valid non-NULL context obtainable without a real model file, so
+        // isolating the individual NULL checks is not possible in this
+        // model-free group; the contract this group actually owns is the one
+        // the task requires — "a NULL context or NULL samples yields
+        // NULL_ARGUMENT, and the out-parameters are cleared, never
+        // uninitialized."
         var outProbs2: UnsafeMutablePointer<Float>? = UnsafeMutablePointer(bitPattern: 1)
         var outCount2: UInt64 = 42
         let statusNullSamples = sd_silero_vad_speech_probabilities(
-            fakeContext, nil, 3, &outProbs2, &outCount2, nil
+            nil, nil, 3, &outProbs2, &outCount2, nil
         )
         try expect(statusNullSamples, equals: SD_SILERO_VAD_ERR_NULL_ARGUMENT,
                    "sd_silero_vad_speech_probabilities with NULL samples should return NULL_ARGUMENT")
@@ -21612,9 +21624,11 @@ private enum ParakeySelfTest {
 
         // sd_silero_vad_speech_probabilities: NULL out_probabilities/out_count
         // -> NULL_ARGUMENT (both are required together per the header doc).
+        // Same reasoning as above: the context stays NULL rather than a
+        // fabricated handle, since any non-NULL value would be dereferenced.
         var dummySample: Float = 0.1
         let statusNullOutProbs = withUnsafeMutablePointer(to: &dummySample) { samplePtr in
-            sd_silero_vad_speech_probabilities(fakeContext, samplePtr, 1, nil, &outCount2, nil)
+            sd_silero_vad_speech_probabilities(nil, samplePtr, 1, nil, &outCount2, nil)
         }
         try expect(statusNullOutProbs, equals: SD_SILERO_VAD_ERR_NULL_ARGUMENT,
                    "sd_silero_vad_speech_probabilities with a NULL out_probabilities should return NULL_ARGUMENT")
