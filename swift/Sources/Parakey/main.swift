@@ -17186,6 +17186,10 @@ private enum ParakeySelfTest {
             return runSuite("segmented-transcription", testSegmentedTranscription)
         case "boundary-oracle":
             return runSuite("boundary-oracle", testBoundaryOracle)
+        case "vad-boundary-oracle":
+            return runSuite("vad-boundary-oracle", testVadBoundaryOracle)
+        case "vad-boundary-oracle-real":
+            return runSuite("vad-boundary-oracle-real", testVadBoundaryOracleRealModel)
         case "parakeet-cpu":
             return runSuite("parakeet-cpu", testParakeetCPUIntegration)
         case "parakeet-text-repair":
@@ -17268,6 +17272,7 @@ private enum ParakeySelfTest {
         try testSegmentedTranscription()
         try testTokenTranscriptionDecode()
         try testBoundaryOracle()
+        try testVadBoundaryOracle()
     }
 
     /// Covers `textInsertionRoute(for:targetElementStillValid:)` — the
@@ -21803,6 +21808,51 @@ private enum ParakeySelfTest {
         print("SILERO VAD: model=\(modelPath), windows=\(outCount), window_size_samples=\(outWindow)")
     }
 
+    /// Skipped (not failed) unless `SUPERDICTATE_SILERO_VAD_MODEL` points at
+    /// a real, already-downloaded Silero VAD ggml model file -- same gating
+    /// pattern as `testSileroVadRealModel`. Runs the REAL `VadBoundaryOracle`
+    /// (backed by a real, load-once `SileroVadEngine`) over a short
+    /// synthetic buffer with a genuine pause in the middle, and confirms the
+    /// chosen split lands inside that pause.
+    private static func testVadBoundaryOracleRealModel() throws {
+        guard let modelPath = ProcessInfo.processInfo.environment["SUPERDICTATE_SILERO_VAD_MODEL"],
+              FileManager.default.fileExists(atPath: modelPath) else {
+            print("SKIP vad-boundary-oracle-real: SUPERDICTATE_SILERO_VAD_MODEL not set to an existing file")
+            return
+        }
+
+        let engine = try SileroVadEngine(modelPath: modelPath)
+        defer { engine.shutdown() }
+
+        // tone - silence - tone: 1s / 1s / 1s at 16kHz. The pause occupies
+        // the middle third, [16_000, 32_000) in zone-relative samples.
+        let sampleRate = SAMPLE_RATE
+        func toneBlock(seconds: Double, frequency: Double, amplitude: Float) -> [Float] {
+            let count = Int(seconds * sampleRate)
+            return (0..<count).map { i in
+                amplitude * Float(sin(2.0 * Double.pi * frequency * Double(i) / sampleRate))
+            }
+        }
+        var zoneSamples: [Float] = []
+        zoneSamples.append(contentsOf: toneBlock(seconds: 1.0, frequency: 440.0, amplitude: 0.3))
+        let pauseStartOffset = zoneSamples.count
+        zoneSamples.append(contentsOf: [Float](repeating: 0.0, count: Int(1.0 * sampleRate)))
+        let pauseEndOffset = zoneSamples.count
+        zoneSamples.append(contentsOf: toneBlock(seconds: 1.0, frequency: 440.0, amplitude: 0.3))
+
+        let zoneStart = 100_000
+        let zoneEnd = zoneStart + zoneSamples.count
+        let oracle = VadBoundaryOracle(engine: engine)
+        guard let split = oracle.chooseSplit(samples: zoneSamples, zoneStartSample: zoneStart, zoneEndSample: zoneEnd, sampleRate: sampleRate) else {
+            throw SelfTestFailure.failed("VadBoundaryOracle declined against a real model on a buffer with an obvious pause")
+        }
+        let splitOffsetInZone = split - zoneStart
+        try expect(splitOffsetInZone >= pauseStartOffset && splitOffsetInZone < pauseEndOffset, equals: true,
+                   "VadBoundaryOracle should pick a split inside the actual pause (got offset \(splitOffsetInZone), pause range [\(pauseStartOffset), \(pauseEndOffset)))")
+
+        print("VAD BOUNDARY ORACLE: model=\(modelPath), split_offset_in_zone=\(splitOffsetInZone)")
+    }
+
     /// Pure algorithm coverage for `PauseSegmenter.segment` — no model, no
     /// audio hardware. Every case asserts the coverage invariant (segments
     /// exactly tile the input, no samples dropped or duplicated) plus the
@@ -22164,6 +22214,90 @@ private enum ParakeySelfTest {
         let tooLowChain = chainBoundaryOracle([FixedOracle(answer: -5)])
         try expect(tooLowChain([], 100, 200, sampleRate), equals: 100,
                    "an out-of-range answer below the zone is clamped to zoneStartSample")
+    }
+
+    /// Pure decision-logic coverage for `VadBoundaryOracle.chooseSplit` --
+    /// no real model, no native context. Injects a mock
+    /// `SpeechProbabilitySource` (mirroring how `testSegmentedTranscription`
+    /// injects a mock `transcribeOne` closure instead of a real
+    /// `ParakeetEngine`) so the longest-quiet-run selection, center
+    /// computation, and decline paths can all be exercised deterministically.
+    private static func testVadBoundaryOracle() throws {
+        let sampleRate = 16_000.0
+        let zoneStart = 10_000
+        let zoneEnd = 20_000
+
+        struct MockSource: SpeechProbabilitySource {
+            let result: Result<SpeechProbabilities, Error>
+            func speechProbabilities(samples: [Float]) throws -> SpeechProbabilities {
+                switch result {
+                case .success(let value): return value
+                case .failure(let error): throw error
+                }
+            }
+        }
+        struct MockError: Error {}
+
+        // 1) One clear low-probability run in the middle -> its center.
+        // Windows: [high, high, low, low, low, high, high] with windowSize 100.
+        // Run is indices [2, 3, 4] (length 3), center index = 2 + 3/2 = 3.
+        let singleRunProbs = SpeechProbabilities(
+            values: [0.9, 0.8, 0.1, 0.2, 0.1, 0.85, 0.95],
+            windowSizeSamples: 100
+        )
+        let singleRunOracle = VadBoundaryOracle(engine: MockSource(result: .success(singleRunProbs)))
+        let singleRunSplit = singleRunOracle.chooseSplit(samples: [Float](repeating: 0, count: 10_000), zoneStartSample: zoneStart, zoneEndSample: zoneEnd, sampleRate: sampleRate)
+        try expect(singleRunSplit, equals: zoneStart + 3 * 100,
+                   "a single clear low-probability run picks its own center window")
+
+        // 2) Multiple runs of different lengths -> the LONGEST one's center,
+        // not the first one encountered. First run: indices [1] (length 1).
+        // Second (longest) run: indices [4, 5, 6, 7] (length 4), center
+        // index = 4 + 4/2 = 6.
+        let multiRunProbs = SpeechProbabilities(
+            values: [0.9, 0.1, 0.9, 0.9, 0.2, 0.1, 0.3, 0.15, 0.9],
+            windowSizeSamples: 50
+        )
+        let multiRunOracle = VadBoundaryOracle(engine: MockSource(result: .success(multiRunProbs)))
+        let multiRunSplit = multiRunOracle.chooseSplit(samples: [Float](repeating: 0, count: 10_000), zoneStartSample: zoneStart, zoneEndSample: zoneEnd, sampleRate: sampleRate)
+        try expect(multiRunSplit, equals: zoneStart + 6 * 50,
+                   "the LONGEST run's center is picked over an earlier, shorter run")
+
+        // 3) Nothing below the threshold -> declines (nil).
+        let allLoudProbs = SpeechProbabilities(values: [0.9, 0.8, 0.95, 0.7], windowSizeSamples: 100)
+        let allLoudOracle = VadBoundaryOracle(engine: MockSource(result: .success(allLoudProbs)))
+        let allLoudSplit = allLoudOracle.chooseSplit(samples: [Float](repeating: 0, count: 10_000), zoneStartSample: zoneStart, zoneEndSample: zoneEnd, sampleRate: sampleRate)
+        try expect(allLoudSplit == nil, equals: true,
+                   "an array with nothing below the silence threshold declines (returns nil)")
+
+        // 4) VAD-fetch failure -> declines (nil), doesn't crash/throw out.
+        let failingOracle = VadBoundaryOracle(engine: MockSource(result: .failure(MockError())))
+        let failingSplit = failingOracle.chooseSplit(samples: [Float](repeating: 0, count: 10_000), zoneStartSample: zoneStart, zoneEndSample: zoneEnd, sampleRate: sampleRate)
+        try expect(failingSplit == nil, equals: true,
+                   "a VAD-fetch failure declines (returns nil) rather than throwing/crashing")
+
+        // 5) Empty zone -> declines without even consulting the source.
+        let emptyZoneOracle = VadBoundaryOracle(engine: MockSource(result: .success(singleRunProbs)))
+        let emptyZoneSplit = emptyZoneOracle.chooseSplit(samples: [], zoneStartSample: 500, zoneEndSample: 500, sampleRate: sampleRate)
+        try expect(emptyZoneSplit == nil, equals: true,
+                   "a zero-width zone declines immediately")
+
+        // 6) windowSizeSamples == 0 -> declines (can't convert window index
+        // to a sample offset).
+        let zeroWindowProbs = SpeechProbabilities(values: [0.1, 0.1], windowSizeSamples: 0)
+        let zeroWindowOracle = VadBoundaryOracle(engine: MockSource(result: .success(zeroWindowProbs)))
+        let zeroWindowSplit = zeroWindowOracle.chooseSplit(samples: [Float](repeating: 0, count: 10_000), zoneStartSample: zoneStart, zoneEndSample: zoneEnd, sampleRate: sampleRate)
+        try expect(zeroWindowSplit == nil, equals: true,
+                   "a zero window size declines rather than dividing/producing a bogus offset")
+
+        // 7) Custom silenceProbabilityThreshold is honored: a value that
+        // would qualify under the default 0.4 threshold no longer qualifies
+        // under a stricter 0.05 threshold -> declines.
+        var strictOracle = VadBoundaryOracle(engine: MockSource(result: .success(singleRunProbs)))
+        strictOracle.silenceProbabilityThreshold = 0.05
+        let strictSplit = strictOracle.chooseSplit(samples: [Float](repeating: 0, count: 10_000), zoneStartSample: zoneStart, zoneEndSample: zoneEnd, sampleRate: sampleRate)
+        try expect(strictSplit == nil, equals: true,
+                   "a stricter silenceProbabilityThreshold can turn a would-be run into nothing qualifying")
     }
 
     /// Pure orchestration coverage for `transcribeSegments` using a mock
