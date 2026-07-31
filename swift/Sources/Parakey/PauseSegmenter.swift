@@ -13,6 +13,17 @@ import Foundation
 struct AudioSegment: Sendable, Equatable {
     let samples: [Float]
     let hasSignal: Bool
+    /// This segment's absolute offset (in samples) within the original
+    /// captured buffer `PauseSegmenter.segment(...)` was given. Defaults to
+    /// 0 for source compatibility with existing single-segment test
+    /// literals that don't care about absolute position; real segments
+    /// produced by `segment(...)` always set this correctly.
+    let startSample: Int
+    init(samples: [Float], hasSignal: Bool, startSample: Int = 0) {
+        self.samples = samples
+        self.hasSignal = hasSignal
+        self.startSample = startSample
+    }
 }
 
 /// Splits a captured mono PCM buffer into segments cut only at natural
@@ -97,7 +108,8 @@ enum PauseSegmenter {
             guard end > segmentStartSample else { return false }
             let range = segmentStartSample..<end
             segments.append(AudioSegment(samples: Array(samples[range]),
-                                         hasSignal: hasSignal(in: range)))
+                                         hasSignal: hasSignal(in: range),
+                                         startSample: segmentStartSample))
             segmentStartSample = end
             return true
         }

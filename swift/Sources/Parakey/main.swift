@@ -17180,6 +17180,8 @@ private enum ParakeySelfTest {
             return runSuite("silero-vad-real", testSileroVadRealModel)
         case "pause-segmentation":
             return runSuite("pause-segmentation", testPauseSegmentation)
+        case "overlap-windowing":
+            return runSuite("overlap-windowing", testOverlapWindowing)
         case "segmented-transcription":
             return runSuite("segmented-transcription", testSegmentedTranscription)
         case "parakeet-cpu":
@@ -21946,6 +21948,152 @@ private enum ParakeySelfTest {
         try expect(sustainedSegments.count, equals: 1, "the sustained-signal buffer stays a single segment")
         try expect(sustainedSegments[0].hasSignal, equals: true,
                    "a run at the minimum-signal threshold is flagged as having signal")
+    }
+
+    /// Direct regression coverage for `OverlapWindower.addOverlap`, and in
+    /// particular for the single most safety-critical invariant in the
+    /// overlap-segmentation plan: overlap is carved OUT of the existing
+    /// max-segment-seconds safety cap, never added on top of it, so a
+    /// window can never grow long enough to reintroduce the Parakeet
+    /// encoder hang that the original 25s cap exists to prevent.
+    private static func testOverlapWindowing() throws {
+        let sampleRate = 16_000.0
+
+        // 1) Single segment -> exactly one AudioWindow, samples identical to
+        // the input, no overlap added. This is the majority-case invariant:
+        // ordinary short dictations that never get split must be completely
+        // unaffected by this feature's existence.
+        let single = [AudioSegment(samples: [Float](repeating: 0.2, count: Int(2.0 * sampleRate)),
+                                    hasSignal: true, startSample: 0)]
+        let singleWindows = OverlapWindower.addOverlap(to: single, sampleRate: sampleRate)
+        try expect(singleWindows.count, equals: 1, "a single segment produces exactly one window")
+        try expect(singleWindows[0].samples, equals: single[0].samples,
+                   "a single segment's window samples are byte-identical to the input (no overlap added)")
+        try expect(singleWindows[0].startSample, equals: 0, "single-segment window startSample is unshifted")
+        try expect(singleWindows[0].ownedStartSample, equals: 0, "single-segment ownedStartSample is unshifted")
+        try expect(singleWindows[0].ownedEndSample, equals: single[0].samples.count,
+                   "single-segment ownedEndSample covers exactly the input")
+
+        // Also confirm the zero-segment edge case doesn't crash and returns
+        // nothing.
+        let emptyWindows = OverlapWindower.addOverlap(to: [], sampleRate: sampleRate)
+        try expect(emptyWindows.count, equals: 0, "zero segments produces zero windows")
+
+        // 2) BUDGET-SAFETY INVARIANT (the most important assertion in this
+        // task): construct three back-to-back segments EACH AT the 25s
+        // safety cap (as PauseSegmenter would actually emit for a very long
+        // unbroken dictation -- see the "forced cuts" case in
+        // testPauseSegmentation), request a real 4s overlap, and verify
+        // EVERY resulting window's sample count still respects the cap.
+        // Hand-traced arithmetic (sampleRate = 16_000, maxSegmentSeconds =
+        // 25.0 -> maxSegmentSamples = 400_000; each segment.samples.count
+        // == 400_000 exactly, so budget = max(0, 400_000 - 400_000) = 0,
+        // halfBudget = 0, so overlapBefore == overlapAfter == 0 for every
+        // segment regardless of the requested 4s -- i.e. the budget clamp
+        // must reduce the requested overlap all the way to zero when a
+        // segment is already AT the cap, and the resulting window count
+        // must equal exactly maxSegmentSamples, never more).
+        let maxSegmentSeconds = PauseSegmenter.defaultMaxSegmentSeconds
+        let maxSegmentSamples = Int(maxSegmentSeconds * sampleRate)
+        let atCapSegments: [AudioSegment] = (0..<3).map { i in
+            AudioSegment(samples: [Float](repeating: 0.2, count: maxSegmentSamples),
+                         hasSignal: true, startSample: i * maxSegmentSamples)
+        }
+        let atCapWindows = OverlapWindower.addOverlap(to: atCapSegments, sampleRate: sampleRate,
+                                                       overlapSeconds: 4.0,
+                                                       maxSegmentSeconds: maxSegmentSeconds)
+        try expect(atCapWindows.count, equals: 3, "budget-safety case produces one window per input segment")
+        for (i, w) in atCapWindows.enumerated() {
+            try expect(w.samples.count <= maxSegmentSamples, equals: true,
+                       "window \(i) built from an at-cap segment must not exceed the safety cap even with overlap requested")
+            try expect(w.samples.count, equals: maxSegmentSamples,
+                       "window \(i) built from an at-cap segment gets zero overlap (budget fully consumed), so it equals the cap exactly")
+        }
+
+        // 2b) A near-cap variant where segments are NOT exactly at the cap,
+        // so there IS a small budget, and confirm the clamp still respects
+        // both the per-side budget AND the 4s request. Each segment is
+        // 24.5s (392_000 samples); budget = 400_000 - 392_000 = 8_000;
+        // halfBudget = 4_000 samples (0.25s) per side -- far less than the
+        // requested 4s (64_000 samples), so overlapBefore/overlapAfter must
+        // clamp to 4_000, and total window length must be
+        // 392_000 + 4_000 + 4_000 = 400_000 == exactly the cap, for the
+        // middle segment (which has neighbors on both sides).
+        let nearCapSamples = Int(24.5 * sampleRate)
+        let nearCapSegments: [AudioSegment] = (0..<3).map { i in
+            AudioSegment(samples: [Float](repeating: 0.2, count: nearCapSamples),
+                         hasSignal: true, startSample: i * nearCapSamples)
+        }
+        let nearCapWindows = OverlapWindower.addOverlap(to: nearCapSegments, sampleRate: sampleRate,
+                                                         overlapSeconds: 4.0,
+                                                         maxSegmentSeconds: maxSegmentSeconds)
+        for (i, w) in nearCapWindows.enumerated() {
+            try expect(w.samples.count <= maxSegmentSamples, equals: true,
+                       "near-cap window \(i) never exceeds the safety cap")
+        }
+        let expectedHalfBudget = (maxSegmentSamples - nearCapSamples) / 2
+        try expect(expectedHalfBudget, equals: 4_000, "hand-traced half-budget for the near-cap case is 4_000 samples")
+        try expect(nearCapWindows[1].samples.count, equals: nearCapSamples + 2 * expectedHalfBudget,
+                   "the middle near-cap window borrows exactly the clamped per-side budget on both sides")
+        try expect(nearCapWindows[1].samples.count, equals: maxSegmentSamples,
+                   "the middle near-cap window lands exactly at the cap, never over it")
+
+        // 3) Normal case: three moderate segments, well under the cap, so
+        // overlap is limited only by the requested overlapSeconds (4s) and
+        // by neighbor length, never by the budget clamp. Hand-computed
+        // expected values below.
+        let segLen = Int(10.0 * sampleRate) // 160_000 samples each, 10s
+        let seg0 = AudioSegment(samples: [Float](repeating: 0.1, count: segLen), hasSignal: true, startSample: 0)
+        let seg1 = AudioSegment(samples: [Float](repeating: 0.2, count: segLen), hasSignal: true, startSample: segLen)
+        let seg2 = AudioSegment(samples: [Float](repeating: 0.3, count: segLen), hasSignal: true, startSample: 2 * segLen)
+        let normalSegments = [seg0, seg1, seg2]
+        let normalWindows = OverlapWindower.addOverlap(to: normalSegments, sampleRate: sampleRate,
+                                                        overlapSeconds: 4.0,
+                                                        maxSegmentSeconds: maxSegmentSeconds)
+        try expect(normalWindows.count, equals: 3, "normal case produces one window per input segment")
+
+        let overlapSamples = Int(4.0 * sampleRate) // 64_000 -- well under segLen and under budget/2
+        // Middle window (index 1): borrows the LAST `overlapSamples` of seg0
+        // as a leading prefix, then all of seg1, then the FIRST
+        // `overlapSamples` of seg2 as a trailing suffix.
+        let middle = normalWindows[1]
+        let expectedMiddle = Array(seg0.samples.suffix(overlapSamples))
+            + seg1.samples
+            + Array(seg2.samples.prefix(overlapSamples))
+        try expect(middle.samples.count, equals: expectedMiddle.count,
+                   "middle window length equals borrowed-prefix + owned + borrowed-suffix")
+        try expect(middle.samples, equals: expectedMiddle,
+                   "middle window samples exactly match the hand-assembled borrowed-tail + owned + borrowed-head")
+        try expect(middle.startSample, equals: seg1.startSample - overlapSamples,
+                   "middle window startSample is shifted left by the borrowed leading overlap")
+        try expect(middle.ownedStartSample, equals: seg1.startSample,
+                   "middle window ownedStartSample is unchanged from the segment's own startSample")
+        try expect(middle.ownedEndSample, equals: seg1.startSample + seg1.samples.count,
+                   "middle window ownedEndSample is unchanged from the segment's own end")
+
+        // 4) Edge segments get no outward overlap: first window has no
+        // leading overlap (startSample == ownedStartSample), and its
+        // trailing borrowed audio (if any) never reaches past its own
+        // ownedEndSample plus the borrowed suffix -- concretely, the FIRST
+        // window's samples must equal seg0 + borrowed head of seg1 (no
+        // borrowed tail from a nonexistent segment "before" it), and the
+        // LAST window's samples must equal borrowed tail of seg1 + seg2 (no
+        // borrowed head from a nonexistent segment "after" it).
+        let first = normalWindows[0]
+        try expect(first.startSample, equals: first.ownedStartSample,
+                   "the first window has no leading overlap: startSample == ownedStartSample")
+        let expectedFirst = seg0.samples + Array(seg1.samples.prefix(overlapSamples))
+        try expect(first.samples, equals: expectedFirst,
+                   "the first window borrows only a trailing head from segment 2, nothing leading")
+
+        let last = normalWindows[2]
+        let expectedLast = Array(seg1.samples.suffix(overlapSamples)) + seg2.samples
+        try expect(last.samples, equals: expectedLast,
+                   "the last window borrows only a leading tail from segment 2, nothing trailing")
+        try expect(last.ownedEndSample, equals: seg2.startSample + seg2.samples.count,
+                   "the last window's ownedEndSample is its own true end, with nothing borrowed past it")
+        try expect(last.startSample + last.samples.count, equals: last.ownedEndSample,
+                   "the last window's samples end exactly at its own ownedEndSample -- no trailing overlap exists to overrun it")
     }
 
     /// Pure orchestration coverage for `transcribeSegments` using a mock
