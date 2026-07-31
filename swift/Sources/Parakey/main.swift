@@ -600,6 +600,18 @@ enum RecordingHUDBackgroundStyle: String, CaseIterable {
     }
 }
 
+enum RecordingHUDDisplayMode: String, CaseIterable {
+    case levelBars
+    case timerOutline
+
+    var displayName: String {
+        switch self {
+        case .levelBars: return "Level bars"
+        case .timerOutline: return "Timer"
+        }
+    }
+}
+
 func parseRecentTranscriptLimit(storedValue value: Any?) -> RecentTranscriptLimit? {
     if let raw = value as? String {
         return RecentTranscriptLimit(rawValue: raw)
@@ -2800,6 +2812,7 @@ final class Settings: @unchecked Sendable {
     private static let keyRecordingHUDTranscribingColor = "recording_hud_transcribing_color"
     private static let keyRecordingHUDBackgroundStyle = "recording_hud_background_style"
     private static let keyRecordingHUDSize = "recording_hud_size"
+    private static let keyRecordingHUDDisplayMode = "recording_hud_display_mode"
     private static let legacyKeyShowRecordingIndicator = "show_recording_indicator"
     private static let keyMuteWhileRecording = "mute_while_recording"
     private static let keyPlayFeedbackSounds = "play_feedback_sounds"
@@ -3190,6 +3203,20 @@ final class Settings: @unchecked Sendable {
         }
         set {
             defaults.set(newValue.rawValue, forKey: Self.keyRecordingHUDSize)
+            defaults.synchronize()
+        }
+    }
+
+    var recordingHUDDisplayMode: RecordingHUDDisplayMode {
+        get {
+            guard let raw = defaults.string(forKey: Self.keyRecordingHUDDisplayMode),
+                  let mode = RecordingHUDDisplayMode(rawValue: raw) else {
+                return .levelBars
+            }
+            return mode
+        }
+        set {
+            defaults.set(newValue.rawValue, forKey: Self.keyRecordingHUDDisplayMode)
             defaults.synchronize()
         }
     }
@@ -17409,6 +17436,8 @@ private enum ParakeySelfTest {
             return runSuite("parakeet-vulkan-bench", benchmarkParakeetCPUvsVulkan)
         case "token-transcription-decode":
             return runSuite("token-transcription-decode", testTokenTranscriptionDecode)
+        case "recording-hud-display-mode":
+            return runSuite("recording-hud-display-mode", testRecordingHUDDisplayMode)
         case "all":
             return runSuite("all", testAll)
         default:
@@ -17439,6 +17468,7 @@ private enum ParakeySelfTest {
         try testPasteConfirmationPoller()
         try testClipboardPasteInserterRestore()
         try testRecentTranscriptLimit()
+        try testRecordingHUDDisplayMode()
         try testDictationUsageStatistics()
         try testTranscriptCorrections()
         try testFillerWordRemoval()
@@ -19096,6 +19126,35 @@ private enum ParakeySelfTest {
             equals: true,
             "latency log should expose model, end-to-end, and insertion outcomes"
         )
+    }
+
+    private static func testRecordingHUDDisplayMode() throws {
+        let defaults = UserDefaults.standard
+        let key = "recording_hud_display_mode"
+        let previousRaw = defaults.string(forKey: key)
+        defer {
+            if let previousRaw {
+                defaults.set(previousRaw, forKey: key)
+            } else {
+                defaults.removeObject(forKey: key)
+            }
+        }
+
+        defaults.removeObject(forKey: key)
+        let settings = Settings.shared
+        guard settings.recordingHUDDisplayMode == .levelBars else {
+            throw SelfTestFailure.failed("expected default .levelBars, got \(settings.recordingHUDDisplayMode)")
+        }
+
+        settings.recordingHUDDisplayMode = .timerOutline
+        guard settings.recordingHUDDisplayMode == .timerOutline else {
+            throw SelfTestFailure.failed("expected .timerOutline after set, got \(settings.recordingHUDDisplayMode)")
+        }
+
+        defaults.set("not-a-real-mode", forKey: key)
+        guard settings.recordingHUDDisplayMode == .levelBars else {
+            throw SelfTestFailure.failed("expected fallback to .levelBars for garbage stored value")
+        }
     }
 
     private static func testDictationUsageStatistics() throws {
