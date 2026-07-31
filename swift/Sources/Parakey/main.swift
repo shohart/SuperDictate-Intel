@@ -24313,6 +24313,29 @@ private enum ParakeySelfTest {
         try expect(realDecoded.words[0].w, equals: "hello", "first decoded word text")
         try expect(realDecoded.words[1].start, equals: 0.720, "second decoded word start time")
         try expect(realDecoded.tokens.count, equals: 1, "tokens must still decode alongside words")
+
+        // --- 9) A malformed word timestamp must never crash the process -
+        // A corrupted/malformed bridge response could in principle hand us
+        // a non-finite or absurdly large `word.start` that survived JSON
+        // decoding (e.g. via a future bridge change). The `Int(...)`
+        // sample-offset conversion traps on overflow/NaN, so this word
+        // must be skipped BEFORE that conversion rather than reaching it —
+        // and every other, well-formed word in the same window must still
+        // come through untouched.
+        let malformedWords = [
+            word("alpha", 1.0),
+            word("nan", .nan),
+            word("inf", .infinity),
+            word("neginf", -.infinity),
+            word("huge", 1e12),
+            word("beta", 1.4),
+        ]
+        let malformedResult = try assembleOverlapTranscript(
+            windows: [singleWindow], perWindowWords: [malformedWords],
+            fullSamples: [Float](repeating: 0, count: Int(6.0 * rate)),
+            sampleRate: rate, boundaryOracles: [])
+        try expect(malformedResult.text, equals: "alpha beta",
+                   "non-finite and absurdly large word timestamps must be skipped, not crash assembly, while sane words survive")
     }
 
     /// Gated real-hardware end-to-end check for the overlap path. Skipped

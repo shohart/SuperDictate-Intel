@@ -128,6 +128,14 @@ func assembleOverlapTranscript(
         for word in perWindowWords[index] {
             let text = word.w.trimmingCharacters(in: .whitespacesAndNewlines)
             if text.isEmpty { continue }
+            // Guard against a malformed/corrupted bridge response handing us
+            // a non-finite or absurd timestamp: the `Int(...)` conversion
+            // below traps on overflow/NaN, which would crash the whole
+            // process instead of falling back to the plain segmentation
+            // path like every other failure mode in this function does.
+            // Skipping just this one word (same as the empty-text case
+            // above) keeps the rest of the window's words intact.
+            guard word.start.isFinite, word.start.magnitude < 1e6 else { continue }
             let absoluteSeconds = Double(window.startSample) / sampleRate + word.start
             let absoluteSample = window.startSample + Int((word.start * sampleRate).rounded())
             guard absoluteSample >= leftBound, absoluteSample < rightBound else { continue }
