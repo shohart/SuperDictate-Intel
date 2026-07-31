@@ -300,30 +300,37 @@ enum RussianNumberNormalizer {
         return s.first?.isNumber == true
     }
 
+    /// Parakeet routinely inserts stray punctuation at the pause right
+    /// before or after a spoken punctuation word ("168, точка, 1", but also
+    /// observed with a period instead of a comma: "168 точка. 1") -- either
+    /// character is an artifact of the pause, not meaningful punctuation, so
+    /// both are treated as skippable filler throughout this file.
+    private static func isFillerPunctuationChar(_ character: Character) -> Bool {
+        character == "," || character == "."
+    }
+
     /// True if `result`'s trailing content is a digit once whitespace and a
-    /// single run of stray commas are ignored -- Parakeet routinely inserts
-    /// a comma at the pause right before a spoken punctuation word ("168,
-    /// точка, 1"), and that artifact comma should not block the digit-before
-    /// check.
+    /// single run of stray filler punctuation is ignored -- see
+    /// `isFillerPunctuationChar`.
     private static func endsWithDigitIgnoringFiller(_ result: String) -> Bool {
         var chars = Substring(result)
-        while let last = chars.last, last.isWhitespace || last == "," {
+        while let last = chars.last, last.isWhitespace || isFillerPunctuationChar(last) {
             chars.removeLast()
         }
         return chars.last?.isNumber == true
     }
 
     private static func trimTrailingFiller(_ result: inout String) {
-        while let last = result.last, last.isWhitespace || last == "," {
+        while let last = result.last, last.isWhitespace || isFillerPunctuationChar(last) {
             result.removeLast()
         }
     }
 
-    /// Scans forward from `index` past whitespace/comma filler (the same
-    /// artifact commas `endsWithDigitIgnoringFiller` looks past) to find the
-    /// next substantive token, reporting whether it's numeric -- a raw
-    /// digit token, or the start of a recognized cardinal/ordinal word --
-    /// and how many filler tokens precede it, so the caller can skip past
+    /// Scans forward from `index` past whitespace/filler-punctuation (the
+    /// same artifact characters `endsWithDigitIgnoringFiller` looks past) to
+    /// find the next substantive token, reporting whether it's numeric -- a
+    /// raw digit token, or the start of a recognized cardinal/ordinal word
+    /// -- and how many filler tokens precede it, so the caller can skip past
     /// them without copying them to the output.
     private static func lookaheadIsNumeric(_ tokens: [Token], from index: Int) -> (isNumeric: Bool, fillerTokenCount: Int) {
         var cursor = index
@@ -333,7 +340,7 @@ enum RussianNumberNormalizer {
             case .whitespace:
                 cursor += 1
                 fillerCount += 1
-            case .punctuation(","):
+            case .punctuation(let s) where s.count == 1 && s.first.map(isFillerPunctuationChar) == true:
                 cursor += 1
                 fillerCount += 1
             default:
