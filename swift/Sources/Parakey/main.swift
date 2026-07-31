@@ -889,6 +889,13 @@ func asrTimingTooltip(_ timing: ASRTimingBreakdown?) -> String? {
     ].joined(separator: "\n")
 }
 
+private func formatRecordingHUDElapsed(_ seconds: TimeInterval) -> String {
+    let totalSeconds = max(0, Int(seconds))
+    let minutes = totalSeconds / 60
+    let secs = totalSeconds % 60
+    return String(format: "%02d:%02d", minutes, secs)
+}
+
 struct DictationLatencyMetrics: Equatable {
     let audioSeconds: Double
     let hotkeyDispatchSeconds: Double?
