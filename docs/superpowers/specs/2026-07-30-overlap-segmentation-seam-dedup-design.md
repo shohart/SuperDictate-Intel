@@ -191,16 +191,38 @@ duplicate at the seam, a collision (different text, same timestamp) to be
 resolved in favor of the earlier segment, and a token far enough from the
 tolerance window to be correctly kept on both sides (no false-positive drop).
 
+*(Terminology note: the shipped path consumes the JSON's already-decoded
+`words` array rather than raw SentencePiece tokens, so "token" throughout
+this section is effectively "word" in the actual implementation —
+`dedupAcrossSeam` operates on `AbsoluteToken` values built from those words,
+not sub-word tokens.)*
+
 ### 6. Assembly
 
 For each segment, after the boundary oracle has decided (or defaulted to)
 an ownership split with each neighbor, keep only the tokens whose absolute
-timestamp falls inside that segment's owned span; join kept tokens' text
-across all segments in order; run seam dedup as the always-on second pass
-over the full ordered token stream before final text assembly. This
-produces one final transcript exactly as `transcribeSegmented` does today —
-downstream (`processedDictationText`, history, insertion) is unchanged,
-consuming a single assembled string as before.
+timestamp falls inside that segment's owned span. Seam dedup then runs once
+*per seam boundary*, not as a single pass over the whole ordered stream:
+at each boundary it compares only the earlier window's trailing kept words
+against the later window's leading candidate words that fall inside that
+seam's tolerance band (per §5), and drops/resolves duplicates locally
+before the two sides are joined. The deduped, ownership-split segments are
+then joined in order to produce one final transcript exactly as
+`transcribeSegmented` does today — downstream (`processedDictationText`,
+history, insertion) is unchanged, consuming a single assembled string as
+before.
+
+> **Correction:** an earlier draft of this section described dedup as
+> running "as the always-on second pass over the full ordered token stream" —
+> i.e. globally across the whole transcript. That formulation was found
+> during implementation (Task 9) to be destructive: on a real dictation,
+> roughly 18% of ordinary consecutive word pairs anywhere in the transcript
+> happen to fall within the ~240ms tolerance window, so a whole-stream pass
+> would drop large numbers of legitimate words that have nothing to do with
+> a segment seam. The shipped implementation instead follows §5's original
+> scoping — strictly local to each seam boundary — as implemented in
+> `dedupAcrossSeam` (`swift/Sources/Parakey/SeamDedup.swift`). This section
+> has been updated to match; §5 was already correct.
 
 ### Error handling
 
