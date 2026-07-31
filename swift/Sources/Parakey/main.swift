@@ -17438,6 +17438,8 @@ private enum ParakeySelfTest {
             return runSuite("token-transcription-decode", testTokenTranscriptionDecode)
         case "recording-hud-display-mode":
             return runSuite("recording-hud-display-mode", testRecordingHUDDisplayMode)
+        case "recording-hud-elapsed-format":
+            return runSuite("recording-hud-elapsed-format", testFormatRecordingHUDElapsed)
         case "all":
             return runSuite("all", testAll)
         default:
@@ -17469,6 +17471,7 @@ private enum ParakeySelfTest {
         try testClipboardPasteInserterRestore()
         try testRecentTranscriptLimit()
         try testRecordingHUDDisplayMode()
+        try testFormatRecordingHUDElapsed()
         try testDictationUsageStatistics()
         try testTranscriptCorrections()
         try testFillerWordRemoval()
@@ -19154,6 +19157,27 @@ private enum ParakeySelfTest {
         defaults.set("not-a-real-mode", forKey: key)
         guard settings.recordingHUDDisplayMode == .levelBars else {
             throw SelfTestFailure.failed("expected fallback to .levelBars for garbage stored value")
+        }
+    }
+
+    private static func testFormatRecordingHUDElapsed() throws {
+        let cases: [(TimeInterval, String)] = [
+            (0, "00:00"),
+            (9, "00:09"),
+            (9.9, "00:09"),
+            (10, "00:10"),
+            (59, "00:59"),
+            (60, "01:00"),
+            (65, "01:05"),
+            (599, "09:59"),
+            (600, "10:00"),
+            (3661, "61:01"),
+        ]
+        for (input, expected) in cases {
+            let actual = formatRecordingHUDElapsed(input)
+            guard actual == expected else {
+                throw SelfTestFailure.failed("formatRecordingHUDElapsed(\(input)) = \(actual), expected \(expected)")
+            }
         }
     }
 
