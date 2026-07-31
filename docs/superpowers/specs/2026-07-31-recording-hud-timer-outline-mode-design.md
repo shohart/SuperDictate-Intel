@@ -115,10 +115,23 @@ recording time reaches **10 seconds** does the view switch to the
 timer-text + outline-fill rendering. Short utterances (under 10s) never
 change appearance, regardless of the setting; the timer/outline treatment
 is reserved for recordings long enough that knowing the elapsed duration
-is actually useful. This is a rendering-time check
-(`elapsed >= 10`) inside the view's draw dispatch, not a separate stored
-state — dropping back under 10s (not possible in practice, since elapsed
-time only increases within one recording) would revert automatically.
+is actually useful.
+
+The switch at the 10s mark is a smooth crossfade, not a hard cut —
+matching the existing appear/disappear animation quality
+(`RECORDING_HUD_ANIMATE_IN_SECONDS`/`smootherstep`, already used in
+`drawFloatingWaveformOnly()`). A `timerModeTransition: CGFloat` progress
+value on `RecordingHUDView`, eased with the same `smootherstep` helper
+already in this file, ramps from 0 to 1 over a short fixed duration
+(0.5s) once elapsed crosses 10s. While `0 < timerModeTransition < 1`,
+both the bar visualization and the timer/outline visualization are drawn
+in the same frame, cross-dissolved by alpha (bars at
+`1 - timerModeTransition`, timer/outline at `timerModeTransition`) — the
+same technique `drawTranscribingWave` already uses to blend
+`recordingAccent`/`transcribingAccent`. This is computed every frame from
+`elapsed` (no stored "have we crossed 10s yet" flag needed beyond the
+transition progress itself), so it naturally only plays once per
+recording, forward.
 
 ### Interaction with other HUD modes
 
