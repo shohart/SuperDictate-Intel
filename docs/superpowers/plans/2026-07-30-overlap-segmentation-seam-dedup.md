@@ -127,26 +127,6 @@ EOF
 
 ---
 
-> **BLOCKER (2026-07-31, autonomous session)**: every remaining task (2-9) has a
-> mandatory "build + self-test [+ safety-check] on the Mac" step over
-> `ssh shohart@192.168.1.246`. This session's environment has no credential for
-> that host: `~/.ssh/` contains only a GitHub deploy key, `ssh-add -l` reports no
-> loaded identities, and `ssh shohart@192.168.1.246` fails with
-> `Permission denied, please try again.` /
-> `Authentications that can continue: publickey,password,keyboard-interactive`
-> (host is reachable, credential is simply absent — not a network/host problem).
-> A prior session in this same worktree branch DID have this access (see
-> `.superpowers/sdd/2026-07-30-overlap-segmentation-seam-dedup/task-1-report.md`'s
-> logged `swift build` output and commit `2a9830e`'s message), so this is an
-> environment-provisioning gap for this specific session, not a project-wide
-> change. No self-test or safety-check was run this session (none was possible),
-> and no new code was written for Task 2, since an unverifiable `extern "C"`
-> bridge (manual malloc ownership, NULL-safety, exception-boundary contract) is
-> exactly the kind of change this project's own conventions require Mac
-> verification for before committing. Human action needed: provision an SSH key
-> (or agent forwarding) for `shohart@192.168.1.246` in this worktree's execution
-> environment, then resume at Task 2 Step 1.
-
 ### Task 2: Silero VAD C bridge (`sd_silero_vad_speech_probabilities`)
 
 **Files:**
@@ -204,23 +184,23 @@ const char *sd_silero_vad_last_error_message(const SDSileroVadContext *context);
 
 **Steps:**
 
-- [ ] **Step 1: Verify the exact upstream signatures**
+- [x] **Step 1: Verify the exact upstream signatures**
 
 Read the actual vendored `swift/Sources/parakeet_cpp/upstream-vad/*.h` from Task 1 (not this plan's research notes) to get the real, current parameter types/order for whichever `whisper_vad_init_*`/`whisper_vad_detect_speech*`/`whisper_vad_n_probs`/`whisper_vad_probs` functions Task 1 actually extracted. Adjust the bridge implementation's internal calls accordingly — the *external* C API above (the `sd_silero_vad_*` names/shapes) is this project's own stable surface and should not need to change regardless of upstream's exact internal signatures.
 
-- [ ] **Step 2: Implement the bridge**
+- [x] **Step 2: Implement the bridge**
 
 Add the struct/enum declarations above to the header, and implement each function in the corresponding `.cpp`, following `sd_parakeet_transcribe`'s exact pattern: NULL-check every pointer argument first, wrap every call into the vendored VAD code in `try { ... } catch (...) { status = SD_SILERO_VAD_ERR_NATIVE_EXCEPTION; }`, store the last error string on the context (same `last_error` field pattern used by `SDParakeetContext`), never let an exception propagate past the `extern "C"` boundary.
 
-- [ ] **Step 3: Add a `parakeet-bridge`-style self-test**
+- [x] **Step 3: Add a `parakeet-bridge`-style self-test**
 
 Look at the existing `testParakeetBridge` self-test (search `main.swift` for `private static func testParakeetBridge`) for the pattern: NULL-argument validation, an invalid model path, etc. — no real model needed for these cases. Add an analogous `silero-vad-bridge` self-test group covering: `sd_silero_vad_create` with a NULL path returns `SD_SILERO_VAD_ERR_NULL_ARGUMENT`; with a nonexistent path returns `SD_SILERO_VAD_ERR_MODEL_LOAD_FAILED`; `sd_silero_vad_speech_probabilities` with a NULL context/samples returns `SD_SILERO_VAD_ERR_NULL_ARGUMENT`; with `sample_count == 0` returns `SD_SILERO_VAD_ERR_EMPTY_AUDIO`. Register it in the `switch` in `ParakeySelfTest.run` and in `testAll()`, matching the exact pattern used for `pause-segmentation`/`segmented-transcription` in the prior plan.
 
-- [ ] **Step 4: Real-model integration self-test (gated, skipped without the model)**
+- [x] **Step 4: Real-model integration self-test (gated, skipped without the model)**
 
 Add a `silero-vad-real` self-test group, gated behind an env var the same way `testParakeetCPUIntegration` is gated behind `SUPERDICTATE_PARAKEET_MODEL` (search `main.swift` for that pattern) — e.g. `SUPERDICTATE_SILERO_VAD_MODEL`. When the env var isn't set to an existing file path, `print("SKIP silero-vad-real: ...")` and return, never fail. When it is set: load the model, run `sd_silero_vad_speech_probabilities` over a short synthetic buffer (e.g. 2 seconds of alternating silence/tone, built the same way `testParakeetCPUIntegration` builds its synthetic buffer), and assert `out_count > 0` and the returned probabilities are all in `[0, 1]`.
 
-- [ ] **Step 5: Build + self-test on the Mac**
+- [x] **Step 5: Build + self-test on the Mac**
 
 ```bash
 git archive HEAD | ssh shohart@192.168.1.246 'rm -rf ~/scratch/sd-overlap && mkdir -p ~/scratch/sd-overlap && tar -x -C ~/scratch/sd-overlap'
@@ -229,7 +209,7 @@ ssh shohart@192.168.1.246 'cd ~/scratch/sd-overlap/swift && ./.build/debug/Parak
 ```
 Then the safety check (per Global Constraints).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add swift/Sources/parakeet_cpp/ swift/Sources/Parakey/main.swift
