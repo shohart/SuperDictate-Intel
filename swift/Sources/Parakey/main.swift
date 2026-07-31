@@ -17468,6 +17468,7 @@ private enum ParakeySelfTest {
         try testParakeetBridge()
         try testSileroVadBridge()
         try testPauseSegmentation()
+        try testOverlapWindowing()
         try testSegmentedTranscription()
         try testSeamDedup()
         try testOverlapAssembly()
