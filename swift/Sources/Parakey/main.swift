@@ -9363,6 +9363,8 @@ private final class RecordingHUDView: NSView {
         }
     }
 
+    var recordingStartedAt: Date?
+
     var phase: CGFloat = 0 {
         didSet {
             if oldValue != phase { needsDisplay = true }
@@ -10815,6 +10817,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var staleRecordingLevelTicks = 0
     private var recordingHUDPanel: NSPanel?
     private var recordingHUDView: RecordingHUDView?
+    private var recordingHUDStartedAt: Date?
     private var recordingHUDTranscribingStartedAt: TimeInterval?
     private var recordingHUDAnimationToken = 0
     private var recordingHUDDisplayLink: CADisplayLink?
@@ -11978,6 +11981,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         lastRecordingLevelSequence = 0
         staleRecordingLevelTicks = 0
         recordingHUDPhase = 0
+        recordingHUDStartedAt = Date()
         recordingHUDInsertionTargetFrame = nil
         recordingHUDInsertionTargetVisualFrame = nil
         recordingHUDFallbackWindowFrame = nil
@@ -12019,6 +12023,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         recordingVisualLevel = 0
         lastRecordingLevelSequence = 0
         staleRecordingLevelTicks = 0
+        recordingHUDStartedAt = nil
         if !isRecording {
             stopRecordingHUDTargetTracking(clearTarget: false)
         }
@@ -12078,6 +12083,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             view.mode = mode
             view.level = level
             view.phase = recordingHUDPhase
+            view.recordingStartedAt = recordingHUDStartedAt
         }
         if shouldAnimate {
             animateRecordingHUDIn(panel)
@@ -12099,6 +12105,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             view.mode = mode
             view.level = level
             view.phase = recordingHUDPhase
+            view.recordingStartedAt = recordingHUDStartedAt
         }
     }
 
