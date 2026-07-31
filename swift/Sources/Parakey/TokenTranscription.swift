@@ -12,16 +12,55 @@ struct Token: Sendable, Decodable, Equatable {
     let conf: Double
 }
 
+/// One ALREADY-DECODED word from the same JSON document's `"words"` array
+/// (`{"w":"...","start":0.480,"end":0.640,"conf":0.9100}`, per
+/// `parakeet_capi_transcribe_path_json`'s doc comment, which
+/// `parakeet_capi_transcribe_pcm_batch_json` reproduces per clip). Unlike
+/// `Token`, this carries its own human-readable text, so overlap assembly
+/// (see OverlapAssembly.swift) can dedup and re-join words without ever
+/// needing SentencePiece detokenization. `start`/`end` are seconds relative
+/// to the START of the buffer passed to that transcribe call, exactly like
+/// `Token.t`.
+struct TranscribedWord: Sendable, Decodable, Equatable {
+    let w: String
+    let start: Double
+    let end: Double
+    let conf: Double
+}
+
 /// Decoded result of a token-timestamp transcription call.
+///
+/// `tokens` and `words` are both decoded leniently (missing key -> empty
+/// array) rather than as required keys: the two arrays are independently
+/// useful, the real bridge always emits both, and a hypothetical future
+/// bridge/model that emitted only one must not turn into a hard decode
+/// failure for callers that only wanted the other.
 struct TokenTranscription: Sendable, Decodable, Equatable {
     let text: String
     let frameSec: Double
     let tokens: [Token]
+    let words: [TranscribedWord]
 
     enum CodingKeys: String, CodingKey {
         case text
         case frameSec = "frame_sec"
         case tokens
+        case words
+    }
+
+    init(text: String, frameSec: Double, tokens: [Token], words: [TranscribedWord] = []) {
+        self.text = text
+        self.frameSec = frameSec
+        self.tokens = tokens
+        self.words = words
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        text = try container.decode(String.self, forKey: .text)
+        frameSec = try container.decode(Double.self, forKey: .frameSec)
+        tokens = try container.decodeIfPresent([Token].self, forKey: .tokens) ?? []
+        words = try container.decodeIfPresent([TranscribedWord].self, forKey: .words) ?? []
     }
 }
 

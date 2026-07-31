@@ -5691,6 +5691,17 @@ private struct TranscriptionWorkerResult: Sendable {
     }
 }
 
+/// `TranscriptionWorkerResult`'s sibling for the token/word-timestamp call
+/// (`TranscriptionWorker.transcribeWithTokens`). Carries no
+/// `hadSegmentFailure`: the overlap path never produces one (it throws and
+/// defers to the plain path instead — see `assembleOverlapTranscript`).
+private struct TokenTranscriptionWorkerResult: Sendable {
+    let transcription: TokenTranscription
+    let workerQueueSeconds: Double
+    let engineCallSeconds: Double
+    let engineProcessingSeconds: Double
+}
+
 private struct CompletedTranscriptionWorkerResult: Sendable {
     let transcription: TranscriptionWorkerResult
     let completedAt: TimeInterval
@@ -6027,6 +6038,42 @@ actor TranscriptionWorker {
         )
     }
 
+    /// Token/word-timestamp sibling of `transcribe(...)`, used ONLY by the
+    /// overlap-window path in `transcribeSegmented`. Mirrors `transcribe`'s
+    /// engine-presence check, `inFlight` reentrancy backstop (including the
+    /// `defer` that clears it, so a throw out of here leaves the worker
+    /// usable for the plain-path fallback that immediately follows) and
+    /// timing accounting.
+    ///
+    /// Deliberately does NOT reimplement `transcribe`'s mid-session
+    /// Vulkan-inference-failure CPU fallback: a Vulkan failure here throws,
+    /// `transcribeSegmented` catches it and re-runs the whole dictation on
+    /// the plain path, and THAT path's `transcribe(...)` performs the real
+    /// fallback exactly as it does today. One fallback implementation, one
+    /// site mutating `vulkanFailedThisSession`/`runtimeStatus`/`engine`.
+    /// See task-9-report.md for the full reasoning.
+    fileprivate func transcribeWithTokens(samples: [Float],
+                                          requestedAt: TimeInterval) async throws -> TokenTranscriptionWorkerResult {
+        let workerEnteredAt = ProcessInfo.processInfo.systemUptime
+        guard let engine else { throw NSError(domain: "Parakey", code: -2) }
+        guard !inFlight else {
+            log("ASR: transcribeWithTokens re-entered while another transcription is in flight — refusing")
+            throw NSError(domain: "Parakey", code: -3)
+        }
+        inFlight = true
+        defer { inFlight = false }
+
+        let engineCallStartedAt = ProcessInfo.processInfo.systemUptime
+        let transcription = try await engine.transcribeWithTokens(samples: samples)
+        let engineCallCompletedAt = ProcessInfo.processInfo.systemUptime
+        return TokenTranscriptionWorkerResult(
+            transcription: transcription,
+            workerQueueSeconds: workerEnteredAt - requestedAt,
+            engineCallSeconds: engineCallCompletedAt - engineCallStartedAt,
+            engineProcessingSeconds: engineCallCompletedAt - engineCallStartedAt
+        )
+    }
+
     func warmUp() async throws -> ASRTimingBreakdown {
         let samples = [Float](repeating: 0, count: Int(SAMPLE_RATE * 0.4))
         let requestedAt = ProcessInfo.processInfo.systemUptime
@@ -6072,6 +6119,30 @@ fileprivate func transcribeSegmented(
 ) async throws -> TranscriptionWorkerResult {
     let segments = PauseSegmenter.segment(samples: samples, sampleRate: SAMPLE_RATE)
 
+    // Multi-segment dictations only: try the overlap-window + boundary-oracle
+    // + word-timestamp-dedup path first. ANY failure anywhere inside it (a
+    // Vulkan throw, a JSON decode failure, a VAD/bridge failure, a
+    // signal-bearing window that produced nothing, an empty transcript)
+    // falls through to the plain path below — which is byte-for-byte the
+    // v0.4.6 behavior, retries included. A 0- or 1-segment dictation (the
+    // overwhelming majority) never even evaluates this branch: no
+    // `OverlapWindower`, no `BoundaryOracle`, no `SileroVadEngine`, no
+    // added latency.
+    if segments.count > 1 {
+        do {
+            let result = try await transcribeWithOverlapWindows(
+                samples: samples,
+                segments: segments,
+                worker: worker,
+                requestedAt: requestedAt
+            )
+            log("overlap transcription path: succeeded")
+            return result
+        } catch {
+            log("overlap transcription path failed (\(error.localizedDescription)), falling back to plain segmentation")
+        }
+    }
+
     var totalDecoderPreparationSeconds = 0.0
     var totalEngineCallSeconds = 0.0
     var totalEngineProcessingSeconds = 0.0
@@ -6111,6 +6182,128 @@ fileprivate func transcribeSegmented(
         engineProcessingSeconds: totalEngineProcessingSeconds,
         hadSegmentFailure: outcome.hadSegmentFailure
     )
+}
+
+/// The overlap path, in two deliberately separated phases:
+///
+/// **Phase A (`async`)** — transcribe every overlap window through the
+/// worker, collecting word timestamps. Nothing model-independent happens
+/// here.
+///
+/// **Phase B (fully synchronous, `assembleOverlapWindows` below)** — load
+/// the VAD model at most once, run the boundary oracle over every seam,
+/// filter by ownership, dedup, join.
+///
+/// The split is not cosmetic. `SileroVadEngine`/`VadBoundaryOracle` hold
+/// non-`Sendable` mutable state and a raw native context; keeping every use
+/// of them inside one synchronous function means they are constructed once,
+/// never cross an `await`, never touch a second isolation domain, and are
+/// destroyed by a `defer` on every exit path including every throw.
+///
+/// Throws on ANY problem; the sole caller turns that into a plain-path
+/// fallback for the whole dictation.
+///
+/// Takes no `language`/`resolveViaKeyboard`: the plain path's only use of
+/// them is a `_ =`-discarded `resolveEffectiveDictationLanguage(...)` call
+/// (a pure function — see KeyboardLanguage.swift — whose result that path
+/// also discards, since parakeet.cpp's PCM entry point accepts no forced
+/// language), so omitting it here changes nothing observable.
+fileprivate func transcribeWithOverlapWindows(
+    samples: [Float],
+    segments: [AudioSegment],
+    worker: TranscriptionWorker,
+    requestedAt: TimeInterval
+) async throws -> TranscriptionWorkerResult {
+    // `segments` MUST be `PauseSegmenter.segment(...)`'s direct output —
+    // never filtered or reordered — or every `AudioSegment.startSample`,
+    // and therefore every absolute seam timestamp below, is wrong. The
+    // caller passes it straight through; keep it that way.
+    let windows = OverlapWindower.addOverlap(to: segments, sampleRate: SAMPLE_RATE)
+
+    // --- Phase A: one token/word-timestamp ASR call per window ---------
+    var perWindowWords: [[TranscribedWord]] = []
+    perWindowWords.reserveCapacity(windows.count)
+    var totalEngineCallSeconds = 0.0
+    var totalEngineProcessingSeconds = 0.0
+    var firstWorkerQueueSeconds = 0.0
+
+    for (index, window) in windows.enumerated() {
+        let result = try await worker.transcribeWithTokens(samples: window.samples, requestedAt: requestedAt)
+        if index == 0 { firstWorkerQueueSeconds = result.workerQueueSeconds }
+        totalEngineCallSeconds += result.engineCallSeconds
+        totalEngineProcessingSeconds += result.engineProcessingSeconds
+        perWindowWords.append(result.transcription.words)
+    }
+
+    // --- Phase B: synchronous, model-lifetime-scoped assembly ----------
+    let assembled = try assembleOverlapWindows(windows: windows,
+                                               perWindowWords: perWindowWords,
+                                               fullSamples: samples)
+    log("overlap transcription: \(windows.count) windows, seam splits \(assembled.seamSplitSamples), \(assembled.droppedAtSeams) word(s) deduped at seams")
+
+    return TranscriptionWorkerResult(
+        text: assembled.text,
+        workerQueueSeconds: firstWorkerQueueSeconds,
+        decoderPreparationSeconds: 0,
+        engineCallSeconds: totalEngineCallSeconds,
+        engineProcessingSeconds: totalEngineProcessingSeconds,
+        // Always false, by construction: `assembleOverlapTranscript` throws
+        // (rather than returning) whenever a signal-bearing window produced
+        // nothing, so this path only ever RETURNS when nothing was lost.
+        // Every real loss is handled by the plain path's shipped
+        // retry/`hadSegmentFailure`/retain-on-loss net, untouched here.
+        hadSegmentFailure: false
+    )
+}
+
+/// Where the Silero VAD model file would live if it were staged. There is
+/// deliberately NO download wiring for it yet (see
+/// scripts/vendor-silero-vad.sh's PROVENANCE notes), so on a normal install
+/// this file is absent, `SileroVadEngine` is never constructed, and the
+/// oracle chain runs mel-energy → midpoint. That is a fully supported
+/// configuration, not a degraded one.
+private func sileroVadModelPath() -> String {
+    if let override = ProcessInfo.processInfo.environment["SUPERDICTATE_SILERO_VAD_MODEL"], !override.isEmpty {
+        return override
+    }
+    return parakeetModelCacheDirectory()
+        .appendingPathComponent("ggml-silero-v6.2.0.bin", isDirectory: false).path
+}
+
+/// Phase B of the overlap path — see `transcribeWithOverlapWindows`.
+/// Synchronous on purpose: `SileroVadEngine` is created at most once here,
+/// used for every seam of this dictation, and torn down by the `defer`
+/// before returning or throwing.
+private func assembleOverlapWindows(
+    windows: [AudioWindow],
+    perWindowWords: [[TranscribedWord]],
+    fullSamples: [Float]
+) throws -> OverlapAssemblyResult {
+    var oracles: [BoundaryOracle] = []
+    var vadEngine: SileroVadEngine?
+    defer { vadEngine?.shutdown() }
+
+    let modelPath = sileroVadModelPath()
+    if FileManager.default.fileExists(atPath: modelPath) {
+        do {
+            let engine = try SileroVadEngine(modelPath: modelPath)
+            vadEngine = engine
+            oracles.append(VadBoundaryOracle(engine: engine))
+        } catch {
+            // Never fatal — the design doc is explicit that a missing or
+            // broken VAD model degrades seam placement, never the dictation.
+            log("overlap transcription: Silero VAD unavailable (\(error.localizedDescription)) — using mel-energy/midpoint seam placement")
+        }
+    } else {
+        log("overlap transcription: no Silero VAD model at \(modelPath) — using mel-energy/midpoint seam placement")
+    }
+    oracles.append(MelEnergyBoundaryOracle())
+
+    return try assembleOverlapTranscript(windows: windows,
+                                         perWindowWords: perWindowWords,
+                                         fullSamples: fullSamples,
+                                         sampleRate: SAMPLE_RATE,
+                                         boundaryOracles: oracles)
 }
 
 // MARK: - Transcript corrections
@@ -17186,6 +17379,10 @@ private enum ParakeySelfTest {
             return runSuite("segmented-transcription", testSegmentedTranscription)
         case "seam-dedup":
             return runSuite("seam-dedup", testSeamDedup)
+        case "overlap-assembly":
+            return runSuite("overlap-assembly", testOverlapAssembly)
+        case "overlap-transcription-real":
+            return runSuite("overlap-transcription-real", testOverlapTranscriptionRealModel)
         case "boundary-oracle":
             return runSuite("boundary-oracle", testBoundaryOracle)
         case "vad-boundary-oracle":
@@ -17273,6 +17470,7 @@ private enum ParakeySelfTest {
         try testPauseSegmentation()
         try testSegmentedTranscription()
         try testSeamDedup()
+        try testOverlapAssembly()
         try testTokenTranscriptionDecode()
         try testBoundaryOracle()
         try testVadBoundaryOracle()
@@ -23939,6 +24137,297 @@ private enum ParakeySelfTest {
             equals: .pass,
             "later Escape keyUp should pass through once the canceled press is complete"
         )
+    }
+
+    // MARK: - Overlap assembly (Task 9)
+    //
+    // `assembleOverlapTranscript` is the whole genuinely-new integration
+    // step, and it is a pure synchronous function over synthetic data —
+    // no `TranscriptionWorker`, no models, no protocol seam needed on the
+    // concrete actor. Everything below runs with zero model files staged.
+
+    /// Builds a window whose owned span is [ownedStart, ownedEnd) with
+    /// `overlapBefore`/`overlapAfter` samples borrowed from its neighbors.
+    /// `samples` content is irrelevant to assembly (only the oracle reads
+    /// audio, and these tests pin the oracle), so it's zero-filled.
+    private static func assemblyWindow(ownedStart: Int, ownedEnd: Int,
+                                       overlapBefore: Int = 0, overlapAfter: Int = 0,
+                                       hasSignal: Bool = true) -> AudioWindow {
+        AudioWindow(samples: [Float](repeating: 0, count: (ownedEnd - ownedStart) + overlapBefore + overlapAfter),
+                    startSample: ownedStart - overlapBefore,
+                    ownedStartSample: ownedStart,
+                    ownedEndSample: ownedEnd,
+                    hasSignal: hasSignal)
+    }
+
+    private static func word(_ text: String, _ start: Double) -> TranscribedWord {
+        TranscribedWord(w: text, start: start, end: start + 0.1, conf: 0.9)
+    }
+
+    /// A `BoundaryOracle` that always answers a fixed absolute offset —
+    /// lets these tests pin seam placement deterministically instead of
+    /// depending on synthetic-audio energy.
+    private struct FixedBoundaryOracle: BoundaryOracle {
+        let split: Int
+        func chooseSplit(samples: [Float], zoneStartSample: Int, zoneEndSample: Int, sampleRate: Double) -> Int? {
+            split
+        }
+    }
+
+    private static func testOverlapAssembly() throws {
+        let rate = SAMPLE_RATE  // 16000
+
+        // --- 1) THE ANTI-CATASTROPHE REGRESSION -----------------------
+        // A single window of fast, evenly-spaced speech (150ms between word
+        // starts — well inside `dedupSeam`'s 240ms tolerance) must come
+        // back with EVERY word intact. Running Task 8's whole-list
+        // `dedupSeam` over an assembled transcript would delete most of
+        // these; the seam-scoped `dedupAcrossSeam` the assembly actually
+        // uses must not touch them at all.
+        let fastWords = (0..<40).map { word("w\($0)", Double($0) * 0.15) }
+        let singleWindow = assemblyWindow(ownedStart: 0, ownedEnd: Int(6.0 * rate))
+        let fastResult = try assembleOverlapTranscript(
+            windows: [singleWindow], perWindowWords: [fastWords],
+            fullSamples: [Float](repeating: 0, count: Int(6.0 * rate)),
+            sampleRate: rate, boundaryOracles: [])
+        try expect(fastResult.text.split(separator: " ").count, equals: 40,
+                   "every word of a 150ms-spaced stream must survive assembly (whole-list dedup would delete most of them)")
+        try expect(fastResult.droppedAtSeams, equals: 0, "a single-window dictation has no seams to dedup at")
+        // Sanity: this fixture really would be destroyed by the whole-list form.
+        let wholeListSurvivors = dedupSeam(fastWords.map { AbsoluteToken(text: $0.w, absoluteSeconds: $0.start) }).count
+        try expect(wholeListSurvivors < 40, equals: true,
+                   "fixture check: whole-list dedupSeam really does drop words from a 150ms-spaced stream (got \(wholeListSurvivors)/40)")
+
+        // --- 2) A duplicated word at a seam is deduped exactly once ----
+        // Two windows meeting at sample 32000 (2.0s), each with 0.5s of
+        // overlap. "beta" is emitted by BOTH decoders around the seam.
+        let seamSample = Int(2.0 * rate)
+        let overlap = Int(0.5 * rate)
+        let leftWindow = assemblyWindow(ownedStart: 0, ownedEnd: seamSample, overlapAfter: overlap)
+        let rightWindow = assemblyWindow(ownedStart: seamSample, ownedEnd: Int(4.0 * rate), overlapBefore: overlap)
+        let full = [Float](repeating: 0, count: Int(4.0 * rate))
+        // Left window's words are relative to its own start (sample 0).
+        let leftWords = [word("alpha", 1.50), word("beta", 1.95)]
+        // Right window starts at 2.0s - 0.5s = 1.5s absolute, so its
+        // relative 0.55 is absolute 2.05 — the same "beta", 100ms later.
+        let rightWords = [word("beta", 0.55), word("gamma", 1.00)]
+        let dedupResult = try assembleOverlapTranscript(
+            windows: [leftWindow, rightWindow], perWindowWords: [leftWords, rightWords],
+            fullSamples: full, sampleRate: rate,
+            boundaryOracles: [FixedBoundaryOracle(split: seamSample)])
+        try expect(dedupResult.text, equals: "alpha beta gamma",
+                   "the duplicated seam word must appear exactly once, from the EARLIER window")
+        try expect(dedupResult.droppedAtSeams, equals: 1, "exactly one word should have been deduped")
+
+        // --- 3) A word past the tolerance band is never dropped -------
+        // Same geometry, but the right window's first word lands 0.5s after
+        // the split — outside the 240ms band, so it can't be a duplicate.
+        let farResult = try assembleOverlapTranscript(
+            windows: [leftWindow, rightWindow],
+            perWindowWords: [leftWords, [word("delta", 1.00), word("gamma", 1.50)]],
+            fullSamples: full, sampleRate: rate,
+            boundaryOracles: [FixedBoundaryOracle(split: seamSample)])
+        try expect(farResult.text, equals: "alpha beta delta gamma",
+                   "a word comfortably past the seam tolerance band must always be kept")
+        try expect(farResult.droppedAtSeams, equals: 0, "nothing should be deduped when nothing is inside the band")
+
+        // --- 4) An oracle-refined split really moves ownership --------
+        // Push the split 0.4s EARLIER (to 1.6s). "beta" (absolute 1.95, in
+        // the left window) now belongs to the right window, so the left
+        // window's copy is discarded by the ownership filter and the right
+        // window's copy is what survives.
+        let movedResult = try assembleOverlapTranscript(
+            windows: [leftWindow, rightWindow], perWindowWords: [leftWords, rightWords],
+            fullSamples: full, sampleRate: rate,
+            boundaryOracles: [FixedBoundaryOracle(split: Int(1.6 * rate))])
+        try expect(movedResult.text, equals: "alpha beta gamma",
+                   "moving the split earlier reassigns the seam word to the later window without duplicating or losing it")
+        try expect(movedResult.seamSplitSamples, equals: [Int(1.6 * rate)],
+                   "the oracle's refined split should be the one actually used")
+
+        // --- 5) Zero-width overlap zone must not crash ----------------
+        // Two back-to-back windows with no overlap budget at all.
+        let tightLeft = assemblyWindow(ownedStart: 0, ownedEnd: seamSample)
+        let tightRight = assemblyWindow(ownedStart: seamSample, ownedEnd: Int(4.0 * rate))
+        let tightResult = try assembleOverlapTranscript(
+            windows: [tightLeft, tightRight],
+            perWindowWords: [[word("alpha", 1.0)], [word("gamma", 1.0)]],
+            fullSamples: full, sampleRate: rate,
+            boundaryOracles: [MelEnergyBoundaryOracle()])
+        try expect(tightResult.text, equals: "alpha gamma", "a zero-width overlap zone falls back to the nominal seam")
+        try expect(tightResult.seamSplitSamples, equals: [seamSample], "zero-width zone keeps the nominal seam")
+
+        // --- 6) A signal-bearing window with no words aborts the path -
+        // This is the guarantee that the overlap path can never lose audio
+        // more quietly than v0.4.6 does: it refuses to return at all, so
+        // `transcribeSegmented` re-runs the dictation on the plain path
+        // (which retries per segment and sets `hadSegmentFailure`).
+        var threwOnLoss = false
+        do {
+            _ = try assembleOverlapTranscript(
+                windows: [leftWindow, rightWindow], perWindowWords: [leftWords, []],
+                fullSamples: full, sampleRate: rate,
+                boundaryOracles: [FixedBoundaryOracle(split: seamSample)])
+        } catch OverlapAssemblyError.signalBearingWindowProducedNoWords {
+            threwOnLoss = true
+        }
+        try expect(threwOnLoss, equals: true,
+                   "a signal-bearing window that produced nothing must abort the overlap path, not silently drop audio")
+
+        // A window with NO signal producing nothing is legitimate silence.
+        let silentRight = assemblyWindow(ownedStart: seamSample, ownedEnd: Int(4.0 * rate),
+                                         overlapBefore: overlap, hasSignal: false)
+        let silentResult = try assembleOverlapTranscript(
+            windows: [leftWindow, silentRight], perWindowWords: [leftWords, []],
+            fullSamples: full, sampleRate: rate,
+            boundaryOracles: [FixedBoundaryOracle(split: seamSample)])
+        try expect(silentResult.text, equals: "alpha beta", "a genuinely silent window contributing nothing is not a failure")
+
+        // --- 7) Shape/emptiness guards --------------------------------
+        var threwShape = false
+        do {
+            _ = try assembleOverlapTranscript(windows: [leftWindow, rightWindow], perWindowWords: [leftWords],
+                                              fullSamples: full, sampleRate: rate, boundaryOracles: [])
+        } catch OverlapAssemblyError.shapeMismatch { threwShape = true }
+        try expect(threwShape, equals: true, "mismatched window/word-list counts must throw, not index out of range")
+
+        var threwEmpty = false
+        do {
+            _ = try assembleOverlapTranscript(windows: [assemblyWindow(ownedStart: 0, ownedEnd: 100, hasSignal: false)],
+                                              perWindowWords: [[]], fullSamples: full, sampleRate: rate,
+                                              boundaryOracles: [])
+        } catch OverlapAssemblyError.emptyTranscript { threwEmpty = true }
+        try expect(threwEmpty, equals: true, "an entirely empty transcript must throw so the plain path takes over")
+
+        // --- 8) `words` decodes from the REAL bridge JSON shape --------
+        // The exact document `parakeet_capi_transcribe_pcm_batch_json`
+        // documents (a one-element ARRAY carrying both "words" and
+        // "tokens"), so the words-over-tokens decision stays verified.
+        let realShapeJSON = """
+        [{"text":"hello world","frame_sec":0.080000,\
+        "words":[{"w":"hello","start":0.480,"end":0.640,"conf":0.9100},{"w":"world","start":0.720,"end":0.960,"conf":0.8800}],\
+        "tokens":[{"id":123,"t":0.480,"conf":0.9100}]}]
+        """
+        let realDecoded = try decodeTokenTranscription(json: realShapeJSON)
+        try expect(realDecoded.words.count, equals: 2, "the real bridge JSON shape's words array should decode")
+        try expect(realDecoded.words[0].w, equals: "hello", "first decoded word text")
+        try expect(realDecoded.words[1].start, equals: 0.720, "second decoded word start time")
+        try expect(realDecoded.tokens.count, equals: 1, "tokens must still decode alongside words")
+    }
+
+    /// Gated real-hardware end-to-end check for the overlap path. Skipped
+    /// (not failed) unless `SUPERDICTATE_PARAKEET_MODEL` points at a real
+    /// GGUF and `SUPERDICTATE_OVERLAP_TEST_WAV` at a genuinely long
+    /// (multi-segment) 16-bit PCM WAV. `SUPERDICTATE_SILERO_VAD_MODEL` is
+    /// optional — without it the chain runs mel-energy/midpoint, which is
+    /// itself a supported production configuration.
+    ///
+    /// Never touches `TranscriptionWorker` or any app state: it drives
+    /// `ParakeetEngine` directly and calls the SAME pure
+    /// `assembleOverlapTranscript` production uses.
+    private static func testOverlapTranscriptionRealModel() throws {
+        guard let modelPath = ProcessInfo.processInfo.environment["SUPERDICTATE_PARAKEET_MODEL"],
+              FileManager.default.fileExists(atPath: modelPath),
+              let wavPath = ProcessInfo.processInfo.environment["SUPERDICTATE_OVERLAP_TEST_WAV"],
+              FileManager.default.fileExists(atPath: wavPath) else {
+            print("SKIP overlap-transcription-real: needs SUPERDICTATE_PARAKEET_MODEL + SUPERDICTATE_OVERLAP_TEST_WAV")
+            return
+        }
+
+        let (wavSamples, wavRate) = try loadWavMonoFloat32(path: wavPath)
+        guard wavRate == UInt32(SAMPLE_RATE) else {
+            throw SelfTestFailure.failed("overlap-transcription-real needs a 16 kHz WAV, got \(wavRate) Hz")
+        }
+        let audioSeconds = Double(wavSamples.count) / SAMPLE_RATE
+        let segments = PauseSegmenter.segment(samples: wavSamples, sampleRate: SAMPLE_RATE)
+        print("OVERLAP REAL: \(String(format: "%.1f", audioSeconds))s audio -> \(segments.count) segment(s)")
+        guard segments.count > 1 else {
+            throw SelfTestFailure.failed("overlap-transcription-real needs a multi-segment fixture; \(wavPath) produced \(segments.count)")
+        }
+
+        let engine = try ParakeetEngine(modelPath: modelPath, device: .cpu,
+                                        threadCount: TranscriptionWorker.resolvedParakeetThreadCount())
+        defer { _ = try? runParakeetEngineSynchronously { await engine.shutdown() } }
+        try runParakeetEngineSynchronously { try await engine.warmUp() }
+
+        // --- The overlap path ---
+        let windows = OverlapWindower.addOverlap(to: segments, sampleRate: SAMPLE_RATE)
+        var perWindowWords: [[TranscribedWord]] = []
+        let overlapStarted = ProcessInfo.processInfo.systemUptime
+        for window in windows {
+            let transcription = try runParakeetEngineSynchronously {
+                try await engine.transcribeWithTokens(samples: window.samples)
+            }
+            perWindowWords.append(transcription.words)
+        }
+        let overlapSeconds = ProcessInfo.processInfo.systemUptime - overlapStarted
+
+        // Measure how tightly real words are actually spaced — this is the
+        // evidence behind `dedupAcrossSeam`'s doc comment (i.e. why Task
+        // 8's whole-list `dedupSeam` is NOT applied to the whole stream).
+        var gapsWithinTolerance = 0
+        var totalGaps = 0
+        for words in perWindowWords where words.count > 1 {
+            for i in 1..<words.count {
+                totalGaps += 1
+                if words[i].start - words[i - 1].start <= 0.24 { gapsWithinTolerance += 1 }
+            }
+        }
+        print("OVERLAP REAL: inter-word start gaps <= 0.24s: \(gapsWithinTolerance)/\(totalGaps)")
+
+        var oracles: [BoundaryOracle] = []
+        var vad: SileroVadEngine?
+        defer { vad?.shutdown() }
+        if let vadPath = ProcessInfo.processInfo.environment["SUPERDICTATE_SILERO_VAD_MODEL"],
+           FileManager.default.fileExists(atPath: vadPath),
+           let loaded = try? SileroVadEngine(modelPath: vadPath) {
+            vad = loaded
+            oracles.append(VadBoundaryOracle(engine: loaded))
+            print("OVERLAP REAL: Silero VAD loaded — VAD seam placement active")
+        } else {
+            print("OVERLAP REAL: no Silero VAD model — mel-energy/midpoint seam placement (a supported production config)")
+        }
+        oracles.append(MelEnergyBoundaryOracle())
+
+        let assembled = try assembleOverlapTranscript(windows: windows, perWindowWords: perWindowWords,
+                                                      fullSamples: wavSamples, sampleRate: SAMPLE_RATE,
+                                                      boundaryOracles: oracles)
+        print("OVERLAP REAL: \(windows.count) windows, splits \(assembled.seamSplitSamples), \(assembled.droppedAtSeams) deduped, \(String(format: "%.1f", overlapSeconds))s wall clock")
+        print("OVERLAP REAL text: \(assembled.text)")
+
+        guard !assembled.text.isEmpty else {
+            throw SelfTestFailure.failed("overlap path produced an empty transcript on a real multi-segment recording")
+        }
+        // No runaway blowup: this whole feature exists to keep long
+        // dictations off the encoder's superlinear cost curve, so the
+        // overlap path must stay comfortably real-time-ish on CPU.
+        guard overlapSeconds < audioSeconds * 4 else {
+            throw SelfTestFailure.failed("overlap path took \(overlapSeconds)s for \(audioSeconds)s of audio — runaway cost")
+        }
+        // No obviously duplicated word run anywhere (the failure mode
+        // overlap+dedup exists to prevent): no 3-word sequence repeated
+        // back-to-back.
+        let allWords = assembled.text.split(separator: " ").map(String.init)
+        if allWords.count >= 6 {
+            for i in 0...(allWords.count - 6) {
+                let a = allWords[i..<(i + 3)]
+                let b = allWords[(i + 3)..<(i + 6)]
+                if a.elementsEqual(b) {
+                    throw SelfTestFailure.failed("duplicated 3-word run at index \(i): \(Array(a))")
+                }
+            }
+        }
+
+        // --- Side-by-side against the plain (v0.4.6) path -------------
+        let plainStarted = ProcessInfo.processInfo.systemUptime
+        var plainPieces: [String] = []
+        for segment in segments {
+            let result = try runParakeetEngineSynchronously { try await engine.transcribe(samples: segment.samples) }
+            if !result.text.isEmpty { plainPieces.append(result.text) }
+        }
+        let plainSeconds = ProcessInfo.processInfo.systemUptime - plainStarted
+        print("PLAIN  REAL: \(String(format: "%.1f", plainSeconds))s wall clock")
+        print("PLAIN  REAL text: \(plainPieces.joined(separator: " "))")
     }
 
     private static func testTokenTranscriptionDecode() throws {
