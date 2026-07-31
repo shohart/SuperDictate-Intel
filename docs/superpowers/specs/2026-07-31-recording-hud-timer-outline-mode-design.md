@@ -107,6 +107,19 @@ same path, not a new shape.
   configured `RecordingHUDAccentColor` (existing "Recording color"
   setting) — no new color configuration surface.
 
+### 10-second activation threshold
+
+In `.timerOutline` mode, the bubble still starts every recording in the
+plain bar-level style — identical to `.levelBars` mode. Only once elapsed
+recording time reaches **10 seconds** does the view switch to the
+timer-text + outline-fill rendering. Short utterances (under 10s) never
+change appearance, regardless of the setting; the timer/outline treatment
+is reserved for recordings long enough that knowing the elapsed duration
+is actually useful. This is a rendering-time check
+(`elapsed >= 10`) inside the view's draw dispatch, not a separate stored
+state — dropping back under 10s (not possible in practice, since elapsed
+time only increases within one recording) would revert automatically.
+
 ### Interaction with other HUD modes
 
 `.transcribing` and `.error` HUD modes are unaffected — this design only
