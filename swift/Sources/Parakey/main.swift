@@ -21596,6 +21596,16 @@ private enum ParakeySelfTest {
             equals: "5 точка зрения",
             "digit before точка but no number after it -- must not convert"
         )
+        try expect(
+            RussianNumberNormalizer.normalize("122 двоеточие. 31"),
+            equals: "122:31",
+            "Parakeet's stray pause-artifact is a period after the spoken punctuation word, not just a comma -- must still convert"
+        )
+        try expect(
+            RussianNumberNormalizer.normalize("122. двоеточие 31"),
+            equals: "122:31",
+            "stray pause-artifact period before the spoken punctuation word -- must still convert"
+        )
     }
 
     private static func testProcessedDictationTextITN() throws {
