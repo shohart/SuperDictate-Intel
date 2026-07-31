@@ -56,7 +56,7 @@
 
 **Steps:**
 
-- [ ] **Step 1: Confirm the pin, live**
+- [x] **Step 1: Confirm the pin, live**
 
 Before writing any script logic, verify against the real, current upstream (not this plan's cached research):
 
@@ -74,7 +74,7 @@ grep -n "whisper_vad_" include/whisper.h | head -30
 
 If `whisper_vad_` symbols are not present at your chosen SHA, pick a different one (e.g. the current `master` tip) and re-verify. Record the confirmed SHA — this is `SILERO_VAD_SOURCE_COMMIT` in the script below.
 
-- [ ] **Step 2: Write `scripts/vendor-silero-vad.sh`**
+- [x] **Step 2: Write `scripts/vendor-silero-vad.sh`**
 
 Mirror `scripts/vendor-parakeet-cpp.sh`'s existing structure and conventions (pinned commit constant at the top, `rm -rf` + regenerate the vendored directory, a generated `PROVENANCE.md`, no network access required at *build* time — only at *vendor* time). Concretely:
 
@@ -86,11 +86,11 @@ Mirror `scripts/vendor-parakeet-cpp.sh`'s existing structure and conventions (pi
 6. Generate `swift/Sources/parakeet_cpp/upstream-vad/PROVENANCE.md` documenting: the source repo URL, pinned commit SHA, what was extracted (file list), the model URL/SHA256/size, and today's date — matching the style of the existing `swift/Sources/parakeet_cpp/upstream/PROVENANCE.md`.
 7. Confirm license notices: copy the MIT license text for both `whisper.cpp` and `silero-vad` into `swift/Sources/parakeet_cpp/upstream-vad/LICENSE-whisper-cpp.txt` and `LICENSE-silero-vad.txt`, matching the existing `LICENSE-parakeet-cpp.txt`/`LICENSE-ggml.txt` pattern.
 
-- [ ] **Step 2: Wire the new source into `Package.swift`**
+- [x] **Step 2: Wire the new source into `Package.swift`**
 
 Read `swift/Package.swift`'s existing `parakeet_cpp` target definition (source paths, excludes, compile flags). Add the new `upstream-vad/` files to that target's sources (or a new sibling SwiftPM target if the existing target's structure makes that cleaner — match whatever's simplest given the actual file layout Step 1 produced). No new external dependencies (Homebrew, ONNX Runtime, etc.) — this must build with only what `vendor-parakeet-cpp.sh`'s CPU path already requires (a C/C++ toolchain, no additional SDK).
 
-- [ ] **Step 3: Build check on the Mac**
+- [x] **Step 3: Build check on the Mac**
 
 ```bash
 git archive HEAD | ssh shohart@192.168.1.246 'rm -rf ~/scratch/sd-overlap && mkdir -p ~/scratch/sd-overlap && tar -x -C ~/scratch/sd-overlap'
@@ -99,7 +99,15 @@ ssh shohart@192.168.1.246 'cd ~/scratch/sd-overlap/swift && swift build -c debug
 
 Expected: clean build (the new VAD source compiles, even though nothing calls it yet — this task only vendors, Task 2 wires the bridge).
 
-- [ ] **Step 4: Commit**
+Done: confirmed via `.superpowers/sdd/2026-07-30-overlap-segmentation-seam-dedup/task-1-report.md`
+(clean `swift build -c debug --product Parakey` on `shohart@192.168.1.246`, "Build of
+product 'Parakey' complete! (189.81s)") and re-confirmed by commit `2a9830e`'s message
+("re-verified swift build ... on the target Mac"). Model-download wiring for the pinned
+Silero VAD model was deliberately deferred out of this task's scope (see
+`upstream-vad/PROVENANCE.md`'s "Model download wiring" note) — Task 2/7's implementer
+needs to add it (duplicate `downloadParakeetModelIfNeeded()`'s pattern, per that note).
+
+- [x] **Step 4: Commit**
 
 ```bash
 git add scripts/vendor-silero-vad.sh swift/Sources/parakeet_cpp/upstream-vad/ swift/Package.swift
@@ -118,6 +126,26 @@ EOF
 ```
 
 ---
+
+> **BLOCKER (2026-07-31, autonomous session)**: every remaining task (2-9) has a
+> mandatory "build + self-test [+ safety-check] on the Mac" step over
+> `ssh shohart@192.168.1.246`. This session's environment has no credential for
+> that host: `~/.ssh/` contains only a GitHub deploy key, `ssh-add -l` reports no
+> loaded identities, and `ssh shohart@192.168.1.246` fails with
+> `Permission denied, please try again.` /
+> `Authentications that can continue: publickey,password,keyboard-interactive`
+> (host is reachable, credential is simply absent — not a network/host problem).
+> A prior session in this same worktree branch DID have this access (see
+> `.superpowers/sdd/2026-07-30-overlap-segmentation-seam-dedup/task-1-report.md`'s
+> logged `swift build` output and commit `2a9830e`'s message), so this is an
+> environment-provisioning gap for this specific session, not a project-wide
+> change. No self-test or safety-check was run this session (none was possible),
+> and no new code was written for Task 2, since an unverifiable `extern "C"`
+> bridge (manual malloc ownership, NULL-safety, exception-boundary contract) is
+> exactly the kind of change this project's own conventions require Mac
+> verification for before committing. Human action needed: provision an SSH key
+> (or agent forwarding) for `shohart@192.168.1.246` in this worktree's execution
+> environment, then resume at Task 2 Step 1.
 
 ### Task 2: Silero VAD C bridge (`sd_silero_vad_speech_probabilities`)
 
