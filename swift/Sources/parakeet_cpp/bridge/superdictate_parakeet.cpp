@@ -302,6 +302,81 @@ extern "C" SDParakeetStatus sd_parakeet_transcribe(
     return status;
 }
 
+extern "C" SDParakeetStatus sd_parakeet_transcribe_with_tokens(
+    SDParakeetContext *context,
+    const float *samples,
+    uint64_t sample_count,
+    uint32_t sample_rate,
+    SDParakeetTokenResult *out_result
+) {
+    if (!out_result) return SD_PARAKEET_ERR_NULL_ARGUMENT;
+    out_result->json = nullptr;
+    out_result->total_seconds = 0.0;
+    out_result->inference_seconds = 0.0;
+    out_result->used_gpu = 0;
+
+    if (!context || !context->native || !samples || sample_rate == 0) {
+        return SD_PARAKEET_ERR_NULL_ARGUMENT;
+    }
+    if (sample_count == 0) {
+        return SD_PARAKEET_ERR_EMPTY_AUDIO;
+    }
+    double durationSeconds = static_cast<double>(sample_count) / static_cast<double>(sample_rate);
+    if (durationSeconds > SD_PARAKEET_MAX_AUDIO_SECONDS) {
+        return SD_PARAKEET_ERR_AUDIO_TOO_LONG;
+    }
+    if (sample_count > static_cast<uint64_t>(INT32_MAX)) {
+        return SD_PARAKEET_ERR_AUDIO_TOO_LONG;
+    }
+
+    bool expected = false;
+    if (!context->busy.compare_exchange_strong(expected, true)) {
+        return SD_PARAKEET_ERR_BUSY;
+    }
+
+    SDParakeetStatus status = SD_PARAKEET_OK;
+    try {
+        auto started = std::chrono::steady_clock::now();
+        int nSamples = static_cast<int>(sample_count);
+        char *json = parakeet_capi_transcribe_pcm_batch_json(
+            context->native, samples, &nSamples, /*n_clips=*/1,
+            static_cast<int>(sample_rate), /*decoder=*/0
+        );
+        auto finished = std::chrono::steady_clock::now();
+        double seconds = std::chrono::duration<double>(finished - started).count();
+
+        if (!json) {
+            context->last_error = parakeet_capi_last_error(context->native);
+            status = SD_PARAKEET_ERR_INFERENCE_FAILED;
+        } else {
+            out_result->json = dupUTF8(std::string(json));
+            parakeet_capi_free_string(json);
+            if (!out_result->json) {
+                status = SD_PARAKEET_ERR_NATIVE_EXCEPTION;
+            } else {
+                out_result->total_seconds = seconds;
+                out_result->inference_seconds = seconds;
+                out_result->used_gpu =
+                    startsWithCaseInsensitive(context->device_name, "Vulkan") ? 1 : 0;
+            }
+        }
+    } catch (...) {
+        context->last_error = "native exception during token transcription";
+        status = SD_PARAKEET_ERR_NATIVE_EXCEPTION;
+    }
+
+    context->busy.store(false);
+    return status;
+}
+
+extern "C" void sd_parakeet_token_result_destroy(SDParakeetTokenResult *result) {
+    if (!result) return;
+    if (result->json) {
+        std::free(result->json);
+        result->json = nullptr;
+    }
+}
+
 extern "C" void sd_parakeet_result_destroy(SDParakeetResult *result) {
     if (!result) return;
     if (result->text) {

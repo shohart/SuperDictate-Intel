@@ -113,6 +113,30 @@ SDParakeetStatus sd_parakeet_transcribe(
     SDParakeetResult *out_result
 );
 
+typedef struct {
+    char *json;                // malloc'd UTF-8 JSON (see parakeet_capi_transcribe_pcm_batch_json's
+                                // documented shape), owned by caller; NULL on failure.
+    double total_seconds;
+    double inference_seconds;
+    int32_t used_gpu;
+} SDParakeetTokenResult;
+
+// Like sd_parakeet_transcribe, but returns per-token/per-word timestamps as
+// a raw JSON document instead of plain text — see
+// parakeet_capi_transcribe_pcm_batch_json's doc comment
+// (swift/Sources/parakeet_cpp/upstream/include/parakeet_capi.h) for the
+// exact JSON shape. Used only for multi-segment (overlapping) dictations;
+// single-segment dictations keep using the plain sd_parakeet_transcribe.
+SDParakeetStatus sd_parakeet_transcribe_with_tokens(
+    SDParakeetContext *context,
+    const float *samples,
+    uint64_t sample_count,
+    uint32_t sample_rate,
+    SDParakeetTokenResult *out_result
+);
+
+void sd_parakeet_token_result_destroy(SDParakeetTokenResult *result);
+
 // The application's own enforced ceiling on a single dictation's audio
 // duration (independent of whatever limit, if any, upstream enforces) —
 // mirrors the "enforce the application's maximum recording duration" bridge

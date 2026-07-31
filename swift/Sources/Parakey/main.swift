@@ -21526,6 +21526,71 @@ private enum ParakeySelfTest {
                    "pinned Parakeet model SHA-256 must match the value verified in Phase 2")
         try expect(PARAKEET_MODEL_FILENAME, equals: "tdt-0.6b-v3-q8_0.gguf",
                    "pinned Parakeet model filename must not drift silently")
+
+        // sd_parakeet_transcribe_with_tokens: NULL out_result -> NULL_ARGUMENT.
+        // No live context is needed — this check runs before context/samples
+        // are ever inspected, mirroring sd_parakeet_transcribe's own
+        // out_result-first ordering.
+        var dummySample: Float = 0.1
+        let statusNullOutResult = withUnsafeMutablePointer(to: &dummySample) { samplePtr in
+            sd_parakeet_transcribe_with_tokens(nil, samplePtr, 1, 16000, nil)
+        }
+        try expect(statusNullOutResult, equals: SD_PARAKEET_ERR_NULL_ARGUMENT,
+                   "sd_parakeet_transcribe_with_tokens with a NULL out_result should return NULL_ARGUMENT")
+
+        // sd_parakeet_transcribe_with_tokens: NULL context -> NULL_ARGUMENT,
+        // and the output struct's fields are all cleared (never left
+        // uninitialized), matching sd_parakeet_transcribe's contract for
+        // SDParakeetResult.
+        var tokenResult = SDParakeetTokenResult(
+            json: UnsafeMutablePointer(bitPattern: 1), // poison
+            total_seconds: 42,
+            inference_seconds: 42,
+            used_gpu: 1
+        )
+        let statusNullContext = withUnsafeMutablePointer(to: &dummySample) { samplePtr in
+            sd_parakeet_transcribe_with_tokens(nil, samplePtr, 1, 16000, &tokenResult)
+        }
+        try expect(statusNullContext, equals: SD_PARAKEET_ERR_NULL_ARGUMENT,
+                   "sd_parakeet_transcribe_with_tokens with a NULL context should return NULL_ARGUMENT")
+        try expect(tokenResult.json == nil, equals: true,
+                   "a NULL_ARGUMENT failure must set out_result->json to NULL")
+        try expect(tokenResult.total_seconds, equals: 0.0,
+                   "a NULL_ARGUMENT failure must zero out_result->total_seconds")
+        try expect(tokenResult.inference_seconds, equals: 0.0,
+                   "a NULL_ARGUMENT failure must zero out_result->inference_seconds")
+        try expect(tokenResult.used_gpu, equals: 0,
+                   "a NULL_ARGUMENT failure must zero out_result->used_gpu")
+
+        // sd_parakeet_transcribe_with_tokens: NULL samples -> NULL_ARGUMENT
+        // (context stays NULL too, for the same reason documented in
+        // testSileroVadBridge — the bridge's guard is a single
+        // short-circuiting `!context || !context->native || !samples || ...`,
+        // so a fabricated non-NULL context handle would be dereferenced
+        // rather than isolating the samples check).
+        var tokenResult2 = SDParakeetTokenResult(
+            json: UnsafeMutablePointer(bitPattern: 1), total_seconds: 42, inference_seconds: 42, used_gpu: 1
+        )
+        let statusNullSamples = sd_parakeet_transcribe_with_tokens(nil, nil, 1, 16000, &tokenResult2)
+        try expect(statusNullSamples, equals: SD_PARAKEET_ERR_NULL_ARGUMENT,
+                   "sd_parakeet_transcribe_with_tokens with NULL samples should return NULL_ARGUMENT")
+        try expect(tokenResult2.json == nil, equals: true,
+                   "a NULL_ARGUMENT failure must set out_result->json to NULL")
+
+        // sd_parakeet_transcribe_with_tokens: sample_rate == 0 -> NULL_ARGUMENT
+        // (grouped with the other NULL-ish argument checks in the bridge's
+        // guard, same as sd_parakeet_transcribe).
+        var tokenResult3 = SDParakeetTokenResult(
+            json: UnsafeMutablePointer(bitPattern: 1), total_seconds: 42, inference_seconds: 42, used_gpu: 1
+        )
+        let statusZeroSampleRate = withUnsafeMutablePointer(to: &dummySample) { samplePtr in
+            sd_parakeet_transcribe_with_tokens(nil, samplePtr, 1, 0, &tokenResult3)
+        }
+        try expect(statusZeroSampleRate, equals: SD_PARAKEET_ERR_NULL_ARGUMENT,
+                   "sd_parakeet_transcribe_with_tokens with sample_rate == 0 should return NULL_ARGUMENT")
+
+        // sd_parakeet_token_result_destroy must be safe (no crash) on NULL.
+        sd_parakeet_token_result_destroy(nil)
     }
 
     /// NULL-argument / invalid-path coverage for the `sd_silero_vad_*` C
