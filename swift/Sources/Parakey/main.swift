@@ -17200,6 +17200,8 @@ private enum ParakeySelfTest {
             return runSuite("parakeet-vulkan", testParakeetVulkanIntegration)
         case "parakeet-vulkan-bench":
             return runSuite("parakeet-vulkan-bench", benchmarkParakeetCPUvsVulkan)
+        case "token-transcription-decode":
+            return runSuite("token-transcription-decode", testTokenTranscriptionDecode)
         case "all":
             return runSuite("all", testAll)
         default:
@@ -17260,6 +17262,7 @@ private enum ParakeySelfTest {
         try testSileroVadBridge()
         try testPauseSegmentation()
         try testSegmentedTranscription()
+        try testTokenTranscriptionDecode()
     }
 
     /// Covers `textInsertionRoute(for:targetElementStillValid:)` — the
@@ -23509,6 +23512,50 @@ private enum ParakeySelfTest {
             equals: .pass,
             "later Escape keyUp should pass through once the canceled press is complete"
         )
+    }
+
+    private static func testTokenTranscriptionDecode() throws {
+        // Test: well-formed single-clip array JSON decodes correctly
+        let wellFormedJSON = """
+        [{"text":"hello world","frame_sec":0.080000,"tokens":[{"id":123,"t":0.480,"conf":0.9100},{"id":456,"t":0.640,"conf":0.8900}]}]
+        """
+        let decoded = try decodeTokenTranscription(json: wellFormedJSON)
+        try expect(decoded.text, equals: "hello world", "decoded text should match input")
+        try expect(decoded.frameSec, equals: 0.080000, "decoded frameSec should match input")
+        try expect(decoded.tokens.count, equals: 2, "decoded tokens array should have 2 elements")
+        try expect(decoded.tokens[0].id, equals: 123, "first token id should be 123")
+        try expect(decoded.tokens[0].t, equals: 0.480, "first token timestamp should be 0.480")
+        try expect(decoded.tokens[0].conf, equals: 0.9100, "first token confidence should be 0.9100")
+        try expect(decoded.tokens[1].id, equals: 456, "second token id should be 456")
+        try expect(decoded.tokens[1].t, equals: 0.640, "second token timestamp should be 0.640")
+        try expect(decoded.tokens[1].conf, equals: 0.8900, "second token confidence should be 0.8900")
+
+        // Test: empty array throws .emptyArray
+        let emptyJSON = "[]"
+        var threwEmptyArray = false
+        do {
+            _ = try decodeTokenTranscription(json: emptyJSON)
+        } catch TokenTranscriptionDecodeError.emptyArray {
+            threwEmptyArray = true
+        }
+        try expect(threwEmptyArray, equals: true, "empty JSON array should throw .emptyArray")
+
+        // Test: malformed JSON throws .malformedJSON
+        let malformedJSON = "\"not json\""
+        var threwMalformedJSON = false
+        do {
+            _ = try decodeTokenTranscription(json: malformedJSON)
+        } catch TokenTranscriptionDecodeError.malformedJSON {
+            threwMalformedJSON = true
+        }
+        try expect(threwMalformedJSON, equals: true, "malformed JSON should throw .malformedJSON")
+
+        // Test: array with multiple elements takes the first
+        let multiElementJSON = """
+        [{"text":"first","frame_sec":0.080000,"tokens":[]},{"text":"second","frame_sec":0.080000,"tokens":[]}]
+        """
+        let decodedMulti = try decodeTokenTranscription(json: multiElementJSON)
+        try expect(decodedMulti.text, equals: "first", "when given multiple array elements, should take the first")
     }
 
     private static func event(

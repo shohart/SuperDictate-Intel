@@ -35,6 +35,7 @@ enum ParakeetEngineError: LocalizedError {
     case vulkanFellBackToCPU(String)
     case warmUpFailed(String)
     case inferenceFailed(String)
+    case tokenDecodeFailed(String)
     case invalidUTF8
     case emptyAudio
     case busy
@@ -54,6 +55,8 @@ enum ParakeetEngineError: LocalizedError {
             return "Parakeet warm-up failed: \(detail)"
         case .inferenceFailed(let detail):
             return "Parakeet transcription failed: \(detail)"
+        case .tokenDecodeFailed(let detail):
+            return "Failed to decode token timestamps: \(detail)"
         case .invalidUTF8:
             return "Parakeet returned a transcript that was not valid UTF-8"
         case .emptyAudio:
@@ -252,6 +255,57 @@ actor ParakeetEngine {
             inferenceSeconds: result.inference_seconds,
             usedGPU: result.used_gpu != 0
         )
+    }
+
+    /// Like `transcribe`, but returns per-token timestamps + confidence as JSON,
+    /// decoded into a `TokenTranscription` struct. `samples` must be non-empty
+    /// mono Float32 PCM at `sampleRate` Hz (16 kHz throughout this app's capture
+    /// pipeline; parakeet.cpp resamples internally if it ever isn't).
+    func transcribeWithTokens(samples: [Float], sampleRate: UInt32 = UInt32(SAMPLE_RATE)) throws -> TokenTranscription {
+        guard !samples.isEmpty else {
+            throw ParakeetEngineError.emptyAudio
+        }
+        guard let context else {
+            throw ParakeetEngineError.inferenceFailed("engine already shut down")
+        }
+
+        var result = SDParakeetTokenResult(json: nil, total_seconds: 0, inference_seconds: 0, used_gpu: 0)
+        let status = samples.withUnsafeBufferPointer { buffer -> SDParakeetStatus in
+            sd_parakeet_transcribe_with_tokens(context, buffer.baseAddress, UInt64(buffer.count), sampleRate, &result)
+        }
+        defer { sd_parakeet_token_result_destroy(&result) }
+
+        switch status {
+        case SD_PARAKEET_OK:
+            break
+        case SD_PARAKEET_ERR_EMPTY_AUDIO:
+            throw ParakeetEngineError.emptyAudio
+        case SD_PARAKEET_ERR_BUSY:
+            throw ParakeetEngineError.busy
+        default:
+            let message = String(cString: sd_parakeet_last_error_message(context))
+            throw ParakeetEngineError.inferenceFailed(message.isEmpty ? "bridge status \(status.rawValue)" : message)
+        }
+
+        guard let jsonPointer = result.json else {
+            throw ParakeetEngineError.inferenceFailed("native call succeeded but returned no JSON")
+        }
+        guard let jsonString = String(validatingCString: jsonPointer) else {
+            throw ParakeetEngineError.invalidUTF8
+        }
+
+        do {
+            return try decodeTokenTranscription(json: jsonString)
+        } catch let error as TokenTranscriptionDecodeError {
+            switch error {
+            case .emptyArray:
+                throw ParakeetEngineError.tokenDecodeFailed("JSON response contained empty clips array")
+            case .malformedJSON(let underlying):
+                throw ParakeetEngineError.tokenDecodeFailed("JSON decode failed: \(underlying.localizedDescription)")
+            }
+        } catch {
+            throw ParakeetEngineError.tokenDecodeFailed("JSON decode failed: \(error.localizedDescription)")
+        }
     }
 
     /// Actual runtime backend, for diagnostics/UI (spec §11.4). Reflects
