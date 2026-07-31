@@ -28,6 +28,7 @@ import AVFoundation
 import AudioToolbox
 import Foundation
 import CoreGraphics
+import parakeet_cpp
 import CryptoKit
 import Darwin
 import ApplicationServices
@@ -17173,6 +17174,10 @@ private enum ParakeySelfTest {
             return runSuite("text-insertion-routing", testTextInsertionRouting)
         case "parakeet-bridge":
             return runSuite("parakeet-bridge", testParakeetBridge)
+        case "silero-vad-bridge":
+            return runSuite("silero-vad-bridge", testSileroVadBridge)
+        case "silero-vad-real":
+            return runSuite("silero-vad-real", testSileroVadRealModel)
         case "pause-segmentation":
             return runSuite("pause-segmentation", testPauseSegmentation)
         case "segmented-transcription":
@@ -17252,6 +17257,7 @@ private enum ParakeySelfTest {
         try testRussianNumberITNPunctuation()
         try testProcessedDictationTextITN()
         try testParakeetBridge()
+        try testSileroVadBridge()
         try testPauseSegmentation()
         try testSegmentedTranscription()
     }
@@ -21520,6 +21526,194 @@ private enum ParakeySelfTest {
                    "pinned Parakeet model SHA-256 must match the value verified in Phase 2")
         try expect(PARAKEET_MODEL_FILENAME, equals: "tdt-0.6b-v3-q8_0.gguf",
                    "pinned Parakeet model filename must not drift silently")
+    }
+
+    /// NULL-argument / invalid-path coverage for the `sd_silero_vad_*` C
+    /// bridge (Task 2) — mirrors `testParakeetBridge`'s shape but calls the
+    /// C API directly (no Swift-side VAD engine wrapper exists yet; wiring
+    /// that up is a later task). No real model is needed for any of these
+    /// cases — every one is rejected before (or without ever) touching the
+    /// vendored whisper_vad_* implementation. `sample_count == 0` ->
+    /// EMPTY_AUDIO is NOT covered here: the bridge's NULL checks
+    /// (context/context->native/samples) run before the empty-audio check
+    /// (same ordering as sd_parakeet_transcribe's NULL-then-EMPTY_AUDIO
+    /// checks), so observing EMPTY_AUDIO specifically requires a live,
+    /// successfully-created context — that path is covered by the gated
+    /// `silero-vad-real` group instead, alongside the real-model inference
+    /// assertions.
+    private static func testSileroVadBridge() throws {
+        // sd_silero_vad_create: NULL model_path -> NULL_ARGUMENT, and
+        // *out_context stays NULL.
+        var ctx: OpaquePointer? = OpaquePointer(bitPattern: 1) // poison value
+        let statusNullPath = sd_silero_vad_create(nil, &ctx)
+        try expect(statusNullPath, equals: SD_SILERO_VAD_ERR_NULL_ARGUMENT,
+                   "sd_silero_vad_create with a NULL model_path should return NULL_ARGUMENT")
+        try expect(ctx == nil, equals: true,
+                   "sd_silero_vad_create must set *out_context to NULL even on a NULL_ARGUMENT failure")
+
+        // sd_silero_vad_create: NULL out_context -> NULL_ARGUMENT (checked
+        // before model_path is even read, matching sd_parakeet_create's
+        // out_context-first ordering).
+        let statusNullOutContext = "/nonexistent/path.bin".withCString { path in
+            sd_silero_vad_create(path, nil)
+        }
+        try expect(statusNullOutContext, equals: SD_SILERO_VAD_ERR_NULL_ARGUMENT,
+                   "sd_silero_vad_create with a NULL out_context should return NULL_ARGUMENT")
+
+        // sd_silero_vad_create: nonexistent model path -> MODEL_LOAD_FAILED,
+        // *out_context left NULL.
+        var ctx2: OpaquePointer? = OpaquePointer(bitPattern: 1) // poison value
+        let statusBadPath = "/nonexistent/path/to/silero-vad-\(UUID().uuidString).bin".withCString { path in
+            sd_silero_vad_create(path, &ctx2)
+        }
+        try expect(statusBadPath, equals: SD_SILERO_VAD_ERR_MODEL_LOAD_FAILED,
+                   "sd_silero_vad_create with a nonexistent model path should return MODEL_LOAD_FAILED")
+        try expect(ctx2 == nil, equals: true,
+                   "sd_silero_vad_create must leave *out_context NULL on a load failure")
+
+        // sd_silero_vad_speech_probabilities: NULL context -> NULL_ARGUMENT,
+        // and the output pointers are left NULL/zero rather than
+        // uninitialized.
+        var samples: [Float] = [0.1, 0.2, 0.3]
+        var outProbs: UnsafeMutablePointer<Float>? = UnsafeMutablePointer(bitPattern: 1) // poison
+        var outCount: UInt64 = 42 // poison
+        var outWindow: UInt64 = 42 // poison
+        let statusNullContext = samples.withUnsafeMutableBufferPointer { buf in
+            sd_silero_vad_speech_probabilities(
+                nil, buf.baseAddress, UInt64(buf.count), &outProbs, &outCount, &outWindow
+            )
+        }
+        try expect(statusNullContext, equals: SD_SILERO_VAD_ERR_NULL_ARGUMENT,
+                   "sd_silero_vad_speech_probabilities with a NULL context should return NULL_ARGUMENT")
+        try expect(outProbs == nil, equals: true,
+                   "a NULL_ARGUMENT failure must set *out_probabilities to NULL")
+        try expect(outCount, equals: 0,
+                   "a NULL_ARGUMENT failure must set *out_count to zero")
+        try expect(outWindow, equals: 0,
+                   "a NULL_ARGUMENT failure must set *out_window_size_samples to zero")
+
+        // sd_silero_vad_speech_probabilities: NULL samples -> NULL_ARGUMENT.
+        // Uses OpaquePointer(bitPattern:) to fabricate a non-NULL-looking
+        // (but never dereferenced, since samples == NULL fails first)
+        // context pointer, isolating the `samples` check from the
+        // `context` check exercised above.
+        let fakeContext = OpaquePointer(bitPattern: 0xdead_beef)
+        var outProbs2: UnsafeMutablePointer<Float>? = UnsafeMutablePointer(bitPattern: 1)
+        var outCount2: UInt64 = 42
+        let statusNullSamples = sd_silero_vad_speech_probabilities(
+            fakeContext, nil, 3, &outProbs2, &outCount2, nil
+        )
+        try expect(statusNullSamples, equals: SD_SILERO_VAD_ERR_NULL_ARGUMENT,
+                   "sd_silero_vad_speech_probabilities with NULL samples should return NULL_ARGUMENT")
+        try expect(outProbs2 == nil, equals: true,
+                   "a NULL_ARGUMENT failure must set *out_probabilities to NULL")
+        try expect(outCount2, equals: 0,
+                   "a NULL_ARGUMENT failure must set *out_count to zero")
+
+        // sd_silero_vad_speech_probabilities: NULL out_probabilities/out_count
+        // -> NULL_ARGUMENT (both are required together per the header doc).
+        var dummySample: Float = 0.1
+        let statusNullOutProbs = withUnsafeMutablePointer(to: &dummySample) { samplePtr in
+            sd_silero_vad_speech_probabilities(fakeContext, samplePtr, 1, nil, &outCount2, nil)
+        }
+        try expect(statusNullOutProbs, equals: SD_SILERO_VAD_ERR_NULL_ARGUMENT,
+                   "sd_silero_vad_speech_probabilities with a NULL out_probabilities should return NULL_ARGUMENT")
+
+        // sd_silero_vad_destroy / sd_silero_vad_free_probabilities /
+        // sd_silero_vad_last_error_message must all be safe (no crash) on
+        // NULL input.
+        sd_silero_vad_destroy(nil)
+        sd_silero_vad_free_probabilities(nil)
+        let emptyErrorMessage = String(cString: sd_silero_vad_last_error_message(nil))
+        try expect(emptyErrorMessage, equals: "",
+                   "sd_silero_vad_last_error_message(NULL) should return an empty string, never crash")
+    }
+
+    /// Skipped (not failed) unless `SUPERDICTATE_SILERO_VAD_MODEL` points at
+    /// a real, already-downloaded Silero VAD ggml model file — mirrors
+    /// `testParakeetCPUIntegration`'s gating pattern exactly. Task 1
+    /// deliberately left the Silero VAD model-download wiring for a later
+    /// task (see upstream-vad/PROVENANCE.md's "Model download wiring: OUT
+    /// OF SCOPE" note), so no model is staged on this dev machine yet —
+    /// this test is expected to SKIP here and only exercise its real-model
+    /// assertions on a machine/CI box that has explicitly staged one via
+    /// the env var.
+    private static func testSileroVadRealModel() throws {
+        guard let modelPath = ProcessInfo.processInfo.environment["SUPERDICTATE_SILERO_VAD_MODEL"],
+              FileManager.default.fileExists(atPath: modelPath) else {
+            print("SKIP silero-vad-real: SUPERDICTATE_SILERO_VAD_MODEL not set to an existing file")
+            return
+        }
+
+        var context: OpaquePointer?
+        let createStatus = modelPath.withCString { path in
+            sd_silero_vad_create(path, &context)
+        }
+        try expect(createStatus, equals: SD_SILERO_VAD_OK,
+                   "sd_silero_vad_create should succeed against a real, staged Silero VAD model")
+        guard let liveContext = context else {
+            throw SelfTestFailure.failed("sd_silero_vad_create reported OK but *out_context is NULL")
+        }
+        defer { sd_silero_vad_destroy(liveContext) }
+
+        // sample_count == 0 -> EMPTY_AUDIO, now observable with a real
+        // live context (unreachable in the non-gated silero-vad-bridge
+        // group — see that test's doc comment).
+        var dummySample: Float = 0
+        var emptyOutProbs: UnsafeMutablePointer<Float>?
+        var emptyOutCount: UInt64 = 0
+        let emptyStatus = withUnsafeMutablePointer(to: &dummySample) { samplePtr in
+            sd_silero_vad_speech_probabilities(liveContext, samplePtr, 0, &emptyOutProbs, &emptyOutCount, nil)
+        }
+        try expect(emptyStatus, equals: SD_SILERO_VAD_ERR_EMPTY_AUDIO,
+                   "sample_count == 0 against a live context should return EMPTY_AUDIO")
+        try expect(emptyOutProbs == nil, equals: true,
+                   "an EMPTY_AUDIO failure must leave *out_probabilities NULL")
+
+        // 2 seconds of alternating silence/tone at 16kHz — a short
+        // synthetic buffer built the same way testParakeetCPUIntegration
+        // builds its own (no bundled speech fixture needed): 0.5s silence,
+        // 0.5s of a 440Hz tone, repeated once.
+        let sampleRate = SAMPLE_RATE
+        func toneBlock(seconds: Double, frequency: Double, amplitude: Float) -> [Float] {
+            let count = Int(seconds * sampleRate)
+            return (0..<count).map { i in
+                amplitude * Float(sin(2.0 * Double.pi * frequency * Double(i) / sampleRate))
+            }
+        }
+        var synthetic: [Float] = []
+        synthetic.append(contentsOf: [Float](repeating: 0.0, count: Int(0.5 * sampleRate)))
+        synthetic.append(contentsOf: toneBlock(seconds: 0.5, frequency: 440.0, amplitude: 0.2))
+        synthetic.append(contentsOf: [Float](repeating: 0.0, count: Int(0.5 * sampleRate)))
+        synthetic.append(contentsOf: toneBlock(seconds: 0.5, frequency: 440.0, amplitude: 0.2))
+
+        var outProbs: UnsafeMutablePointer<Float>?
+        var outCount: UInt64 = 0
+        var outWindow: UInt64 = 0
+        let status = synthetic.withUnsafeMutableBufferPointer { buf in
+            sd_silero_vad_speech_probabilities(
+                liveContext, buf.baseAddress, UInt64(buf.count), &outProbs, &outCount, &outWindow
+            )
+        }
+        try expect(status, equals: SD_SILERO_VAD_OK,
+                   "sd_silero_vad_speech_probabilities should succeed on a real 2s synthetic buffer")
+        guard let probsPtr = outProbs else {
+            throw SelfTestFailure.failed("sd_silero_vad_speech_probabilities reported OK but *out_probabilities is NULL")
+        }
+        defer { sd_silero_vad_free_probabilities(probsPtr) }
+
+        try expect(outCount > 0, equals: true,
+                   "a 2s buffer should produce at least one analysis-window probability")
+        try expect(outWindow > 0, equals: true,
+                   "out_window_size_samples should be a real, nonzero probed window size")
+
+        let probsBuffer = UnsafeBufferPointer(start: probsPtr, count: Int(outCount))
+        for (index, p) in probsBuffer.enumerated() {
+            try expect(p >= 0.0 && p <= 1.0, equals: true,
+                       "probability at window \(index) (\(p)) must lie in [0, 1]")
+        }
+
+        print("SILERO VAD: model=\(modelPath), windows=\(outCount), window_size_samples=\(outWindow)")
     }
 
     /// Pure algorithm coverage for `PauseSegmenter.segment` — no model, no

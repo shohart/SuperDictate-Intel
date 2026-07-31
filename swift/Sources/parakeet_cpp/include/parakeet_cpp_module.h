@@ -20,6 +20,7 @@
 #define PARAKEET_CPP_MODULE_H
 
 #include "superdictate_parakeet.h"
+#include "superdictate_silero_vad.h"
 #include "ggml-vulkan-shaders-runtime.h"
 
 #endif
