@@ -11144,6 +11144,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var recordingHUDView: RecordingHUDView?
     private var recordingHUDStartedAt: Date?
     private var recordingHUDTranscribingStartedAt: TimeInterval?
+    private var silenceAutoStopTracker: SilenceAutoStopTracker?
     private var recordingHUDAnimationToken = 0
     private var recordingHUDDisplayLink: CADisplayLink?
     private var lastRecordingHUDMotionAt: TimeInterval?
@@ -12309,6 +12310,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         staleRecordingLevelTicks = 0
         recordingHUDPhase = 0
         recordingHUDStartedAt = Date()
+        silenceAutoStopTracker = settings.autoStopOnSilenceEnabled
+            ? SilenceAutoStopTracker(thresholdSeconds: TimeInterval(settings.autoStopSilenceSeconds))
+            : nil
         recordingHUDInsertionTargetFrame = nil
         recordingHUDInsertionTargetVisualFrame = nil
         recordingHUDFallbackWindowFrame = nil
@@ -12392,6 +12396,12 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
         } else {
             hideRecordingHUD()
+        }
+
+        if silenceAutoStopTracker?.update(level: rawLevel, now: now) == true {
+            log("auto-stop: \(settings.autoStopSilenceSeconds)s of continuous silence, releasing")
+            hotkey.resetToggleState()
+            handleRelease()
         }
     }
 
@@ -25286,6 +25296,8 @@ private struct ControlPanelSettingsDraft: Equatable {
     var removeFillerWords: Bool
     var enabledFillerPresetKeys: Set<String>
     var customFillerWords: [String]
+    var autoStopOnSilenceEnabled: Bool
+    var autoStopSilenceSeconds: Int
 
     init(settings: Settings) {
         dictationHotkey = settings.configuredHotkey
@@ -25305,6 +25317,8 @@ private struct ControlPanelSettingsDraft: Equatable {
         removeFillerWords = settings.removeFillerWords
         enabledFillerPresetKeys = settings.enabledFillerPresetKeys
         customFillerWords = settings.customFillerWords
+        autoStopOnSilenceEnabled = settings.autoStopOnSilenceEnabled
+        autoStopSilenceSeconds = settings.autoStopSilenceSeconds
     }
 }
 
@@ -25582,6 +25596,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         root.addArrangedSubview(alternateCompletionRow(draft))
         root.addArrangedSubview(normalizeNumbersRow(draft))
         root.addArrangedSubview(fillerWordsRow(draft))
+        root.addArrangedSubview(autoStopOnSilenceRow(draft))
+        root.addArrangedSubview(autoStopSilenceDurationRow(draft))
         root.addArrangedSubview(enterDelayRow(draft))
         root.addArrangedSubview(hotkeyRow(
             title: t("История", "History"),
@@ -26514,6 +26530,59 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         return container
     }
 
+    private var silenceDurationOptions: [(title: String, value: String)] {
+        (1...10).map { ("\($0) \(t("сек", "sec"))", String($0)) }
+    }
+
+    private func autoStopOnSilenceRow(_ draft: ControlPanelSettingsDraft) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 10
+
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        text.addArrangedSubview(panelLabel(
+            t("Останавливать запись при тишине", "Stop automatically after silence"),
+            size: 13,
+            weight: .semibold
+        ))
+        text.addArrangedSubview(panelLabel(
+            t("Диктовка завершится сама после указанного времени тишины.",
+              "Dictation ends on its own after the configured amount of silence."),
+            size: 12,
+            color: .secondaryLabelColor
+        ))
+
+        let toggle = NSSwitch()
+        toggle.target = self
+        toggle.action = #selector(toggleAutoStopOnSilence(_:))
+        toggle.state = draft.autoStopOnSilenceEnabled ? .on : .off
+        toggle.toolTip = t("Автоматически завершать запись после длительной тишины.",
+                           "Automatically end recording after a long silence.")
+        toggle.setContentHuggingPriority(.required, for: .horizontal)
+
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(toggle)
+        return row
+    }
+
+    private func autoStopSilenceDurationRow(_ draft: ControlPanelSettingsDraft) -> NSView {
+        popupRow(
+            title: t("Длительность тишины", "Silence duration"),
+            detail: t("Сколько секунд тишины ждать перед остановкой.",
+                      "How many seconds of silence to wait before stopping."),
+            selectedValue: String(draft.autoStopSilenceSeconds),
+            options: silenceDurationOptions,
+            action: #selector(selectAutoStopSilenceSeconds(_:)),
+            toolTip: t("Настроить порог тишины для автоостановки.",
+                       "Configure the silence threshold for auto-stop.")
+        )
+    }
+
     private static let enterDelayOptions: [(title: String, value: String)] = [
         ("0 ms", "0"),
         ("50 ms", "50"),
@@ -27221,6 +27290,22 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         refreshSettingsWindow()
     }
 
+    @objc private func toggleAutoStopOnSilence(_ sender: NSSwitch) {
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.autoStopOnSilenceEnabled = sender.state == .on
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
+    @objc private func selectAutoStopSilenceSeconds(_ sender: NSPopUpButton) {
+        guard let raw = sender.selectedItem?.representedObject as? String,
+              let seconds = Int(raw) else { return }
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.autoStopSilenceSeconds = seconds
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
     @objc private func selectRecordingHUDRecordingColor(_ sender: NSPopUpButton) {
         guard let raw = sender.selectedItem?.representedObject as? String,
               let color = RecordingHUDAccentColor(rawValue: raw) else { return }
@@ -27307,6 +27392,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         settings.removeFillerWords = draft.removeFillerWords
         settings.enabledFillerPresetKeys = draft.enabledFillerPresetKeys
         settings.customFillerWords = draft.customFillerWords
+        settings.autoStopOnSilenceEnabled = draft.autoStopOnSilenceEnabled
+        settings.autoStopSilenceSeconds = draft.autoStopSilenceSeconds
         settings.agentEnabled = true
         _ = settings.refreshFromDisk()
         settingsDraft = ControlPanelSettingsDraft(settings: settings)
