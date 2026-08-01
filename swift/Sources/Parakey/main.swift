@@ -2643,7 +2643,15 @@ enum SuperDictateAgentService {
             "Label": AGENT_LABEL,
             "ProgramArguments": [agentExecutablePath(), AGENT_ARGUMENT],
             "RunAtLoad": true,
-            "KeepAlive": true,
+            // SuccessfulExit: false -- relaunch only after a crash (non-zero
+            // exit), not after a clean exit(0). Plain `KeepAlive: true`
+            // relaunches on ANY exit, including the user's own Quit menu
+            // action (`quitClicked` -> `NSApp.terminate`), which made the
+            // app immediately resurrect itself and blocked removing it from
+            // /Applications. Verified on real hardware with an isolated,
+            // unrelated LaunchAgent label: a clean exit runs once and stays
+            // down; a crashing exit is relaunched (throttled) as before.
+            "KeepAlive": ["SuccessfulExit": false],
             "ProcessType": "Interactive",
             "StandardOutPath": logPath,
             "StandardErrorPath": logPath,
