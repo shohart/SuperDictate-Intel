@@ -15375,13 +15375,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         sub.addItem(buildRecentTranscriptLimitSettingsItem())
         sub.addItem(buildCorrectionsItem())
 
-        let filler = NSMenuItem(title: "Remove filler words (um, uh, ah, er, hmm)",
-                                action: #selector(toggleRemoveFillerWords(_:)),
-                                keyEquivalent: "")
-        filler.target = self
-        filler.state = settings.removeFillerWords ? .on : .off
-        sub.addItem(filler)
-
         parent.submenu = sub
         return parent
     }
@@ -16929,11 +16922,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc private func toggleMute(_ sender: NSMenuItem) {
         settings.muteWhileRecording.toggle()
         sender.state = settings.muteWhileRecording ? .on : .off
-    }
-
-    @objc private func toggleRemoveFillerWords(_ sender: NSMenuItem) {
-        settings.removeFillerWords.toggle()
-        sender.state = settings.removeFillerWords ? .on : .off
     }
 
     @objc private func toggleFeedbackSounds(_ sender: NSMenuItem) {
@@ -25209,6 +25197,9 @@ private struct ControlPanelSettingsDraft: Equatable {
     var hudSize: RecordingHUDSize
     var hudDisplayMode: RecordingHUDDisplayMode
     var normalizeNumbersToDigits: Bool
+    var removeFillerWords: Bool
+    var enabledFillerPresetKeys: Set<String>
+    var customFillerWords: [String]
 
     init(settings: Settings) {
         dictationHotkey = settings.configuredHotkey
@@ -25225,6 +25216,9 @@ private struct ControlPanelSettingsDraft: Equatable {
         hudSize = settings.recordingHUDSize
         hudDisplayMode = settings.recordingHUDDisplayMode
         normalizeNumbersToDigits = settings.normalizeNumbersToDigits
+        removeFillerWords = settings.removeFillerWords
+        enabledFillerPresetKeys = settings.enabledFillerPresetKeys
+        customFillerWords = settings.customFillerWords
     }
 }
 
@@ -25501,6 +25495,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         root.addArrangedSubview(primaryCompletionBehaviorRow(draft))
         root.addArrangedSubview(alternateCompletionRow(draft))
         root.addArrangedSubview(normalizeNumbersRow(draft))
+        root.addArrangedSubview(fillerWordsRow(draft))
         root.addArrangedSubview(enterDelayRow(draft))
         root.addArrangedSubview(hotkeyRow(
             title: t("История", "History"),
@@ -26352,6 +26347,87 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         return row
     }
 
+    private func fillerWordsRow(_ draft: ControlPanelSettingsDraft) -> NSView {
+        let container = NSStackView()
+        container.orientation = .vertical
+        container.alignment = .leading
+        container.spacing = 8
+
+        let header = NSStackView()
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 10
+
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        text.addArrangedSubview(panelLabel(
+            t("Удалять слова-паразиты", "Remove filler words"),
+            size: 13,
+            weight: .semibold
+        ))
+        text.addArrangedSubview(panelLabel(
+            t("Удаляет слова-хезитации и разговорные паразиты из текста диктовки.",
+              "Removes hesitation sounds and verbal tics from dictated text."),
+            size: 12,
+            color: .secondaryLabelColor
+        ))
+
+        let toggle = NSSwitch()
+        toggle.target = self
+        toggle.action = #selector(toggleRemoveFillerWordsSetting(_:))
+        toggle.state = draft.removeFillerWords ? .on : .off
+        toggle.toolTip = t("Включить удаление слов-паразитов.",
+                           "Enable removing filler words.")
+        toggle.setContentHuggingPriority(.required, for: .horizontal)
+
+        header.addArrangedSubview(text)
+        header.addArrangedSubview(NSView())
+        header.addArrangedSubview(toggle)
+        container.addArrangedSubview(header)
+
+        if draft.removeFillerWords {
+            let checklist = NSStackView()
+            checklist.orientation = .vertical
+            checklist.alignment = .leading
+            checklist.spacing = 4
+            for preset in FillerWordRemover.presets {
+                let row = NSButton(checkboxWithTitle: preset.displayText, target: self, action: #selector(toggleFillerPreset(_:)))
+                row.state = draft.enabledFillerPresetKeys.contains(preset.key) ? .on : .off
+                row.identifier = NSUserInterfaceItemIdentifier(preset.key)
+                checklist.addArrangedSubview(row)
+            }
+            let scroll = NSScrollView()
+            scroll.documentView = checklist
+            scroll.hasVerticalScroller = true
+            scroll.drawsBackground = false
+            scroll.heightAnchor.constraint(equalToConstant: 160).isActive = true
+            container.addArrangedSubview(scroll)
+
+            let customField = NSTextField()
+            customField.placeholderString = t("Добавить своё слово или фразу и нажать Enter",
+                                              "Add a custom word or phrase and press Enter")
+            customField.target = self
+            customField.action = #selector(addCustomFillerWord(_:))
+            container.addArrangedSubview(customField)
+
+            for word in draft.customFillerWords {
+                let row = NSStackView()
+                row.orientation = .horizontal
+                row.spacing = 8
+                row.addArrangedSubview(panelLabel(word, size: 12))
+                let remove = NSButton(title: "×", target: self, action: #selector(removeCustomFillerWord(_:)))
+                remove.identifier = NSUserInterfaceItemIdentifier(word)
+                remove.bezelStyle = .inline
+                row.addArrangedSubview(remove)
+                container.addArrangedSubview(row)
+            }
+        }
+
+        return container
+    }
+
     private static let enterDelayOptions: [(title: String, value: String)] = [
         ("0 ms", "0"),
         ("50 ms", "50"),
@@ -27018,6 +27094,47 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         refreshSettingsWindow()
     }
 
+    @objc private func toggleRemoveFillerWordsSetting(_ sender: NSSwitch) {
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.removeFillerWords = sender.state == .on
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
+    @objc private func toggleFillerPreset(_ sender: NSButton) {
+        guard let key = sender.identifier?.rawValue else { return }
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        if sender.state == .on {
+            draft.enabledFillerPresetKeys.insert(key)
+        } else {
+            draft.enabledFillerPresetKeys.remove(key)
+        }
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
+    @objc private func addCustomFillerWord(_ sender: NSTextField) {
+        let trimmed = sender.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        guard !draft.customFillerWords.contains(trimmed) else {
+            sender.stringValue = ""
+            return
+        }
+        draft.customFillerWords.append(trimmed)
+        settingsDraft = draft
+        sender.stringValue = ""
+        refreshSettingsWindow()
+    }
+
+    @objc private func removeCustomFillerWord(_ sender: NSButton) {
+        guard let word = sender.identifier?.rawValue else { return }
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.customFillerWords.removeAll { $0 == word }
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
     @objc private func selectRecordingHUDRecordingColor(_ sender: NSPopUpButton) {
         guard let raw = sender.selectedItem?.representedObject as? String,
               let color = RecordingHUDAccentColor(rawValue: raw) else { return }
@@ -27101,6 +27218,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         settings.recordingHUDSize = draft.hudSize
         settings.recordingHUDDisplayMode = draft.hudDisplayMode
         settings.normalizeNumbersToDigits = draft.normalizeNumbersToDigits
+        settings.removeFillerWords = draft.removeFillerWords
+        settings.enabledFillerPresetKeys = draft.enabledFillerPresetKeys
+        settings.customFillerWords = draft.customFillerWords
         settings.agentEnabled = true
         _ = settings.refreshFromDisk()
         settingsDraft = ControlPanelSettingsDraft(settings: settings)
