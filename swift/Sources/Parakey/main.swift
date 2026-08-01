@@ -2830,6 +2830,8 @@ final class Settings: @unchecked Sendable {
     private static let keyRecordingHUDDisplayMode = "recording_hud_display_mode"
     private static let legacyKeyShowRecordingIndicator = "show_recording_indicator"
     private static let keyMuteWhileRecording = "mute_while_recording"
+    private static let keyAutoStopOnSilenceEnabled = "auto_stop_on_silence_enabled"
+    private static let keyAutoStopSilenceSeconds = "auto_stop_silence_seconds"
     private static let keyPlayFeedbackSounds = "play_feedback_sounds"
     private static let keyShowInDock = "show_in_dock"
     private static let keyInputDevice = "input_device"
@@ -3244,6 +3246,19 @@ final class Settings: @unchecked Sendable {
             return defaults.bool(forKey: Self.keyMuteWhileRecording)
         }
         set { defaults.set(newValue, forKey: Self.keyMuteWhileRecording) }
+    }
+
+    var autoStopOnSilenceEnabled: Bool {
+        get { defaults.bool(forKey: Self.keyAutoStopOnSilenceEnabled) }
+        set { defaults.set(newValue, forKey: Self.keyAutoStopOnSilenceEnabled) }
+    }
+
+    var autoStopSilenceSeconds: Int {
+        get {
+            guard defaults.object(forKey: Self.keyAutoStopSilenceSeconds) != nil else { return 5 }
+            return max(1, min(10, defaults.integer(forKey: Self.keyAutoStopSilenceSeconds)))
+        }
+        set { defaults.set(max(1, min(10, newValue)), forKey: Self.keyAutoStopSilenceSeconds) }
     }
 
     var playFeedbackSounds: Bool {
@@ -6728,6 +6743,44 @@ enum FillerWordRemover {
 
     private static func isOrphanSeparator(_ character: Character) -> Bool {
         ",.;:!?".contains(character)
+    }
+}
+
+/// Tracks continuous silence during a live recording and reports when a
+/// configured duration has been reached, for auto-stopping the recording.
+/// Pure and clock-injected (no wall-clock reads inside) so it can be
+/// driven deterministically by a test.
+struct SilenceAutoStopTracker {
+    static let liveSilenceLevelThreshold: Float = 0.02
+
+    private var silenceStartedAt: TimeInterval?
+    private var fired = false
+    let thresholdSeconds: TimeInterval
+
+    init(thresholdSeconds: TimeInterval) {
+        self.thresholdSeconds = thresholdSeconds
+    }
+
+    /// Call once per level-timer tick. Returns true exactly once, on the
+    /// tick where continuous silence first reaches `thresholdSeconds`;
+    /// false on every other tick, including all subsequent silent ticks
+    /// after firing once (call `reset()` when starting a new recording).
+    mutating func update(level: Float, now: TimeInterval) -> Bool {
+        guard !fired else { return false }
+        guard level < Self.liveSilenceLevelThreshold else {
+            silenceStartedAt = nil
+            return false
+        }
+        let startedAt = silenceStartedAt ?? now
+        silenceStartedAt = startedAt
+        guard now - startedAt >= thresholdSeconds else { return false }
+        fired = true
+        return true
+    }
+
+    mutating func reset() {
+        silenceStartedAt = nil
+        fired = false
     }
 }
 
@@ -17724,6 +17777,8 @@ private enum ParakeySelfTest {
             return runSuite("filler-word-preset-defaults", testFillerWordPresetDefaults)
         case "enabled-filler-preset-keys-setting":
             return runSuite("enabled-filler-preset-keys-setting", testEnabledFillerPresetKeysSetting)
+        case "silence-auto-stop-tracker":
+            return runSuite("silence-auto-stop-tracker", testSilenceAutoStopTracker)
         case "all":
             return runSuite("all", testAll)
         default:
@@ -17763,6 +17818,7 @@ private enum ParakeySelfTest {
         try testFillerWordRemoverPresetsAndCustomWords()
         try testFillerWordPresetDefaults()
         try testEnabledFillerPresetKeysSetting()
+        try testSilenceAutoStopTracker()
         try testAudioLevelMetering()
         try testAudioConversion()
         try testAudioInputDeviceFiltering()
@@ -20626,6 +20682,31 @@ private enum ParakeySelfTest {
         guard settings.enabledFillerPresetKeys == ["en_um"] else {
             throw SelfTestFailure.failed("expected stored set to override the default once written")
         }
+    }
+
+    private static func testSilenceAutoStopTracker() throws {
+        // Continuous silence past the threshold fires exactly once.
+        var tracker = SilenceAutoStopTracker(thresholdSeconds: 5)
+        try expect(tracker.update(level: 0.0, now: 0), equals: false, "tick 0: not yet silent long enough")
+        try expect(tracker.update(level: 0.0, now: 3), equals: false, "tick 3s: still under threshold")
+        try expect(tracker.update(level: 0.0, now: 5), equals: true, "tick 5s: threshold reached, fires once")
+        try expect(tracker.update(level: 0.0, now: 6), equals: false, "tick 6s: already fired, must not fire again")
+
+        // A voiced tick resets the clock.
+        var resetTracker = SilenceAutoStopTracker(thresholdSeconds: 5)
+        _ = resetTracker.update(level: 0.0, now: 0)
+        _ = resetTracker.update(level: 0.0, now: 4)
+        _ = resetTracker.update(level: 0.5, now: 4.5) // voice interrupts
+        try expect(resetTracker.update(level: 0.0, now: 5), equals: false, "silence restarted after voice, 0.5s in is not enough")
+        try expect(resetTracker.update(level: 0.0, now: 9.5), equals: true, "5s of continuous silence after the reset point fires")
+
+        // reset() allows firing again for a new recording.
+        var reusedTracker = SilenceAutoStopTracker(thresholdSeconds: 1)
+        _ = reusedTracker.update(level: 0.0, now: 0)
+        try expect(reusedTracker.update(level: 0.0, now: 1), equals: true, "first recording fires at 1s")
+        reusedTracker.reset()
+        try expect(reusedTracker.update(level: 0.0, now: 1.5), equals: false, "after reset, clock restarts from the next tick")
+        try expect(reusedTracker.update(level: 0.0, now: 2.5), equals: true, "second recording fires 1s after its own start")
     }
 
     private static func testAudioInputDeviceFiltering() throws {
