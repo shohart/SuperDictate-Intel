@@ -6559,14 +6559,29 @@ enum FillerWordRemover {
     /// ("ummm", "uhhhh", "ahhh", "hmmm") and the word-boundary lookahead
     /// would otherwise reject them. "er" and "erm" deliberately have no
     /// repeat quantifier: "er+" would also match the real word "err".
-    private static let fillerPatterns = ["um+", "uh+", "ah+", "er", "erm", "hm+"]
-
-    static func apply(to text: String) -> (text: String, removedCount: Int) {
+    static func apply(to text: String,
+                       enabledPresetKeys: Set<String> = defaultEnabledPresetKeys,
+                       customWords: [String] = []) -> (text: String, removedCount: Int) {
         guard !text.isEmpty else { return (text, 0) }
+
+        let presetPatterns = presets
+            .filter { enabledPresetKeys.contains($0.key) }
+            .map { (source: $0.displayText, pattern: $0.pattern) }
+        let customPatterns = customWords.map { word -> (source: String, pattern: String) in
+            let escapedTokens = word.split(separator: " ").map { NSRegularExpression.escapedPattern(for: String($0)) }
+            return (source: word, pattern: escapedTokens.joined(separator: #"\s+"#))
+        }
+        // Longest source text first, so a multi-word phrase is tried before any
+        // shorter pattern that could otherwise partially match inside it.
+        let orderedPatterns = (presetPatterns + customPatterns)
+            .sorted { $0.source.count > $1.source.count }
+            .map(\.pattern)
+
+        guard !orderedPatterns.isEmpty else { return (text, 0) }
 
         // Word-boundary lookarounds include `'` (so "it's" stays one
         // token) and `-` (so "uh-huh", "uh-oh" don't get split apart).
-        let alternation = fillerPatterns.joined(separator: "|")
+        let alternation = orderedPatterns.joined(separator: "|")
         let pattern = #"(?i)(?<![\p{L}\p{N}'\-])("# + alternation + #")(?![\p{L}\p{N}'\-])"#
         guard let regex = try? NSRegularExpression(pattern: pattern) else {
             return (text, 0)
@@ -6738,7 +6753,9 @@ private func processedDictationText(rawTranscript: String,
                                     corrections: [TranscriptCorrection],
                                     removeFillerWords: Bool,
                                     normalizeNumbersToDigits: Bool = false,
-                                    language: DictationLanguage = .auto) -> DictationTextProcessingResult {
+                                    language: DictationLanguage = .auto,
+                                    enabledFillerPresetKeys: Set<String> = FillerWordRemover.defaultEnabledPresetKeys,
+                                    customFillerWords: [String] = []) -> DictationTextProcessingResult {
     let trimmed = rawTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
     let repaired = ParakeetTranscriptRepair.apply(to: trimmed, language: language)
 
@@ -6758,7 +6775,9 @@ private func processedDictationText(rawTranscript: String,
                                              removedFillerWordCount: 0)
     }
 
-    let stripped = FillerWordRemover.apply(to: corrected.text)
+    let stripped = FillerWordRemover.apply(to: corrected.text,
+                                           enabledPresetKeys: enabledFillerPresetKeys,
+                                           customWords: customFillerWords)
     return DictationTextProcessingResult(text: stripped.text,
                                          appliedCorrectionCount: corrected.appliedCount,
                                          removedFillerWordCount: stripped.removedCount)
@@ -11647,7 +11666,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                                        corrections: settings.transcriptCorrections,
                                                        removeFillerWords: settings.removeFillerWords,
                                                        normalizeNumbersToDigits: settings.normalizeNumbersToDigits,
-                                                       language: settings.dictationLanguage)
+                                                       language: settings.dictationLanguage,
+                                                       enabledFillerPresetKeys: settings.enabledFillerPresetKeys,
+                                                       customFillerWords: settings.customFillerWords)
                 if !processed.text.isEmpty {
                     addToHistory(
                         processed.text,
@@ -13202,7 +13223,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                                            corrections: settings.transcriptCorrections,
                                                            removeFillerWords: settings.removeFillerWords,
                                                            normalizeNumbersToDigits: settings.normalizeNumbersToDigits,
-                                                           language: settings.dictationLanguage)
+                                                           language: settings.dictationLanguage,
+                                                           enabledFillerPresetKeys: settings.enabledFillerPresetKeys,
+                                                           customFillerWords: settings.customFillerWords)
                     let postprocessingCompletedAt = ProcessInfo.processInfo.systemUptime
                     if processed.appliedCorrectionCount > 0 {
                         log("transcript corrections applied: \(processed.appliedCorrectionCount)")
@@ -13440,7 +13463,9 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                                            corrections: settings.transcriptCorrections,
                                                            removeFillerWords: settings.removeFillerWords,
                                                            normalizeNumbersToDigits: settings.normalizeNumbersToDigits,
-                                                           language: settings.dictationLanguage)
+                                                           language: settings.dictationLanguage,
+                                                           enabledFillerPresetKeys: settings.enabledFillerPresetKeys,
+                                                           customFillerWords: settings.customFillerWords)
                     if !processed.text.isEmpty {
                         addToHistory(
                             processed.text,
@@ -17613,6 +17638,8 @@ private enum ParakeySelfTest {
             return runSuite("corrections", testTranscriptCorrections)
         case "fillers":
             return runSuite("fillers", testFillerWordRemoval)
+        case "filler-word-presets-custom-words":
+            return runSuite("filler-word-presets-custom-words", testFillerWordRemoverPresetsAndCustomWords)
         case "audio-level":
             return runSuite("audio-level", testAudioLevelMetering)
         case "audio-conversion":
@@ -17741,6 +17768,7 @@ private enum ParakeySelfTest {
         try testDictationUsageStatistics()
         try testTranscriptCorrections()
         try testFillerWordRemoval()
+        try testFillerWordRemoverPresetsAndCustomWords()
         try testFillerWordPresetDefaults()
         try testEnabledFillerPresetKeysSetting()
         try testAudioLevelMetering()
@@ -20499,6 +20527,43 @@ private enum ParakeySelfTest {
         let leadingBang = FillerWordRemover.apply(to: "Ah! Careful.")
         try expect(leadingBang.text, equals: "Careful.", "leading filler exclamation should take its punctuation with it")
         try expect(leadingBang.removedCount, equals: 1, "leading filler exclamation removal count")
+    }
+
+    private static func testFillerWordRemoverPresetsAndCustomWords() throws {
+        // Only enabled presets are removed.
+        // "Um" carries the capital at sentence start, so removal restores
+        // capitalization onto the following word ("hello" -> "Hello"),
+        // exactly like the pre-existing sentence-initial-filler behavior
+        // exercised in testFillerWordRemoval. "ah" is left untouched
+        // because only the "en_um" preset is enabled.
+        let onlyUm = FillerWordRemover.apply(to: "Um, hello, ah, world.", enabledPresetKeys: ["en_um"], customWords: [])
+        try expect(onlyUm.text, equals: "Hello, ah, world.", "only the enabled preset (um) should be removed, ah stays")
+
+        // Phrase preset, default-off key, explicitly enabled.
+        let phrase = FillerWordRemover.apply(to: "Это как бы сложно.", enabledPresetKeys: ["ru_kak_by"], customWords: [])
+        try expect(phrase.text, equals: "Это сложно.", "multi-word Russian phrase preset should be removed when enabled")
+
+        // Custom word, case-insensitive, word-boundary safe.
+        let custom = FillerWordRemover.apply(to: "So anyway I think so.", enabledPresetKeys: [], customWords: ["anyway"])
+        try expect(custom.text, equals: "So I think so.", "custom single word should be removed when listed")
+
+        // Custom multi-word phrase, tolerant of ASR spacing via \s+.
+        let customPhrase = FillerWordRemover.apply(to: "This is sort  of  fine.", enabledPresetKeys: [], customWords: ["sort of"])
+        try expect(customPhrase.text, equals: "This is fine.", "custom multi-word phrase should tolerate extra whitespace")
+
+        // No presets, no custom words -> no-op.
+        let noop = FillerWordRemover.apply(to: "Nothing changes here.", enabledPresetKeys: [], customWords: [])
+        try expect(noop.text, equals: "Nothing changes here.", "empty preset/custom sets should leave text untouched")
+
+        // Longest-first ordering: a custom word that's a substring of a longer
+        // enabled phrase must not corrupt the phrase.
+        // As with "onlyUm" above, "Это" carries the sentence-initial capital,
+        // so removing the full "это самое" phrase restores capitalization
+        // onto "сложно". The key assertion here is that the longer phrase
+        // ("это самое") is matched and removed whole -- not the shorter
+        // "это" leaving a stray "самое" behind.
+        let ordering = FillerWordRemover.apply(to: "Это самое сложно.", enabledPresetKeys: ["ru_eto_samoe"], customWords: ["это"])
+        try expect(ordering.text, equals: "Сложно.", "the longer phrase preset must be tried before the shorter custom word it contains")
     }
 
     private static func testFillerWordPresetDefaults() throws {
