@@ -15459,13 +15459,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         waveform.state = settings.showRecordingWaveform ? .on : .off
         sub.addItem(waveform)
 
-        let mute = NSMenuItem(title: "Mute system audio while recording",
-                              action: #selector(toggleMute(_:)),
-                              keyEquivalent: "")
-        mute.target = self
-        mute.state = settings.muteWhileRecording ? .on : .off
-        sub.addItem(mute)
-
         let sounds = NSMenuItem(title: "Play feedback sounds",
                                 action: #selector(toggleFeedbackSounds(_:)),
                                 keyEquivalent: "")
@@ -16970,11 +16963,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         } else {
             hideRecordingHUD()
         }
-    }
-
-    @objc private func toggleMute(_ sender: NSMenuItem) {
-        settings.muteWhileRecording.toggle()
-        sender.state = settings.muteWhileRecording ? .on : .off
     }
 
     @objc private func toggleFeedbackSounds(_ sender: NSMenuItem) {
@@ -25257,6 +25245,7 @@ private struct ControlPanelSettingsDraft: Equatable {
     var customFillerWords: [String]
     var autoStopOnSilenceEnabled: Bool
     var autoStopSilenceSeconds: Int
+    var muteWhileRecording: Bool
 
     init(settings: Settings) {
         dictationHotkey = settings.configuredHotkey
@@ -25278,6 +25267,7 @@ private struct ControlPanelSettingsDraft: Equatable {
         customFillerWords = settings.customFillerWords
         autoStopOnSilenceEnabled = settings.autoStopOnSilenceEnabled
         autoStopSilenceSeconds = settings.autoStopSilenceSeconds
+        muteWhileRecording = settings.muteWhileRecording
     }
 }
 
@@ -25567,7 +25557,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         ))
         root.addArrangedSubview(separator())
         root.addArrangedSubview(microphoneSettingsRow(draft))
+        root.addArrangedSubview(muteWhileRecordingRow(draft))
         root.addArrangedSubview(launchAtLoginRow())
+        root.addArrangedSubview(correctionsInfoRow())
         root.addArrangedSubview(separator())
         root.addArrangedSubview(popupRow(
             title: t("Размер капсулы", "Capsule size"),
@@ -26586,6 +26578,61 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         return row
     }
 
+    private func muteWhileRecordingRow(_ draft: ControlPanelSettingsDraft) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 10
+
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        text.addArrangedSubview(panelLabel(
+            t("Заглушать системный звук во время записи", "Mute system audio while recording"),
+            size: 13,
+            weight: .semibold
+        ))
+        text.addArrangedSubview(panelLabel(
+            t("Временно приглушает воспроизведение, пока микрофон слушает.",
+              "Temporarily mutes playback while the microphone is listening."),
+            size: 12,
+            color: .secondaryLabelColor
+        ))
+
+        let toggle = NSSwitch()
+        toggle.target = self
+        toggle.action = #selector(toggleMuteWhileRecordingSetting(_:))
+        toggle.state = draft.muteWhileRecording ? .on : .off
+        toggle.toolTip = t("Заглушать системный звук во время записи.",
+                           "Mute system audio while recording.")
+        toggle.setContentHuggingPriority(.required, for: .horizontal)
+
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(toggle)
+        return row
+    }
+
+    private func correctionsInfoRow() -> NSView {
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        text.addArrangedSubview(panelLabel(
+            t("Исправления транскрипции", "Text corrections"),
+            size: 13,
+            weight: .semibold
+        ))
+        text.addArrangedSubview(panelLabel(
+            t("Управляются из меню значка в строке меню → «Исправления текста».",
+              "Managed from the menu bar icon → “Text Corrections”."),
+            size: 12,
+            color: .secondaryLabelColor
+        ))
+        return text
+    }
+
     private static let enterDelayOptions: [(title: String, value: String)] = [
         ("0 ms", "0"),
         ("50 ms", "50"),
@@ -27309,6 +27356,13 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         refreshSettingsWindow()
     }
 
+    @objc private func toggleMuteWhileRecordingSetting(_ sender: NSSwitch) {
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.muteWhileRecording = sender.state == .on
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
     @objc private func toggleLaunchAtLoginSetting(_ sender: NSSwitch) {
         do {
             switch SMAppService.mainApp.status {
@@ -27414,6 +27468,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         settings.customFillerWords = draft.customFillerWords
         settings.autoStopOnSilenceEnabled = draft.autoStopOnSilenceEnabled
         settings.autoStopSilenceSeconds = draft.autoStopSilenceSeconds
+        settings.muteWhileRecording = draft.muteWhileRecording
         settings.agentEnabled = true
         _ = settings.refreshFromDisk()
         settingsDraft = ControlPanelSettingsDraft(settings: settings)
