@@ -15481,21 +15481,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         automaticUpdates.toolTip = "Periodically checks GitHub for a newer release and only notifies you."
         sub.addItem(automaticUpdates)
 
-        let launchAtLogin = NSMenuItem(title: "Launch at Login",
-                                       action: #selector(toggleLaunchAtLogin(_:)),
-                                       keyEquivalent: "")
-        launchAtLogin.target = self
-        switch SMAppService.mainApp.status {
-        case .enabled:
-            launchAtLogin.state = .on
-        case .requiresApproval:
-            launchAtLogin.state = .mixed
-            launchAtLogin.toolTip = "Approve SuperDictate in System Settings → General → Login Items."
-        default:
-            launchAtLogin.state = .off
-        }
-        sub.addItem(launchAtLogin)
-
         let dock = NSMenuItem(title: "Show SuperDictate in Dock",
                               action: #selector(toggleDock(_:)),
                               keyEquivalent: "")
@@ -17019,22 +17004,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         rebuildMenu()
     }
 
-    @objc private func toggleLaunchAtLogin(_ sender: NSMenuItem) {
-        do {
-            switch SMAppService.mainApp.status {
-            case .enabled, .requiresApproval:
-                try SMAppService.mainApp.unregister()
-                log("launch at login disabled")
-            default:
-                try SMAppService.mainApp.register()
-                log("launch at login enabled")
-            }
-        } catch {
-            showLaunchAtLoginError(error)
-        }
-        rebuildMenu()
-    }
-
     private func ensureLaunchAtLoginEnabled() {
         switch SMAppService.mainApp.status {
         case .enabled:
@@ -17049,16 +17018,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 log("launch at login auto-enable failed: \(error.localizedDescription)")
             }
         }
-    }
-
-    private func showLaunchAtLoginError(_ error: Error) {
-        showAppForModal()
-        let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.messageText = "Launch at Login couldn't be changed"
-        alert.informativeText = "\(error)"
-        alert.addButton(withTitle: "OK")
-        alert.runModal()
     }
 
     @objc private func toggleCheckForUpdates(_ sender: NSMenuItem) {
@@ -25608,6 +25567,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         ))
         root.addArrangedSubview(separator())
         root.addArrangedSubview(microphoneSettingsRow(draft))
+        root.addArrangedSubview(launchAtLoginRow())
         root.addArrangedSubview(separator())
         root.addArrangedSubview(popupRow(
             title: t("Размер капсулы", "Capsule size"),
@@ -26583,6 +26543,49 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         )
     }
 
+    private func launchAtLoginRow() -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 10
+
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        text.addArrangedSubview(panelLabel(
+            t("Запускать при входе в систему", "Launch at Login"),
+            size: 13,
+            weight: .semibold
+        ))
+        text.addArrangedSubview(panelLabel(
+            t("Открывать SuperDictate автоматически при входе в macOS.",
+              "Open SuperDictate automatically when you log in to macOS."),
+            size: 12,
+            color: .secondaryLabelColor
+        ))
+
+        let toggle = NSSwitch()
+        toggle.target = self
+        toggle.action = #selector(toggleLaunchAtLoginSetting(_:))
+        switch SMAppService.mainApp.status {
+        case .enabled:
+            toggle.state = .on
+        case .requiresApproval:
+            toggle.state = .mixed
+            toggle.toolTip = t("Подтвердите в Системных настройках → Основные → Элементы входа.",
+                               "Approve in System Settings → General → Login Items.")
+        default:
+            toggle.state = .off
+        }
+        toggle.setContentHuggingPriority(.required, for: .horizontal)
+
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(toggle)
+        return row
+    }
+
     private static let enterDelayOptions: [(title: String, value: String)] = [
         ("0 ms", "0"),
         ("50 ms", "50"),
@@ -27303,6 +27306,23 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
         draft.autoStopSilenceSeconds = seconds
         settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
+    @objc private func toggleLaunchAtLoginSetting(_ sender: NSSwitch) {
+        do {
+            switch SMAppService.mainApp.status {
+            case .enabled, .requiresApproval:
+                try SMAppService.mainApp.unregister()
+                log("launch at login disabled (settings window)")
+            default:
+                try SMAppService.mainApp.register()
+                log("launch at login enabled (settings window)")
+            }
+        } catch {
+            showError(title: t("Не удалось изменить запуск при входе", "Couldn't change Launch at Login"),
+                      detail: "\(error)")
+        }
         refreshSettingsWindow()
     }
 
