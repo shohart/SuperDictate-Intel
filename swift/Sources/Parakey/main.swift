@@ -6567,9 +6567,13 @@ enum FillerWordRemover {
         let presetPatterns = presets
             .filter { enabledPresetKeys.contains($0.key) }
             .map { (source: $0.displayText, pattern: $0.pattern) }
-        let customPatterns = customWords.map { word -> (source: String, pattern: String) in
-            let escapedTokens = word.split(separator: " ").map { NSRegularExpression.escapedPattern(for: String($0)) }
-            return (source: word, pattern: escapedTokens.joined(separator: #"\s+"#))
+        let customPatterns = customWords.compactMap { word -> (source: String, pattern: String)? in
+            let trimmed = word.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            let escapedTokens = trimmed
+                .split(whereSeparator: { $0.isWhitespace })
+                .map { NSRegularExpression.escapedPattern(for: String($0)) }
+            return (source: trimmed, pattern: escapedTokens.joined(separator: #"\s+"#))
         }
         // Longest source text first, so a multi-word phrase is tried before any
         // shorter pattern that could otherwise partially match inside it.
@@ -20564,6 +20568,31 @@ private enum ParakeySelfTest {
         // "это" leaving a stray "самое" behind.
         let ordering = FillerWordRemover.apply(to: "Это самое сложно.", enabledPresetKeys: ["ru_eto_samoe"], customWords: ["это"])
         try expect(ordering.text, equals: "Сложно.", "the longer phrase preset must be tried before the shorter custom word it contains")
+
+        // Blank/whitespace-only custom words must be ignored, not turned
+        // into a zero-width-match pattern that inflates removedCount and
+        // corrupts unrelated text via the punctuation-cleanup pass.
+        let blankCustomWords = FillerWordRemover.apply(to: "Hello world.", enabledPresetKeys: [], customWords: ["", "   "])
+        try expect(blankCustomWords.text, equals: "Hello world.", "blank/whitespace-only custom words should be a no-op")
+        try expect(blankCustomWords.removedCount, equals: 0, "blank/whitespace-only custom words should not count as removals")
+
+        // Russian hesitation-sound presets (ru_e, ru_em, ru_m, ru_am, ru_aa)
+        // are intentionally defaultEnabled: true per the design doc's
+        // parity intent (docs/superpowers/specs/2026-08-01-windows-port-
+        // feature-parity-design.md §1: Russian hesitation sounds are
+        // categorized alongside the English ones as "unambiguous
+        // hesitation sounds", not as an ambiguous real-word phrase like
+        // "как бы"/"типа"). This is a deliberate behavior *addition* for
+        // any user who hasn't touched filler settings, not a preserved
+        // no-op -- confirmed here through the same production path
+        // (processedDictationText with default enabledFillerPresetKeys)
+        // that live dictation uses.
+        let russianDefaultOn = processedDictationText(
+            rawTranscript: "Э, мне нужно подумать.",
+            corrections: [],
+            removeFillerWords: true
+        )
+        try expect(russianDefaultOn.text, equals: "Мне нужно подумать.", "Russian hesitation sound (э) should be removed by default, with no explicit preset/custom-word configuration")
     }
 
     private static func testFillerWordPresetDefaults() throws {
