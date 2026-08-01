@@ -292,16 +292,29 @@ port's corrections tab — **no backend or menu changes are needed here.**
 
 ### Design
 
-Add one row to `makeSettingsContentView()` — a simple button/link row
-("Manage corrections…") that, when clicked, opens the exact same UI the
-existing menu item already opens (reuse whatever
-`NSMenuItem`/window-presentation call the menu's "Corrections" entry
-already makes — this is a one-line action wiring, not new UI). This
-purely improves discoverability for users who don't dig into the menu
-bar dropdown; the menu item **stays** (unlike §1/§3/§4, this isn't a
-simple toggle being duplicated — it's a whole submenu, which doesn't fit
-as a single Settings-window row, so both entry points coexist pointing at
-the same underlying UI).
+**Architectural constraint discovered during planning**: `buildCorrectionsItem()`
+and its action handlers live on `ParakeyApp` (`main.swift:10918`), the
+menu-bar `--agent` process. `makeSettingsContentView()` lives on
+`SuperDictateControlPanelApp` (`main.swift:25047`), a **separate process**
+— the Settings window is its own executable invocation, not merely a
+different window in the same app. There is no existing IPC call that lets
+the control-panel process trigger the agent process to present a specific
+piece of UI (the only cross-process mechanism in this codebase today is a
+`DistributedNotificationCenter` pair used for hotkey-capture coordination,
+`main.swift:11319-11337`, which isn't a fit for "pop up a menu with a
+screen anchor" across process boundaries).
+
+Building real cross-process menu-triggering for this would be
+disproportionate to the value of what is explicitly the lowest-priority,
+purely-discoverability item in this whole spec. Design call: **no
+interactive control**. Add one static informational row to
+`makeSettingsContentView()` — a label (both languages, via `t(...)`)
+along the lines of "Manage text corrections from the menu bar icon →
+Text Corrections" — with no button, no action, no new IPC. This still
+meets the actual goal (a first-time Settings-window visitor now learns
+the feature exists and roughly where to find it) without inventing
+cross-process plumbing for a minor nicety. The full-featured menu-driven
+corrections UI is untouched and remains the single, sole entry point.
 
 ## 6. HUD "Contrast" (adaptive) accent color
 
