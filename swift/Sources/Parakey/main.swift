@@ -2848,6 +2848,8 @@ final class Settings: @unchecked Sendable {
     private static let keySpeechModelProfile = "speech_model_profile"
     private static let keyInitialSpeechModelChoiceRequired = "initial_speech_model_choice_required"
     private static let keyRemoveFillerWords = "remove_filler_words"
+    private static let keyEnabledFillerPresetKeys = "enabled_filler_preset_keys"
+    private static let keyCustomFillerWords = "custom_filler_words"
     private static let keyNormalizeNumbersToDigits = "normalize_numbers_to_digits"
     // New key, deliberately NOT the old "use_gpu" (spec §10: "Do not
     // inherit the old Whisper `useGPU` storage value... the persisted key
@@ -3510,6 +3512,21 @@ final class Settings: @unchecked Sendable {
     var removeFillerWords: Bool {
         get { defaults.bool(forKey: Self.keyRemoveFillerWords) }
         set { defaults.set(newValue, forKey: Self.keyRemoveFillerWords) }
+    }
+
+    var enabledFillerPresetKeys: Set<String> {
+        get {
+            guard let stored = defaults.array(forKey: Self.keyEnabledFillerPresetKeys) as? [String] else {
+                return FillerWordRemover.defaultEnabledPresetKeys
+            }
+            return Set(stored)
+        }
+        set { defaults.set(Array(newValue), forKey: Self.keyEnabledFillerPresetKeys) }
+    }
+
+    var customFillerWords: [String] {
+        get { (defaults.array(forKey: Self.keyCustomFillerWords) as? [String]) ?? [] }
+        set { defaults.set(newValue, forKey: Self.keyCustomFillerWords) }
     }
 
     var normalizeNumbersToDigits: Bool {
@@ -6488,6 +6505,52 @@ enum FillerWordRemover {
         case start
         case afterSentenceTerminator(Int)
     }
+
+    struct FillerWordPreset {
+        let key: String
+        let displayText: String
+        let pattern: String
+        let defaultEnabled: Bool
+    }
+
+    /// Mirrors the Windows port's `PRESET_FILLERS`: unambiguous hesitation
+    /// sounds default on, real words/phrases that only sometimes serve as
+    /// fillers default off (never delete real words without consent).
+    static let presets: [FillerWordPreset] = [
+        // English hesitations (existing patterns, now data-driven)
+        FillerWordPreset(key: "en_um", displayText: "um", pattern: "um+", defaultEnabled: true),
+        FillerWordPreset(key: "en_uh", displayText: "uh", pattern: "uh+", defaultEnabled: true),
+        FillerWordPreset(key: "en_ah", displayText: "ah", pattern: "ah+", defaultEnabled: true),
+        FillerWordPreset(key: "en_er", displayText: "er", pattern: "er", defaultEnabled: true),
+        FillerWordPreset(key: "en_erm", displayText: "erm", pattern: "erm", defaultEnabled: true),
+        FillerWordPreset(key: "en_hm", displayText: "hm", pattern: "hm+", defaultEnabled: true),
+        // Russian hesitations
+        FillerWordPreset(key: "ru_e", displayText: "э", pattern: "э+", defaultEnabled: true),
+        FillerWordPreset(key: "ru_em", displayText: "эм", pattern: "эм+", defaultEnabled: true),
+        FillerWordPreset(key: "ru_m", displayText: "м", pattern: "м+", defaultEnabled: true),
+        FillerWordPreset(key: "ru_am", displayText: "ам", pattern: "ам+", defaultEnabled: true),
+        FillerWordPreset(key: "ru_aa", displayText: "аа", pattern: "аа+", defaultEnabled: true),
+        // Russian verbal-tic phrases (default OFF -- real words/phrases)
+        FillerWordPreset(key: "ru_kak_by", displayText: "как бы", pattern: #"как\s+бы"#, defaultEnabled: false),
+        FillerWordPreset(key: "ru_tipa", displayText: "типа", pattern: "типа", defaultEnabled: false),
+        FillerWordPreset(key: "ru_koroche", displayText: "короче", pattern: "короче", defaultEnabled: false),
+        FillerWordPreset(key: "ru_eto_samoe", displayText: "это самое", pattern: #"это\s+самое"#, defaultEnabled: false),
+        FillerWordPreset(key: "ru_tak_skazat", displayText: "так сказать", pattern: #"так\s+сказать"#, defaultEnabled: false),
+        FillerWordPreset(key: "ru_v_obshchem", displayText: "в общем", pattern: #"в\s+общем"#, defaultEnabled: false),
+        FillerWordPreset(key: "ru_sobstvenno", displayText: "собственно", pattern: "собственно", defaultEnabled: false),
+        FillerWordPreset(key: "ru_dopustim", displayText: "допустим", pattern: "допустим", defaultEnabled: false),
+        FillerWordPreset(key: "ru_slushay", displayText: "слушай", pattern: "слушай", defaultEnabled: false),
+        FillerWordPreset(key: "ru_ponimaesh", displayText: "понимаешь", pattern: "понимаешь", defaultEnabled: false),
+        FillerWordPreset(key: "ru_znaesh", displayText: "знаешь", pattern: "знаешь", defaultEnabled: false),
+        // English verbal-tic phrases (default OFF)
+        FillerWordPreset(key: "en_like", displayText: "like", pattern: "like", defaultEnabled: false),
+        FillerWordPreset(key: "en_you_know", displayText: "you know", pattern: #"you\s+know"#, defaultEnabled: false),
+        FillerWordPreset(key: "en_i_mean", displayText: "i mean", pattern: #"i\s+mean"#, defaultEnabled: false),
+        FillerWordPreset(key: "en_actually", displayText: "actually", pattern: "actually", defaultEnabled: false),
+        FillerWordPreset(key: "en_basically", displayText: "basically", pattern: "basically", defaultEnabled: false),
+    ]
+
+    static let defaultEnabledPresetKeys: Set<String> = Set(presets.filter(\.defaultEnabled).map(\.key))
 
     /// Non-word interjections only. "like" and "you know" are excluded
     /// because they have valid non-filler meanings ("I like cats", "you
@@ -17638,6 +17701,10 @@ private enum ParakeySelfTest {
             return runSuite("recording-hud-elapsed-format", testFormatRecordingHUDElapsed)
         case "recording-hud-outline-path":
             return runSuite("recording-hud-outline-path", testRecordingHUDOutlineFillPath)
+        case "filler-word-preset-defaults":
+            return runSuite("filler-word-preset-defaults", testFillerWordPresetDefaults)
+        case "enabled-filler-preset-keys-setting":
+            return runSuite("enabled-filler-preset-keys-setting", testEnabledFillerPresetKeysSetting)
         case "all":
             return runSuite("all", testAll)
         default:
@@ -17674,6 +17741,8 @@ private enum ParakeySelfTest {
         try testDictationUsageStatistics()
         try testTranscriptCorrections()
         try testFillerWordRemoval()
+        try testFillerWordPresetDefaults()
+        try testEnabledFillerPresetKeysSetting()
         try testAudioLevelMetering()
         try testAudioConversion()
         try testAudioInputDeviceFiltering()
@@ -20430,6 +20499,51 @@ private enum ParakeySelfTest {
         let leadingBang = FillerWordRemover.apply(to: "Ah! Careful.")
         try expect(leadingBang.text, equals: "Careful.", "leading filler exclamation should take its punctuation with it")
         try expect(leadingBang.removedCount, equals: 1, "leading filler exclamation removal count")
+    }
+
+    private static func testFillerWordPresetDefaults() throws {
+        // Every preset's default-enabled status must match its curated intent:
+        // hesitation sounds on, real-word phrases off.
+        let alwaysOnKeys: Set<String> = ["en_um", "en_uh", "en_ah", "en_er", "en_erm", "en_hm",
+                                          "ru_e", "ru_em", "ru_m", "ru_am", "ru_aa"]
+        let alwaysOffKeys: Set<String> = ["ru_kak_by", "ru_tipa", "ru_koroche", "en_like", "en_you_know"]
+        for preset in FillerWordRemover.presets where alwaysOnKeys.contains(preset.key) {
+            guard preset.defaultEnabled else {
+                throw SelfTestFailure.failed("expected \(preset.key) to default on")
+            }
+        }
+        for preset in FillerWordRemover.presets where alwaysOffKeys.contains(preset.key) {
+            guard !preset.defaultEnabled else {
+                throw SelfTestFailure.failed("expected \(preset.key) to default off")
+            }
+        }
+
+        // No duplicate keys -- a duplicate would silently shadow one preset's
+        // toggle state with another's in the enabled-set.
+        let keys = FillerWordRemover.presets.map(\.key)
+        guard Set(keys).count == keys.count else {
+            throw SelfTestFailure.failed("duplicate FillerWordPreset keys found")
+        }
+    }
+
+    private static func testEnabledFillerPresetKeysSetting() throws {
+        let defaults = UserDefaults.standard
+        let key = "enabled_filler_preset_keys"
+        let previous = defaults.array(forKey: key)
+        defer {
+            if let previous { defaults.set(previous, forKey: key) } else { defaults.removeObject(forKey: key) }
+        }
+
+        defaults.removeObject(forKey: key)
+        let settings = Settings.shared
+        guard settings.enabledFillerPresetKeys == FillerWordRemover.defaultEnabledPresetKeys else {
+            throw SelfTestFailure.failed("expected default enabled set when nothing stored yet")
+        }
+
+        settings.enabledFillerPresetKeys = ["en_um"]
+        guard settings.enabledFillerPresetKeys == ["en_um"] else {
+            throw SelfTestFailure.failed("expected stored set to override the default once written")
+        }
     }
 
     private static func testAudioInputDeviceFiltering() throws {
