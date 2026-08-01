@@ -600,6 +600,18 @@ enum RecordingHUDBackgroundStyle: String, CaseIterable {
     }
 }
 
+enum RecordingHUDDisplayMode: String, CaseIterable {
+    case levelBars
+    case timerOutline
+
+    var displayName: String {
+        switch self {
+        case .levelBars: return "Level bars"
+        case .timerOutline: return "Timer"
+        }
+    }
+}
+
 func parseRecentTranscriptLimit(storedValue value: Any?) -> RecentTranscriptLimit? {
     if let raw = value as? String {
         return RecentTranscriptLimit(rawValue: raw)
@@ -875,6 +887,13 @@ func asrTimingTooltip(_ timing: ASRTimingBreakdown?) -> String? {
         "Decoder setup  \(millisecondsLabel(timing.decoderPreparationSeconds))",
         "Actor + framework  \(millisecondsLabel(timing.workerQueueSeconds + timing.frameworkOverheadSeconds))",
     ].joined(separator: "\n")
+}
+
+private func formatRecordingHUDElapsed(_ seconds: TimeInterval) -> String {
+    let totalSeconds = max(0, Int(seconds))
+    let minutes = totalSeconds / 60
+    let secs = totalSeconds % 60
+    return String(format: "%02d:%02d", minutes, secs)
 }
 
 struct DictationLatencyMetrics: Equatable {
@@ -2800,6 +2819,7 @@ final class Settings: @unchecked Sendable {
     private static let keyRecordingHUDTranscribingColor = "recording_hud_transcribing_color"
     private static let keyRecordingHUDBackgroundStyle = "recording_hud_background_style"
     private static let keyRecordingHUDSize = "recording_hud_size"
+    private static let keyRecordingHUDDisplayMode = "recording_hud_display_mode"
     private static let legacyKeyShowRecordingIndicator = "show_recording_indicator"
     private static let keyMuteWhileRecording = "mute_while_recording"
     private static let keyPlayFeedbackSounds = "play_feedback_sounds"
@@ -3190,6 +3210,20 @@ final class Settings: @unchecked Sendable {
         }
         set {
             defaults.set(newValue.rawValue, forKey: Self.keyRecordingHUDSize)
+            defaults.synchronize()
+        }
+    }
+
+    var recordingHUDDisplayMode: RecordingHUDDisplayMode {
+        get {
+            guard let raw = defaults.string(forKey: Self.keyRecordingHUDDisplayMode),
+                  let mode = RecordingHUDDisplayMode(rawValue: raw) else {
+                return .levelBars
+            }
+            return mode
+        }
+        set {
+            defaults.set(newValue.rawValue, forKey: Self.keyRecordingHUDDisplayMode)
             defaults.synchronize()
         }
     }
@@ -9272,6 +9306,77 @@ final class CorrectionShareCleanupDelegate: NSObject, @preconcurrency NSSharingS
     }
 }
 
+/// Builds the portion of a capsule's rounded-rect outline that should be lit,
+/// growing from the bottom center point symmetrically up both the left and
+/// right sides as `fraction` (0...1) increases, tracing the same rounded-rect
+/// path geometry as the full capsule outline (bottom-half straight run, then
+/// the end-cap arc, then the top-half straight run back to top-center).
+///
+/// Pure geometry, no view/window/context dependency, so it can be exercised
+/// directly by self-tests.
+private func recordingHUDOutlineFillPath(in capsuleRect: NSRect, fraction: CGFloat) -> NSBezierPath {
+    let clamped = max(0, min(1, fraction))
+    let fullPath = NSBezierPath(roundedRect: capsuleRect,
+                                xRadius: capsuleRect.height / 2,
+                                yRadius: capsuleRect.height / 2)
+    guard clamped < 1 else { return fullPath }
+
+    let radius = capsuleRect.height / 2
+    let bottomCenter = NSPoint(x: capsuleRect.midX, y: capsuleRect.maxY)
+    let topCenter = NSPoint(x: capsuleRect.midX, y: capsuleRect.minY)
+    let straightLength = max(0, capsuleRect.width - capsuleRect.height)
+    let halfStraight = straightLength / 2
+    let arcLength = CGFloat.pi * radius
+    // Full traversal from bottom-center up one side to top-center covers the
+    // bottom-half straight run, the full end-cap arc, and the top-half
+    // straight run: halfStraight + arcLength + halfStraight == straightLength + arcLength.
+    let halfPerimeter = straightLength + arcLength
+    let litLength = clamped * halfPerimeter
+
+    let path = NSBezierPath()
+    path.lineJoinStyle = .round
+
+    func appendSide(direction: CGFloat) {
+        // direction: -1 for left side, +1 for right side.
+        var remaining = litLength
+        path.move(to: bottomCenter)
+
+        // Segment 1: bottom-half straight run.
+        let seg1 = min(remaining, halfStraight)
+        let straightEnd = NSPoint(x: bottomCenter.x + (direction * seg1), y: bottomCenter.y)
+        path.line(to: straightEnd)
+        remaining -= seg1
+        guard remaining > 0 else { return }
+
+        // Segment 2: the end-cap arc, starting at the visual bottom of the
+        // cap (matching where segment 1 left off) and sweeping toward the
+        // visual top of the cap.
+        let arcTraversed = min(remaining, arcLength)
+        let arcFraction = arcTraversed / arcLength
+        let center = NSPoint(x: capsuleRect.midX + (direction * halfStraight), y: capsuleRect.midY)
+        let startAngle: CGFloat = 90
+        let sweep = direction > 0 ? -180 * arcFraction : 180 * arcFraction
+        path.appendArc(withCenter: center,
+                       radius: radius,
+                       startAngle: startAngle,
+                       endAngle: startAngle + sweep,
+                       clockwise: direction > 0)
+        remaining -= arcTraversed
+        guard remaining > 0 else { return }
+
+        // Segment 3: top-half straight run, from the arc's end point inward
+        // toward top-center.
+        let seg3 = min(remaining, halfStraight)
+        let arcEnd = NSPoint(x: capsuleRect.midX + (direction * halfStraight), y: topCenter.y)
+        let topEnd = NSPoint(x: arcEnd.x - (direction * seg3), y: topCenter.y)
+        path.line(to: topEnd)
+    }
+
+    appendSide(direction: -1)
+    appendSide(direction: 1)
+    return path
+}
+
 private final class RecordingHUDView: NSView {
     var visualScale: CGFloat = RecordingHUDSize.standard.visualScale {
         didSet {
@@ -9326,6 +9431,16 @@ private final class RecordingHUDView: NSView {
     var level: Float = 0 {
         didSet {
             if oldValue != level { needsDisplay = true }
+        }
+    }
+
+    var recordingStartedAt: Date? {
+        didSet { if oldValue != recordingStartedAt { needsDisplay = true } }
+    }
+
+    var displayMode: RecordingHUDDisplayMode = .levelBars {
+        didSet {
+            if oldValue != displayMode { needsDisplay = true }
         }
     }
 
@@ -9412,6 +9527,36 @@ private final class RecordingHUDView: NSView {
             return
         }
 
+        let elapsedForMode: TimeInterval = recordingStartedAt.map { Date().timeIntervalSince($0) } ?? 0
+        let timerActivationSeconds: TimeInterval = 10
+        let transitionDuration: TimeInterval = 0.5
+        let timerModeTransition: CGFloat
+        if displayMode == .timerOutline {
+            let progress = (elapsedForMode - timerActivationSeconds) / transitionDuration
+            timerModeTransition = smootherstep(0, 1, CGFloat(max(0, min(1, progress))))
+        } else {
+            timerModeTransition = 0
+        }
+
+        if timerModeTransition < 1 {
+            NSGraphicsContext.saveGraphicsState()
+            // `setAlpha` REPLACES the graphics-state alpha rather than
+            // composing with it, so it must be multiplied by `contentAlpha`
+            // here or the reveal fade-in gets discarded (a hard-1.0 pop) in
+            // the default .levelBars mode, where timerModeTransition is 0.
+            context.setAlpha(contentAlpha * (1 - timerModeTransition))
+            drawRecordingLevelBars(audio: audio, vividAccent: vividAccent, visualScale: visualScale, capsuleRect: capsuleRect)
+            NSGraphicsContext.restoreGraphicsState()
+        }
+        if timerModeTransition > 0 {
+            NSGraphicsContext.saveGraphicsState()
+            context.setAlpha(contentAlpha * timerModeTransition)
+            drawTimerOutlineFill(in: capsuleRect, accent: vividAccent, level: CGFloat(max(0, min(1, level))), elapsed: elapsedForMode)
+            NSGraphicsContext.restoreGraphicsState()
+        }
+    }
+
+    private func drawRecordingLevelBars(audio: CGFloat, vividAccent: NSColor, visualScale: CGFloat, capsuleRect: NSRect) {
         let barCount = 8
         let barWidth: CGFloat = 2.05 * visualScale
         let barGap: CGFloat = 2.55 * visualScale
@@ -9457,6 +9602,70 @@ private final class RecordingHUDView: NSView {
             vividAccent.withAlphaComponent(0.74 + (0.26 * activity)).setFill()
             path.fill()
         }
+    }
+
+    private func drawTimerOutlineFill(in capsuleRect: NSRect, accent: NSColor, level: CGFloat, elapsed: TimeInterval) {
+        // Outline stroke, filled fraction of the perimeter grows from the
+        // bottom center point symmetrically up both sides with `level`.
+        //
+        // The outer clip region (see `capsule.addClip()` in
+        // `drawFloatingWaveformOnly`) is the un-inset capsule, so a stroke
+        // centered on that same path would have half its width — and the
+        // glow's outward half — clipped away. Inset by half of the widest
+        // stroke used here (the fully-widened glow, worst case at level==1)
+        // so the whole glow stays inside the clip region.
+        let strokeWidth: CGFloat = 2.4 * visualScale
+        let maxGlowWidth = strokeWidth + (3.0 * visualScale)
+        let halfMaxStrokeWidth = maxGlowWidth / 2
+        let outlineRect = capsuleRect.insetBy(dx: halfMaxStrokeWidth, dy: halfMaxStrokeWidth)
+
+        let capsule = NSBezierPath(roundedRect: outlineRect,
+                                   xRadius: outlineRect.height / 2,
+                                   yRadius: outlineRect.height / 2)
+        let unfilledColor = accent.withAlphaComponent(0.14)
+        unfilledColor.setStroke()
+        capsule.lineWidth = strokeWidth
+        capsule.stroke()
+
+        if level > 0.001 {
+            let filledPath = recordingHUDOutlineFillPath(in: outlineRect, fraction: level)
+            let glowAlpha = 0.18 + (0.55 * level)
+            let glowWidth = strokeWidth + (3.0 * visualScale * level)
+            accent.withAlphaComponent(glowAlpha).setStroke()
+            filledPath.lineWidth = glowWidth
+            filledPath.lineCapStyle = .round
+            filledPath.stroke()
+
+            accent.withAlphaComponent(0.85 + (0.15 * level)).setStroke()
+            filledPath.lineWidth = strokeWidth
+            filledPath.lineCapStyle = .round
+            filledPath.stroke()
+        }
+
+        let text = formatRecordingHUDElapsed(elapsed)
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 12 * visualScale, weight: .semibold)
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        // Explicit light/dark-bubble-derived color, matching the same
+        // `shouldUseLightBackground()` idiom `backgroundPalette` uses below —
+        // `NSColor.labelColor` resolves against system appearance, which can
+        // mismatch the bubble's actual background (e.g. a forced-light bubble
+        // on a Dark-mode Mac would render unreadable white-on-white text).
+        let textColor: NSColor = shouldUseLightBackground()
+            ? NSColor(calibratedWhite: 0.0, alpha: 0.85)
+            : NSColor(calibratedWhite: 1.0, alpha: 0.92)
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: textColor,
+            .paragraphStyle: paragraph,
+        ]
+        let attributed = NSAttributedString(string: text, attributes: attributes)
+        let textSize = attributed.size()
+        let textRect = NSRect(x: capsuleRect.midX - (textSize.width / 2),
+                              y: capsuleRect.midY - (textSize.height / 2),
+                              width: textSize.width,
+                              height: textSize.height)
+        attributed.draw(in: textRect)
     }
 
     private func drawTranscribingWave(in capsuleRect: NSRect, alpha: CGFloat) {
@@ -10781,6 +10990,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var staleRecordingLevelTicks = 0
     private var recordingHUDPanel: NSPanel?
     private var recordingHUDView: RecordingHUDView?
+    private var recordingHUDStartedAt: Date?
     private var recordingHUDTranscribingStartedAt: TimeInterval?
     private var recordingHUDAnimationToken = 0
     private var recordingHUDDisplayLink: CADisplayLink?
@@ -11944,6 +12154,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         lastRecordingLevelSequence = 0
         staleRecordingLevelTicks = 0
         recordingHUDPhase = 0
+        recordingHUDStartedAt = Date()
         recordingHUDInsertionTargetFrame = nil
         recordingHUDInsertionTargetVisualFrame = nil
         recordingHUDFallbackWindowFrame = nil
@@ -11985,6 +12196,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         recordingVisualLevel = 0
         lastRecordingLevelSequence = 0
         staleRecordingLevelTicks = 0
+        recordingHUDStartedAt = nil
         if !isRecording {
             stopRecordingHUDTargetTracking(clearTarget: false)
         }
@@ -12044,6 +12256,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             view.mode = mode
             view.level = level
             view.phase = recordingHUDPhase
+            view.recordingStartedAt = recordingHUDStartedAt
         }
         if shouldAnimate {
             animateRecordingHUDIn(panel)
@@ -12065,6 +12278,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             view.mode = mode
             view.level = level
             view.phase = recordingHUDPhase
+            view.recordingStartedAt = recordingHUDStartedAt
         }
     }
 
@@ -12205,6 +12419,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         view.recordingColor = settings.recordingHUDRecordingColor.nsColor
         view.transcribingColor = settings.recordingHUDTranscribingColor.nsColor
         view.backgroundStyle = settings.recordingHUDBackgroundStyle
+        view.displayMode = settings.recordingHUDDisplayMode
     }
 
     private func animateRecordingHUDIn(_ panel: NSPanel) {
@@ -17409,6 +17624,12 @@ private enum ParakeySelfTest {
             return runSuite("parakeet-vulkan-bench", benchmarkParakeetCPUvsVulkan)
         case "token-transcription-decode":
             return runSuite("token-transcription-decode", testTokenTranscriptionDecode)
+        case "recording-hud-display-mode":
+            return runSuite("recording-hud-display-mode", testRecordingHUDDisplayMode)
+        case "recording-hud-elapsed-format":
+            return runSuite("recording-hud-elapsed-format", testFormatRecordingHUDElapsed)
+        case "recording-hud-outline-path":
+            return runSuite("recording-hud-outline-path", testRecordingHUDOutlineFillPath)
         case "all":
             return runSuite("all", testAll)
         default:
@@ -17439,6 +17660,9 @@ private enum ParakeySelfTest {
         try testPasteConfirmationPoller()
         try testClipboardPasteInserterRestore()
         try testRecentTranscriptLimit()
+        try testRecordingHUDDisplayMode()
+        try testFormatRecordingHUDElapsed()
+        try testRecordingHUDOutlineFillPath()
         try testDictationUsageStatistics()
         try testTranscriptCorrections()
         try testFillerWordRemoval()
@@ -19096,6 +19320,210 @@ private enum ParakeySelfTest {
             equals: true,
             "latency log should expose model, end-to-end, and insertion outcomes"
         )
+    }
+
+    private static func testRecordingHUDDisplayMode() throws {
+        let defaults = UserDefaults.standard
+        let key = "recording_hud_display_mode"
+        let previousRaw = defaults.string(forKey: key)
+        defer {
+            if let previousRaw {
+                defaults.set(previousRaw, forKey: key)
+            } else {
+                defaults.removeObject(forKey: key)
+            }
+        }
+
+        defaults.removeObject(forKey: key)
+        let settings = Settings.shared
+        guard settings.recordingHUDDisplayMode == .levelBars else {
+            throw SelfTestFailure.failed("expected default .levelBars, got \(settings.recordingHUDDisplayMode)")
+        }
+
+        settings.recordingHUDDisplayMode = .timerOutline
+        guard settings.recordingHUDDisplayMode == .timerOutline else {
+            throw SelfTestFailure.failed("expected .timerOutline after set, got \(settings.recordingHUDDisplayMode)")
+        }
+
+        defaults.set("not-a-real-mode", forKey: key)
+        guard settings.recordingHUDDisplayMode == .levelBars else {
+            throw SelfTestFailure.failed("expected fallback to .levelBars for garbage stored value")
+        }
+    }
+
+    private static func testFormatRecordingHUDElapsed() throws {
+        let cases: [(TimeInterval, String)] = [
+            (0, "00:00"),
+            (9, "00:09"),
+            (9.9, "00:09"),
+            (10, "00:10"),
+            (59, "00:59"),
+            (60, "01:00"),
+            (65, "01:05"),
+            (599, "09:59"),
+            (600, "10:00"),
+            (3661, "61:01"),
+        ]
+        for (input, expected) in cases {
+            let actual = formatRecordingHUDElapsed(input)
+            guard actual == expected else {
+                throw SelfTestFailure.failed("formatRecordingHUDElapsed(\(input)) = \(actual), expected \(expected)")
+            }
+        }
+    }
+
+    /// `recordingHUDOutlineFillPath` is pure geometry — exercise it directly
+    /// without instantiating a window, per the final-review finding that both
+    /// Critical geometry bugs (chord across the bubble, missing top edge)
+    /// were self-test-catchable this way.
+    private static func testRecordingHUDOutlineFillPath() throws {
+        let capsuleRect = NSRect(x: 0, y: 0, width: 72, height: 26)
+        let bottomCenter = NSPoint(x: capsuleRect.midX, y: capsuleRect.maxY)
+        let topCenter = NSPoint(x: capsuleRect.midX, y: capsuleRect.minY)
+        let tolerance: CGFloat = 0.5
+
+        func subpaths(_ path: NSBezierPath) -> [[NSPoint]] {
+            var result: [[NSPoint]] = []
+            var current: [NSPoint] = []
+            var associated = [NSPoint](repeating: .zero, count: 3)
+            for i in 0..<path.elementCount {
+                let type = path.element(at: i, associatedPoints: &associated)
+                switch type {
+                case .moveTo:
+                    if !current.isEmpty { result.append(current) }
+                    current = [associated[0]]
+                case .lineTo:
+                    current.append(associated[0])
+                case .curveTo:
+                    current.append(contentsOf: associated[0..<3])
+                default:
+                    break
+                }
+            }
+            if !current.isEmpty { result.append(current) }
+            return result
+        }
+
+        func allPoints(_ path: NSBezierPath) -> [NSPoint] {
+            subpaths(path).flatMap { $0 }
+        }
+
+        func approxLength(_ path: NSBezierPath) -> CGFloat {
+            let points = allPoints(path)
+            guard points.count > 1 else { return 0 }
+            var total: CGFloat = 0
+            for i in 1..<points.count {
+                let dx = points[i].x - points[i - 1].x
+                let dy = points[i].y - points[i - 1].y
+                total += (dx * dx + dy * dy).squareRoot()
+            }
+            return total
+        }
+
+        func near(_ a: NSPoint, _ b: NSPoint, _ tol: CGFloat = tolerance) -> Bool {
+            abs(a.x - b.x) < tol && abs(a.y - b.y) < tol
+        }
+
+        // fraction = 0: degenerate (caller already gates on level > 0.001
+        // before calling this), but must still produce a valid path that
+        // starts at bottom-center.
+        let zeroPath = recordingHUDOutlineFillPath(in: capsuleRect, fraction: 0)
+        guard let zeroFirst = allPoints(zeroPath).first, near(zeroFirst, bottomCenter) else {
+            throw SelfTestFailure.failed("fraction=0 path should start at bottom-center \(bottomCenter)")
+        }
+
+        // Every element's associated points stay within the capsule rect
+        // (small tolerance for floating point) at a spread of fractions.
+        let containment = capsuleRect.insetBy(dx: -tolerance, dy: -tolerance)
+        for fraction: CGFloat in [0, 0.25, 0.5, 0.75, 0.999] {
+            let path = recordingHUDOutlineFillPath(in: capsuleRect, fraction: fraction)
+            for point in allPoints(path) {
+                guard containment.contains(point) else {
+                    throw SelfTestFailure.failed("fraction=\(fraction) produced point \(point) outside \(capsuleRect)")
+                }
+                guard point.x.isFinite, point.y.isFinite else {
+                    throw SelfTestFailure.failed("fraction=\(fraction) produced a non-finite point")
+                }
+            }
+            // Bottom-center is always the start point of both side subpaths.
+            for side in subpaths(path) {
+                guard let first = side.first, near(first, bottomCenter) else {
+                    throw SelfTestFailure.failed("fraction=\(fraction) subpath should start at bottom-center, got \(side.first.map(String.init(describing:)) ?? "nil")")
+                }
+            }
+        }
+
+        // fraction = 0.5 is analytically exact for this rect (radius 13,
+        // straightLength 46): the lit length lands exactly at the arc's
+        // horizontal midpoint on each side. This is the one check that pins
+        // down the arc's sweep direction -- containment alone would pass
+        // even if the arc swept the wrong way, since a <=180 degree arc
+        // about the cap center stays inside capsuleRect regardless.
+        let halfPath = recordingHUDOutlineFillPath(in: capsuleRect, fraction: 0.5)
+        let halfSides = subpaths(halfPath)
+        guard halfSides.count == 2 else {
+            throw SelfTestFailure.failed("fraction=0.5 path should have two side subpaths, got \(halfSides.count)")
+        }
+        let leftEnd = halfSides[0].last!
+        let rightEnd = halfSides[1].last!
+        let expectedLeft = NSPoint(x: capsuleRect.minX, y: capsuleRect.midY)
+        let expectedRight = NSPoint(x: capsuleRect.maxX, y: capsuleRect.midY)
+        guard near(leftEnd, expectedLeft) else {
+            throw SelfTestFailure.failed("fraction=0.5 left side should end at \(expectedLeft), got \(leftEnd)")
+        }
+        guard near(rightEnd, expectedRight) else {
+            throw SelfTestFailure.failed("fraction=0.5 right side should end at \(expectedRight), got \(rightEnd)")
+        }
+
+        // fraction = 0.999: both sides should have traversed the bottom
+        // straight run, the full arc, and nearly all of the top straight run
+        // -- i.e. nearly reached top-center. This is the check that catches
+        // a halfPerimeter that omits the top edge (Critical 2): with the bug
+        // present, the arc end point (not top-center) would be the ceiling
+        // any fraction below 1.0 could reach.
+        let almostFullPath = recordingHUDOutlineFillPath(in: capsuleRect, fraction: 0.999)
+        let almostFullSides = subpaths(almostFullPath)
+        guard almostFullSides.count == 2 else {
+            throw SelfTestFailure.failed("fraction=0.999 path should have two side subpaths, got \(almostFullSides.count)")
+        }
+        for side in almostFullSides {
+            guard let end = side.last, near(end, topCenter, 1.0) else {
+                throw SelfTestFailure.failed("fraction=0.999 side should nearly reach top-center \(topCenter), got \(side.last.map(String.init(describing:)) ?? "nil")")
+            }
+        }
+
+        // fraction = 1.0 should equal the full capsule outline (bounds match).
+        let fullPath = recordingHUDOutlineFillPath(in: capsuleRect, fraction: 1.0)
+        let fullBounds = fullPath.bounds
+        guard abs(fullBounds.minX - capsuleRect.minX) < tolerance,
+              abs(fullBounds.minY - capsuleRect.minY) < tolerance,
+              abs(fullBounds.maxX - capsuleRect.maxX) < tolerance,
+              abs(fullBounds.maxY - capsuleRect.maxY) < tolerance else {
+            throw SelfTestFailure.failed("fraction=1.0 path bounds \(fullBounds) should match capsuleRect \(capsuleRect)")
+        }
+
+        // Traversed length should increase monotonically with fraction.
+        let fractions: [CGFloat] = [0, 0.25, 0.5, 0.75, 0.999]
+        var previousLength: CGFloat = -1
+        for fraction in fractions {
+            let length = approxLength(recordingHUDOutlineFillPath(in: capsuleRect, fraction: fraction))
+            guard length >= previousLength else {
+                throw SelfTestFailure.failed("traversed length should increase monotonically with fraction, regressed at \(fraction)")
+            }
+            previousLength = length
+        }
+
+        // A perfect circle (width == height, straightLength == 0) should not
+        // divide by zero or produce NaNs.
+        let circleRect = NSRect(x: 0, y: 0, width: 26, height: 26)
+        for fraction: CGFloat in [0, 0.5, 0.999, 1.0] {
+            let path = recordingHUDOutlineFillPath(in: circleRect, fraction: fraction)
+            for point in allPoints(path) {
+                guard point.x.isFinite, point.y.isFinite else {
+                    throw SelfTestFailure.failed("circle case fraction=\(fraction) produced a non-finite point")
+                }
+            }
+        }
     }
 
     private static func testDictationUsageStatistics() throws {
@@ -24553,6 +24981,7 @@ private struct ControlPanelSettingsDraft: Equatable {
     var transcribingColor: RecordingHUDAccentColor
     var backgroundStyle: RecordingHUDBackgroundStyle
     var hudSize: RecordingHUDSize
+    var hudDisplayMode: RecordingHUDDisplayMode
     var normalizeNumbersToDigits: Bool
 
     init(settings: Settings) {
@@ -24568,6 +24997,7 @@ private struct ControlPanelSettingsDraft: Equatable {
         transcribingColor = settings.recordingHUDTranscribingColor
         backgroundStyle = settings.recordingHUDBackgroundStyle
         hudSize = settings.recordingHUDSize
+        hudDisplayMode = settings.recordingHUDDisplayMode
         normalizeNumbersToDigits = settings.normalizeNumbersToDigits
     }
 }
@@ -24874,6 +25304,16 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             options: RecordingHUDAccentColor.allCases.map { (localizedColorName($0), $0.rawValue) },
             action: #selector(selectRecordingHUDRecordingColor(_:)),
             toolTip: t("Цвет индикатора во время записи.", "Indicator color while recording.")
+        ))
+        root.addArrangedSubview(popupRow(
+            title: t("Индикатор записи", "Recording indicator"),
+            detail: t("Полоски уровня громкости или таймер длительности после 10 секунд записи.",
+                      "Volume level bars, or an elapsed-time timer after 10 seconds of recording."),
+            selectedValue: draft.hudDisplayMode.rawValue,
+            options: RecordingHUDDisplayMode.allCases.map { (localizedDisplayModeName($0), $0.rawValue) },
+            action: #selector(selectRecordingHUDDisplayMode(_:)),
+            toolTip: t("Переключить вид плавающего индикатора во время записи.",
+                       "Switch how the floating recording indicator looks while recording.")
         ))
         root.addArrangedSubview(popupRow(
             title: t("Цвет транскрибации", "Transcribing color"),
@@ -26116,6 +26556,14 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         }
     }
 
+    private func localizedDisplayModeName(_ mode: RecordingHUDDisplayMode) -> String {
+        guard language == .russian else { return mode.displayName }
+        switch mode {
+        case .levelBars: return "Полоски уровня"
+        case .timerOutline: return "Таймер"
+        }
+    }
+
     private func beginServiceOperation(_ operation: ControlPanelServiceOperation) {
         guard serviceOperation == nil else { return }
         serviceOperation = operation
@@ -26397,6 +26845,15 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         refreshSettingsWindow()
     }
 
+    @objc private func selectRecordingHUDDisplayMode(_ sender: NSPopUpButton) {
+        guard let raw = sender.selectedItem?.representedObject as? String,
+              let mode = RecordingHUDDisplayMode(rawValue: raw) else { return }
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.hudDisplayMode = mode
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
     @objc private func discardSettingsClicked(_ sender: NSButton) {
         settingsDraft = ControlPanelSettingsDraft(settings: settings)
         refreshSettingsWindow()
@@ -26416,6 +26873,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         settings.recordingHUDTranscribingColor = draft.transcribingColor
         settings.recordingHUDBackgroundStyle = draft.backgroundStyle
         settings.recordingHUDSize = draft.hudSize
+        settings.recordingHUDDisplayMode = draft.hudDisplayMode
         settings.normalizeNumbersToDigits = draft.normalizeNumbersToDigits
         settings.agentEnabled = true
         _ = settings.refreshFromDisk()
