@@ -531,6 +531,7 @@ enum RecordingHUDAccentColor: String, CaseIterable {
     case cyan
     case green
     case white
+    case contrast
 
     var displayName: String {
         switch self {
@@ -542,6 +543,7 @@ enum RecordingHUDAccentColor: String, CaseIterable {
         case .cyan: return "Cyan"
         case .green: return "Green"
         case .white: return "White"
+        case .contrast: return "Contrast"
         }
     }
 
@@ -555,6 +557,20 @@ enum RecordingHUDAccentColor: String, CaseIterable {
         case .cyan: return .systemCyan
         case .green: return .systemGreen
         case .white: return .white
+        case .contrast: return .white
+        }
+    }
+}
+
+extension RecordingHUDAccentColor {
+    /// `contrast` adapts to the HUD background (dark on light, white on
+    /// dark); every other color is background-independent. `.contrast.nsColor`
+    /// stays a plain literal for callers that must resolve without a
+    /// background context.
+    func resolvedColor(lightBackground: Bool) -> NSColor {
+        switch self {
+        case .contrast: return lightBackground ? .black : .white
+        default: return nsColor
         }
     }
 }
@@ -9937,7 +9953,7 @@ private final class RecordingHUDView: NSView {
         )
     }
 
-    private func shouldUseLightBackground() -> Bool {
+    func shouldUseLightBackground() -> Bool {
         switch backgroundStyle {
         case .light:
             return true
@@ -9984,8 +10000,8 @@ private func exportRecordingHUDAnimationFrames(to directory: URL) throws {
     let view = RecordingHUDView(frame: NSRect(origin: .zero, size: pointSize))
     view.visualScale = hudSize.visualScale
     let settings = Settings.shared
-    view.recordingColor = settings.recordingHUDRecordingColor.nsColor
-    view.transcribingColor = settings.recordingHUDTranscribingColor.nsColor
+    view.recordingColor = settings.recordingHUDRecordingColor.resolvedColor(lightBackground: false)
+    view.transcribingColor = settings.recordingHUDTranscribingColor.resolvedColor(lightBackground: false)
     view.backgroundStyle = .dark
     view.showsCapsuleStroke = false
     view.mode = .recording
@@ -12580,9 +12596,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func configureRecordingHUDView(_ view: RecordingHUDView) {
         view.visualScale = settings.recordingHUDSize.visualScale
-        view.recordingColor = settings.recordingHUDRecordingColor.nsColor
-        view.transcribingColor = settings.recordingHUDTranscribingColor.nsColor
         view.backgroundStyle = settings.recordingHUDBackgroundStyle
+        let isLight = view.shouldUseLightBackground()
+        view.recordingColor = settings.recordingHUDRecordingColor.resolvedColor(lightBackground: isLight)
+        view.transcribingColor = settings.recordingHUDTranscribingColor.resolvedColor(lightBackground: isLight)
         view.displayMode = settings.recordingHUDDisplayMode
     }
 
@@ -17741,6 +17758,8 @@ private enum ParakeySelfTest {
             return runSuite("enabled-filler-preset-keys-setting", testEnabledFillerPresetKeysSetting)
         case "silence-auto-stop-tracker":
             return runSuite("silence-auto-stop-tracker", testSilenceAutoStopTracker)
+        case "recording-hud-accent-color-resolved":
+            return runSuite("recording-hud-accent-color-resolved", testRecordingHUDAccentColorResolvedColor)
         case "all":
             return runSuite("all", testAll)
         default:
@@ -17781,6 +17800,7 @@ private enum ParakeySelfTest {
         try testFillerWordPresetDefaults()
         try testEnabledFillerPresetKeysSetting()
         try testSilenceAutoStopTracker()
+        try testRecordingHUDAccentColorResolvedColor()
         try testAudioLevelMetering()
         try testAudioConversion()
         try testAudioInputDeviceFiltering()
@@ -20669,6 +20689,19 @@ private enum ParakeySelfTest {
         reusedTracker.reset()
         try expect(reusedTracker.update(level: 0.0, now: 1.5), equals: false, "after reset, clock restarts from the next tick")
         try expect(reusedTracker.update(level: 0.0, now: 2.5), equals: true, "second recording fires 1s after its own start")
+    }
+
+    private static func testRecordingHUDAccentColorResolvedColor() throws {
+        for color in RecordingHUDAccentColor.allCases where color != .contrast {
+            try expect(color.resolvedColor(lightBackground: true), equals: color.nsColor,
+                       "\(color) must be background-independent on a light background")
+            try expect(color.resolvedColor(lightBackground: false), equals: color.nsColor,
+                       "\(color) must be background-independent on a dark background")
+        }
+        try expect(RecordingHUDAccentColor.contrast.resolvedColor(lightBackground: true), equals: .black,
+                   "contrast on a light background must resolve to black")
+        try expect(RecordingHUDAccentColor.contrast.resolvedColor(lightBackground: false), equals: .white,
+                   "contrast on a dark background must resolve to white")
     }
 
     private static func testAudioInputDeviceFiltering() throws {
@@ -27042,6 +27075,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         case .cyan: return "Голубой"
         case .green: return "Зелёный"
         case .white: return "Белый"
+        case .contrast: return "Контрастный"
         }
     }
 
