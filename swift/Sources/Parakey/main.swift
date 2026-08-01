@@ -6767,8 +6767,13 @@ struct SilenceAutoStopTracker {
     /// after firing once (call `reset()` when starting a new recording).
     mutating func update(level: Float, now: TimeInterval) -> Bool {
         guard !fired else { return false }
-        guard level < Self.liveSilenceLevelThreshold else {
-            silenceStartedAt = nil
+        if level >= Self.liveSilenceLevelThreshold {
+            // Voice interrupts ongoing silence, but anchors the *next*
+            // potential silence at this voiced tick, so the measured
+            // duration matches how a user perceives "I stopped talking X
+            // seconds ago" -- counted from the last voiced sample, not
+            // from the first silent one after it.
+            silenceStartedAt = now
             return false
         }
         let startedAt = silenceStartedAt ?? now
