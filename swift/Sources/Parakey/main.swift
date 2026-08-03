@@ -26533,54 +26533,84 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         container.addArrangedSubview(header)
 
         if draft.removeFillerWords {
-            // One unified checklist, presets first, then the user's own
-            // words -- the same interaction shape as the Windows port:
-            // every row has a checkbox; custom rows also carry a delete
-            // button; newly added words land in this same list, ticked.
-            let checklist = NSStackView()
-            checklist.orientation = .vertical
-            checklist.alignment = .leading
-            checklist.spacing = 4
-            checklist.translatesAutoresizingMaskIntoConstraints = false
+            // Four columns across, like the Windows port's QGridLayout:
+            // the words are short, so a single column left most of the
+            // window width empty and made the list look unfinished.
+            // Row-major order (left to right, then down), presets first,
+            // then the user's own words -- the same ordering the Windows
+            // port uses. Four vertical stacks inside a .fillEqually
+            // horizontal stack guarantee equal column widths structurally,
+            // which is what the Windows port needed setColumnStretch for:
+            // one long word must not drag the whole grid sideways.
+            let fillerColumnCount = 4
+            var columnStacks: [NSStackView] = []
+            for _ in 0..<fillerColumnCount {
+                let column = NSStackView()
+                column.orientation = .vertical
+                column.alignment = .leading
+                column.spacing = 4
+                columnStacks.append(column)
+            }
 
+            func addCell(_ cell: NSView, at index: Int) {
+                let column = columnStacks[index % fillerColumnCount]
+                column.addArrangedSubview(cell)
+                cell.widthAnchor.constraint(equalTo: column.widthAnchor).isActive = true
+            }
+
+            var cellIndex = 0
             for preset in FillerWordRemover.presets {
-                let row = NSButton(checkboxWithTitle: preset.displayText, target: self, action: #selector(toggleFillerPreset(_:)))
-                row.state = draft.enabledFillerPresetKeys.contains(preset.key) ? .on : .off
-                row.identifier = NSUserInterfaceItemIdentifier(preset.key)
-                checklist.addArrangedSubview(row)
+                let box = NSButton(checkboxWithTitle: preset.displayText, target: self, action: #selector(toggleFillerPreset(_:)))
+                box.state = draft.enabledFillerPresetKeys.contains(preset.key) ? .on : .off
+                box.identifier = NSUserInterfaceItemIdentifier(preset.key)
+                box.lineBreakMode = .byTruncatingTail
+                box.toolTip = preset.displayText
+                addCell(box, at: cellIndex)
+                cellIndex += 1
             }
             for word in draft.customFillerWords {
-                let row = NSStackView()
-                row.orientation = .horizontal
-                row.alignment = .centerY
-                row.spacing = 6
+                let cell = NSStackView()
+                cell.orientation = .horizontal
+                cell.alignment = .centerY
+                cell.spacing = 4
                 let box = NSButton(checkboxWithTitle: word, target: self, action: #selector(toggleCustomFillerWord(_:)))
                 box.state = draft.disabledCustomFillerWords.contains(word) ? .off : .on
                 box.identifier = NSUserInterfaceItemIdentifier(word)
-                row.addArrangedSubview(box)
-                row.addArrangedSubview(NSView())
+                box.lineBreakMode = .byTruncatingTail
+                box.toolTip = word
+                box.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+                cell.addArrangedSubview(box)
+                cell.addArrangedSubview(NSView())
                 let remove = NSButton(title: "×", target: self, action: #selector(removeCustomFillerWord(_:)))
                 remove.identifier = NSUserInterfaceItemIdentifier(word)
                 remove.bezelStyle = .inline
                 remove.toolTip = t("Убрать слово из списка", "Remove this word from the list")
-                row.addArrangedSubview(remove)
-                checklist.addArrangedSubview(row)
-                row.widthAnchor.constraint(equalTo: checklist.widthAnchor).isActive = true
+                remove.setContentHuggingPriority(.required, for: .horizontal)
+                cell.addArrangedSubview(remove)
+                addCell(cell, at: cellIndex)
+                cellIndex += 1
             }
 
+            let columnsRow = NSStackView(views: columnStacks)
+            columnsRow.orientation = .horizontal
+            columnsRow.alignment = .top
+            columnsRow.spacing = 12
+            columnsRow.distribution = .fillEqually
+            columnsRow.translatesAutoresizingMaskIntoConstraints = false
+
             let scroll = NSScrollView()
-            scroll.documentView = checklist
+            scroll.documentView = columnsRow
             scroll.hasVerticalScroller = true
             scroll.drawsBackground = false
             scroll.translatesAutoresizingMaskIntoConstraints = false
-            // Without explicit constraints a stack view used as a scroll
-            // document stays (0,0,0,0) and the whole checklist renders
-            // empty -- pin its width to the clip view and give the scroll
-            // view itself a real height.
+            // Without explicit constraints a view used as a scroll document
+            // stays (0,0,0,0) and the whole checklist renders empty -- pin
+            // its width to the clip view and give the scroll view itself a
+            // real height.
             NSLayoutConstraint.activate([
-                checklist.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
-                checklist.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
-                checklist.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+                columnsRow.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+                columnsRow.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
+                columnsRow.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
                 scroll.heightAnchor.constraint(equalToConstant: 180),
             ])
             container.addArrangedSubview(scroll)
