@@ -302,6 +302,9 @@ effectively selected device. Results from a real run are in
   macOS 15.7.7), not through CI: hosted GitHub macOS runners are only
   available on Apple Silicon, so there's no automated coverage of this path
   yet.
+- The published `SuperDictate.zip` is built for Intel (x86_64). On Apple
+  Silicon, install with the build-from-source command instead — the
+  installer verifies the architecture and will tell you.
 - The public build is signed ad-hoc and not notarized by Apple. Installing
   via the command above is verified, but a ZIP downloaded manually through a
   browser may trigger a Gatekeeper warning.
