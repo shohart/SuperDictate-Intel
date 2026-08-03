@@ -14,7 +14,7 @@ jobs:
     steps:
       - name: Install from the public command
         run: |
-          curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/main/install.sh | \
+          curl -fsSL https://raw.githubusercontent.com/shohart/SuperDictate-Next/main/install.sh | \
             SUPERDICTATE_NO_OPEN=1 bash
       - name: Verify installed release
         run: |

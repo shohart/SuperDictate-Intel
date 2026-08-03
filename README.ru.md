@@ -1,16 +1,60 @@
-# 🎙️ SuperDictate
+# 🎙️ SuperDictate Next
+
+**Быстрая, приватная, локальная диктовка для macOS — включая Intel-Mac'и,
+которые другие проекты оставили за бортом.** Зажмите горячую клавишу,
+говорите — и текст печатается в активном поле. Без облака, без аккаунта,
+аудио не покидает ваш Mac.
 
 **[Read this in English](README.md)**
 
-## Установить за минуту
+## 🌱 Зачем существует этот проект
 
-**Нужен Mac на Apple Silicon (`M1` или новее) или Intel, и macOS 14+.**
+SuperDictate Next — самостоятельное продолжение проекта
+[SuperDictate](https://github.com/shlgd/SuperDictate) (который, в свою
+очередь, основан на [Parakey](https://github.com/rcourtman/parakey) Richard
+Courtman), форкнутого в июле 2026. Это **не** зеркало: 170+ коммитов
+оригинальной работы, свой речевой движок, свой канал релизов, свой
+механизм обновлений.
+
+В апстриме не хватало трёх вещей — из-за них и появился этот проект:
+
+1. **Intel-Mac'и.** Разработка и CI апстрима нацелены только на Apple
+   Silicon. Множество ещё вполне боевых Intel-машин (этот проект собирается
+   и тестируется на Xeon E5-2678 v3 с AMD Radeon RX 6600) оставались там
+   непроверенной территорией. Здесь они — первоклассная цель.
+2. **Другой речевой движок.** Апстрим остался на whisper.cpp. SuperDictate
+   Next перешёл на [parakeet.cpp](https://github.com/mudler/parakeet.cpp) с
+   моделью NVIDIA Parakeet TDT 0.6B v3 (GGUF, q8_0): быстро на CPU, плюс
+   настоящий Vulkan-путь для AMD-карт через MoltenVK с автоматическим
+   откатом на CPU.
+3. **Пространство для итераций по эргономике диктовки** в ежедневном
+   русско-английском сценарии: управление словами-паразитами,
+   автоостановка по тишине, полноценное окно настроек, нормализация
+   русских чисел, сегментация длинных диктовок.
+
+## 🔀 Чем отличается от апстрим-SuperDictate
+
+| Область | Апстрим (на момент форка) | SuperDictate Next |
+|---|---|---|
+| Движок распознавания | whisper.cpp, large-v3-turbo | parakeet.cpp + Parakeet TDT 0.6B v3 (GGUF q8_0) — whisper удалён полностью |
+| GPU-ускорение | нет на этом пути | Vulkan-бэкенд (ggml + MoltenVK), проверено на AMD RX 6600, честный откат на CPU |
+| Intel-Mac'и | не тестировались | первоклассная цель, проверено на реальном железе |
+| Слова-паразиты | один общий тумблер | чеклист по словам: 27 отобранных RU/EN-пресетов в 4 колонки + свои слова и фразы |
+| Автоостановка | — | завершает диктовку после 1–10 с тишины (опционально) |
+| Окно настроек | частичное | добавлены Launch at Login, заглушение звука при записи, адаптивный цвет **Контрастный**, размер капсулы, режимы индикатора (полоски уровня / таймер-контур) |
+| Русские числа | словами | опциональная ITN: продиктованные числа цифрами (25, а не двадцать пять) |
+| Длинные диктовки | один проход | сегментация по паузам с дедупликацией швов перекрытий |
+| Исправления | — | менеджер текстовых исправлений (в меню-баре) для устойчивых ошибок ASR |
+
+## 🚀 Установить за минуту
+
+**Нужен Mac с macOS 14+ — Apple Silicon или Intel.**
 
 1. Откройте приложение **Terminal**.
 2. Вставьте эту команду и нажмите Enter:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shohart/SuperDictate-Intel/main/install.sh | /bin/bash
+curl -fsSL https://raw.githubusercontent.com/shohart/SuperDictate-Next/main/install.sh | /bin/bash
 ```
 
 3. В открывшемся SuperDictate нажмите `Разрешить` для **Микрофона**,
@@ -23,9 +67,6 @@ curl -fsSL https://raw.githubusercontent.com/shohart/SuperDictate-Intel/main/ins
 940 МБ; для установки лучше иметь не менее 1,5 ГБ свободного места. После
 загрузки интернет для диктовки не нужен.
 
-SuperDictate — быстрая локальная диктовка для macOS. Аудио и расшифровка не
-отправляются в облачный API.
-
 ## Обновиться
 
 **Если в SuperDictate уже есть кнопка `Обновить`:** откройте приложение из
@@ -36,16 +77,15 @@ SuperDictate — быстрая локальная диктовка для macOS
 удаляйте. Откройте Terminal и ещё раз выполните ту же команду:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shohart/SuperDictate-Intel/main/install.sh | /bin/bash
+curl -fsSL https://raw.githubusercontent.com/shohart/SuperDictate-Next/main/install.sh | /bin/bash
 ```
 
 Команда заменяет только `/Applications/SuperDictate.app`. История, настройки и
 уже загруженная модель остаются на месте. После этого следующие обновления
 можно устанавливать прямо из приложения.
 
-Последнюю опубликованную версию также всегда можно увидеть на странице
-[GitHub Releases](https://github.com/shohart/SuperDictate-Intel/releases/latest)
-(этот форк ещё не выпустил свой первый релиз).
+Последнюю опубликованную версию всегда можно увидеть на странице
+[GitHub Releases](https://github.com/shohart/SuperDictate-Next/releases/latest).
 
 ## ⌨️ Горячие клавиши
 
@@ -67,20 +107,39 @@ curl -fsSL https://raw.githubusercontent.com/shohart/SuperDictate-Intel/main/ins
 - Откройте `SuperDictate` из Applications, чтобы проверить службу,
   разрешения и обновления. Настройки открываются кнопкой-шестерёнкой.
 
-## 🖥️ Панель управления
+## 🖥️ Панель управления и настройки
 
 Основная панель компактна: в ней видны состояние фоновой службы, недостающие
 разрешения и доступное обновление. Кнопки управления службой находятся справа
 от её статуса; при наведении macOS показывает пояснение к каждой кнопке.
 
-Шестерёнка открывает отдельное окно с тремя сочетаниями, поведением завершения,
-размером капсулы, цветами и фоном индикатора. Переключатель `RU / EN` мгновенно
-меняет язык обеих панелей. Изменения сначала остаются черновиком; кнопка
-`Сохранить и перезапустить` применяет их вместе и перезапускает только фоновую
-службу. История и модель при этом не удаляются.
+Шестерёнка открывает окно настроек: три сочетания, поведение завершения,
+менеджер слов-паразитов, автоостановка по тишине, микрофон, запуск при входе,
+заглушение звука при записи, размер капсулы, цвета и фон индикатора.
+Переключатель `RU / EN` мгновенно меняет язык обеих панелей. Изменения сначала
+остаются черновиком; кнопка `Сохранить и перезапустить` применяет их вместе и
+перезапускает только фоновую службу. История и модель при этом не удаляются.
 
 Панель можно полностью закрыть. Отдельная фоновая служба продолжит работать и
 автоматически запустится после следующего входа в macOS.
+
+## 🧹 Удаление слов-паразитов
+
+Настройки → `Удалять слова-паразиты` открывают чеклист в четыре колонки:
+
+- **27 отобранных пресетов** — слова-хезитации (`um`, `uh`, `ah`, `эм`, `м`,
+  `аа`…, включены по умолчанию) и разговорные паразиты (`как бы`, `типа`,
+  `короче`, `это самое`, `знаешь`, `you know`, `basically`…, выключены, пока
+  вы их не отметите, — они могут быть настоящими словами).
+- **Свои слова и фразы**: введите, нажмите Enter — слово попадает в тот же
+  список уже отмеченным. Снятая галка оставляет слово в списке, но не
+  применяет его; кнопка `×` удаляет.
+
+## ⏸️ Автоостановка по тишине
+
+Опционально: диктовка завершается сама после выбранной непрерывной тишины
+(1–10 секунд, по умолчанию 5). Тишина отсчитывается от последнего voiced-сэмпла —
+ровно так, как вы это ощущаете.
 
 ## 🔐 Зачем нужны разрешения
 
@@ -99,13 +158,13 @@ macOS не разрешает приложению выдать их самом�
 Установщик:
 
 1. Загружает `SuperDictate.zip` из
-   [GitHub Releases](https://github.com/shohart/SuperDictate-Intel/releases).
+   [GitHub Releases](https://github.com/shohart/SuperDictate-Next/releases).
 2. Проверяет закреплённую SHA-256, версию, bundle ID, архитектуру (Apple
    Silicon или Intel), подпись и microphone-entitlements.
 3. Безопасно заменяет `/Applications/SuperDictate.app` и открывает панель.
 
-Xcode и Command Line Tools для обычной установки не нужны. История, настройки
-и уже загруженная модель при обновлении сохраняются.
+Xcode и Command Line Tools для обычной установки не нужны. История, настройки и
+уже загруженная модель при обновлении сохраняются.
 
 ## 🛠️ Сборка из исходников
 
@@ -115,7 +174,7 @@ Xcode и Command Line Tools для обычной установки не нуж
 результат в `/Applications`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shohart/SuperDictate-Intel/main/install.sh | SUPERDICTATE_BUILD_FROM_SOURCE=1 /bin/bash
+curl -fsSL https://raw.githubusercontent.com/shohart/SuperDictate-Next/main/install.sh | SUPERDICTATE_BUILD_FROM_SOURCE=1 /bin/bash
 ```
 
 Понадобятся бесплатные Apple Command Line Tools. Если их нет, установщик
@@ -131,8 +190,8 @@ curl -fsSL https://raw.githubusercontent.com/shohart/SuperDictate-Intel/main/ins
 
 ```bash
 xcode-select --install
-git clone https://github.com/shohart/SuperDictate-Intel.git
-cd SuperDictate
+git clone https://github.com/shohart/SuperDictate-Next.git
+cd SuperDictate-Next
 swift run -c debug --package-path swift Parakey --self-test all
 ./scripts/build-app.sh ./dist/SuperDictate.app
 open ./dist/SuperDictate.app
@@ -152,15 +211,15 @@ SIGN_IDENTITY="Apple Development: Your Name (TEAMID)" ./scripts/build-app.sh ./d
 
 ## 🗣️ Распознавание речи: Parakeet TDT 0.6B v3
 
-SuperDictate использует NVIDIA Parakeet TDT 0.6B v3 (мультиязычная модель,
-формат GGUF, квантование q8_0) через движок
+SuperDictate Next использует NVIDIA Parakeet TDT 0.6B v3 (мультиязычная
+модель, формат GGUF, квантование q8_0) через движок
 [parakeet.cpp](https://github.com/mudler/parakeet.cpp). Whisper.cpp и
 large-v3-turbo больше не используются — это единственная production-модель
 распознавания речи в приложении.
 
 По умолчанию распознавание идёт на CPU. В меню приложения (в настройках,
 среди поведенческих переключателей) есть пункт `Use GPU (Vulkan)` —
-переключатель реально подключён к parakeet.cpp's Vulkan-бэкенду (ggml
+переключатель реально подключён к Vulkan-бэкенду parakeet.cpp (ggml
 v0.13.0 + MoltenVK), проверено на реальном железе (Intel Xeon E5-2678 v3 +
 AMD Radeon RX 6600, macOS 15.7.7). Пункт меню недоступен (disabled, с
 объяснением в подсказке), если Vulkan-устройство не обнаружено реестром
@@ -230,7 +289,7 @@ RTF, пиковой RSS и фактически выбранным устрой�
 ## ⚠️ Ограничения
 
 - Поддерживаются Apple Silicon и Intel Mac на macOS 14 или новее. Windows и
-  Linux пока не поддерживаются. Поддержка Intel в этом форке проверена ручным
+  Linux пока не поддерживаются. Поддержка Intel проверена ручным
   тестированием только на одной конкретной машине (Xeon E5-2678 v3 + AMD
   Radeon RX 6600, macOS 15.7.7), а не через CI: размещённые GitHub раннеры
   macOS доступны только на Apple Silicon, поэтому автоматической проверки
@@ -250,11 +309,11 @@ RTF, пиковой RSS и фактически выбранным устрой�
   могут не отдавать координаты каретки. Это влияет на положение анимации, но
   не всегда мешает вставке текста.
 - Ориентир по ресурсам на текущей сборке: около 940 МБ на диске для модели
-  (`parakeet-tdt-0.6b-v3-q8_0.gguf`, движок parakeet.cpp, только CPU в этой
-  версии). Пиковая резидентная память процесса — около 940 МБ–1,2 ГБ в
-  зависимости от длины записи (замерено на реальном Intel-железе, см. отчёт
-  миграции). Старые цифры для предыдущих движков (whisper.cpp,
-  FluidAudio/CoreML) для parakeet.cpp не применимы.
+  (`parakeet-tdt-0.6b-v3-q8_0.gguf`, движок parakeet.cpp; по умолчанию CPU,
+  Vulkan — опционально). Пиковая резидентная память процесса — около
+  940 МБ–1,2 ГБ в зависимости от длины записи (замерено на реальном
+  Intel-железе, см. отчёт миграции). Старые цифры для предыдущих движков
+  (whisper.cpp, FluidAudio/CoreML) для parakeet.cpp не применимы.
 
 ## 🔒 Данные и приватность
 
@@ -272,7 +331,7 @@ RTF, пиковой RSS и фактически выбранным устрой�
 ## 🗑️ Удаление
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shohart/SuperDictate-Intel/main/uninstall.sh | bash
+curl -fsSL https://raw.githubusercontent.com/shohart/SuperDictate-Next/main/uninstall.sh | bash
 ```
 
 Приложение и фоновая служба удаляются. История, настройки и модель сохраняются,
@@ -280,7 +339,17 @@ curl -fsSL https://raw.githubusercontent.com/shohart/SuperDictate-Intel/main/uni
 
 ## 📜 Происхождение и лицензия
 
-SuperDictate основан на открытом проекте
-[Parakey](https://github.com/rcourtman/parakey) Richard Courtman. Исходный и
-изменённый код распространяется по лицензии MIT. См. [LICENSE](LICENSE) и
-[NOTICE.md](NOTICE.md).
+SuperDictate Next — форк проекта
+[SuperDictate](https://github.com/shlgd/SuperDictate), который основан на
+открытом проекте [Parakey](https://github.com/rcourtman/parakey) Richard
+Courtman. Исходный и изменённый код распространяется по лицензии MIT.
+См. [LICENSE](LICENSE) и [NOTICE.md](NOTICE.md).
+
+Раньше проект назывался **SuperDictate-Intel**; в SuperDictate Next он
+переименован с релизом v0.5.0. Старые ссылки на репозиторий редиректятся.
+
+## 🤝 Участие
+
+Issues и pull request'ы приветствуются — см. [CONTRIBUTING.md](CONTRIBUTING.md)
+со списком проверок перед PR и [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) с
+правилами сообщества.

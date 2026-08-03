@@ -58,11 +58,14 @@ let MIN_CLIP_SECONDS: Double = 0.25
 let UPDATE_CHECK_FIRST_DELAY_SECONDS: TimeInterval = 30
 let UPDATE_CHECK_INTERVAL_SECONDS: TimeInterval = 6 * 3600  // 6h
 let UPDATE_REMIND_LATER_SECONDS: TimeInterval = 24 * 3600  // 24h
-let GITHUB_LATEST_RELEASE_URL = URL(string: "https://api.github.com/repos/shlgd/SuperDictate/releases/latest")!
-let GITHUB_REPOSITORY_PAGE = URL(string: "https://github.com/shlgd/SuperDictate")!
-let GITHUB_RELEASES_PAGE = URL(string: "https://github.com/shlgd/SuperDictate/releases/latest")!
-let GITHUB_UPDATE_MANIFEST_URL = URL(string: "https://raw.githubusercontent.com/shlgd/SuperDictate/main/update.json")!
+let GITHUB_LATEST_RELEASE_URL = URL(string: "https://api.github.com/repos/shohart/SuperDictate-Next/releases/latest")!
+let GITHUB_REPOSITORY_PAGE = URL(string: "https://github.com/shohart/SuperDictate-Next")!
+let GITHUB_RELEASES_PAGE = URL(string: "https://github.com/shohart/SuperDictate-Next/releases/latest")!
+let GITHUB_UPDATE_MANIFEST_URL = URL(string: "https://raw.githubusercontent.com/shohart/SuperDictate-Next/main/update.json")!
 let UPDATE_ARCHIVE_MAX_BYTES = 64 * 1024 * 1024
+// The upstream project's Homebrew cask, kept deliberately: the updater's
+// migration path detects installs that came from upstream's brew tap.
+// This fork publishes no cask of its own.
 let HOMEBREW_CASK_TAP = "shlgd/superdictate"
 let HOMEBREW_CASK_TOKEN = "shlgd/superdictate/superdictate"
 let HOMEBREW_CASK_INSTALLED_TOKEN = "parakey"
@@ -8641,7 +8644,7 @@ func manualUpdateCheckFailureText(_ failure: UpdateCheckFailure) -> String {
 }
 
 enum UpdateCheck {
-    private static let githubReleaseURLPathPrefix = "/shlgd/SuperDictate/releases/tag/"
+    private static let githubReleaseURLPathPrefix = "/shohart/SuperDictate-Next/releases/tag/"
     static let maxReleaseResponseBytes = 512 * 1024
 
     static func fetchLatest() async -> Result<GitHubRelease, UpdateCheckFailure> {
@@ -8836,7 +8839,7 @@ enum SuperDictateUpdateInstaller {
             throw SuperDictateUpdateInstallerError.appNotWritable
         }
 
-        let archiveURL = URL(string: "https://github.com/shlgd/SuperDictate/releases/download/v\(manifest.version)/SuperDictate.zip")!
+        let archiveURL = URL(string: "https://github.com/shohart/SuperDictate-Next/releases/download/v\(manifest.version)/SuperDictate.zip")!
         var request = URLRequest(url: archiveURL)
         request.setValue("superdictate-in-app-update", forHTTPHeaderField: "User-Agent")
         request.timeoutInterval = 60
@@ -17129,7 +17132,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             Permissions: microphone audio, paste-at-cursor, push-to-talk hotkey.
 
             Open source, based on Parakey by Richard Courtman.
-            github.com/shlgd/SuperDictate · MIT licensed
+            github.com/shohart/SuperDictate-Next · MIT licensed
             """
         // Use our app icon instead of NSAlert's default exclamation
         // mark. .icns lives in Contents/Resources/Parakey.icns;
@@ -17449,7 +17452,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         To update, run this command in Terminal:
 
-        curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/main/install.sh | bash
+        curl -fsSL https://raw.githubusercontent.com/shohart/SuperDictate-Next/main/install.sh | bash
         """
         alert.addButton(withTitle: "Open Release Page")
         alert.addButton(withTitle: "Close")
@@ -17471,7 +17474,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         You can update from Terminal:
 
-        curl -fsSL https://raw.githubusercontent.com/shlgd/SuperDictate/main/install.sh | bash
+        curl -fsSL https://raw.githubusercontent.com/shohart/SuperDictate-Next/main/install.sh | bash
         """
         alert.addButton(withTitle: "OK")
         alert.runModal()
@@ -21368,7 +21371,7 @@ private enum ParakeySelfTest {
                                        httpVersion: nil,
                                        headerFields: nil)!
         let releaseData = Data(
-            #"{"tag_name":"v9.8.7","body":"Notes","html_url":"https://github.com/shlgd/SuperDictate/releases/tag/v9.8.7"}"#.utf8
+            #"{"tag_name":"v9.8.7","body":"Notes","html_url":"https://github.com/shohart/SuperDictate-Next/releases/tag/v9.8.7"}"#.utf8
         )
 
         try expect(
@@ -21376,7 +21379,7 @@ private enum ParakeySelfTest {
             equals: .success(GitHubRelease(tagName: "v9.8.7",
                                            version: "9.8.7",
                                            body: "Notes",
-                                           htmlURL: "https://github.com/shlgd/SuperDictate/releases/tag/v9.8.7")),
+                                           htmlURL: "https://github.com/shohart/SuperDictate-Next/releases/tag/v9.8.7")),
             "update parsing should decode typed GitHub release payloads"
         )
         try expect(
@@ -21395,7 +21398,7 @@ private enum ParakeySelfTest {
         )
         let oversizedReleaseData = Data(
             """
-            {"tag_name":"v9.8.7","body":"\(String(repeating: "x", count: UpdateCheck.maxReleaseResponseBytes))","html_url":"https://github.com/shlgd/SuperDictate/releases/tag/v9.8.7"}
+            {"tag_name":"v9.8.7","body":"\(String(repeating: "x", count: UpdateCheck.maxReleaseResponseBytes))","html_url":"https://github.com/shohart/SuperDictate-Next/releases/tag/v9.8.7"}
             """.utf8
         )
         try expect(
@@ -21466,7 +21469,7 @@ private enum ParakeySelfTest {
         )
         try expect(
             UpdateCheck.parseLatest(
-                data: Data(#"{"tag_name":"v9.8.7","html_url":"https://github.com/shlgd/SuperDictate/releases/tag/v9.8.8"}"#.utf8),
+                data: Data(#"{"tag_name":"v9.8.7","html_url":"https://github.com/shohart/SuperDictate-Next/releases/tag/v9.8.8"}"#.utf8),
                 response: ok
             ),
             equals: .success(GitHubRelease(tagName: "v9.8.7",
@@ -21518,19 +21521,19 @@ private enum ParakeySelfTest {
             "stored app version normalization should reject oversized numeric components"
         )
         try expect(
-            UpdateCheck.sanitizedReleaseURL("http://github.com/shlgd/SuperDictate/releases/tag/v9.8.7",
+            UpdateCheck.sanitizedReleaseURL("http://github.com/shohart/SuperDictate-Next/releases/tag/v9.8.7",
                                             expectedTag: "v9.8.7"),
             equals: GITHUB_RELEASES_PAGE.absoluteString,
             "release URL sanitizing should require HTTPS"
         )
         try expect(
-            UpdateCheck.sanitizedReleaseURL("https://user@github.com/shlgd/SuperDictate/releases/tag/v9.8.7",
+            UpdateCheck.sanitizedReleaseURL("https://user@github.com/shohart/SuperDictate-Next/releases/tag/v9.8.7",
                                             expectedTag: "v9.8.7"),
             equals: GITHUB_RELEASES_PAGE.absoluteString,
             "release URL sanitizing should reject userinfo"
         )
         try expect(
-            UpdateCheck.sanitizedReleaseURL("https://github.com/shlgd/SuperDictate/releases/tag/v9.8.7?download=1",
+            UpdateCheck.sanitizedReleaseURL("https://github.com/shohart/SuperDictate-Next/releases/tag/v9.8.7?download=1",
                                             expectedTag: "v9.8.7"),
             equals: GITHUB_RELEASES_PAGE.absoluteString,
             "release URL sanitizing should reject query strings"

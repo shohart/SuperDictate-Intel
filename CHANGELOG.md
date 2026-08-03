@@ -1,10 +1,48 @@
 # 📋 Changelog
 
-All notable changes to SuperDictate are documented here, in reverse
+All notable changes to SuperDictate Next are documented here, in reverse
 chronological order. This file covers the release history published on
-[GitHub Releases](https://github.com/shohart/SuperDictate-Intel/releases).
+[GitHub Releases](https://github.com/shohart/SuperDictate-Next/releases).
 
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+
+## v0.5.0 — 2026-08-02
+
+**SuperDictate Next** — the first release under the new project name
+(formerly SuperDictate-Intel), now tracking its own repository for update
+checks instead of the upstream project.
+
+- Filler-word manager in Settings: a four-column checklist of 27 curated
+  Russian and English presets — hesitation sounds (on by default) and
+  verbal-tic phrases like "как бы", "это самое", "знаешь", "you know"
+  (off until ticked) — plus your own words and phrases, which join the
+  same list already ticked and can be unticked without deleting. The old
+  menu-bar toggle moved into Settings.
+- Auto-stop on silence: dictation can end itself after 1–10 s of
+  continuous silence (off by default), measured from the last voiced
+  sample.
+- Launch at Login and Mute system audio while recording moved from the
+  menu bar into the Settings window; a hint row points to the
+  text-corrections manager.
+- New adaptive "Contrast" HUD accent color: black on a light capsule
+  background, white on dark — fixes the recording indicator being
+  invisible white-on-light.
+- Settings reliability: the filler-word checklist always renders (a
+  zero-size scroll document hid it), and periodic panel refreshes no
+  longer eat checkbox clicks mid-edit, which had silently dropped saved
+  preset ticks.
+
+## v0.4.x — 2026-07-28…2026-08-01 (summary)
+
+- v0.4.0: whisper.cpp fully replaced by parakeet.cpp + NVIDIA Parakeet
+  TDT 0.6B v3 (GGUF q8_0) as the only speech engine; optional Vulkan GPU
+  backend (ggml + MoltenVK) with automatic CPU fallback, verified on
+  AMD RX 6600.
+- Russian number ITN: dictated numbers written as digits.
+- Long-dictation pause segmentation and overlap seam deduplication.
+- Recording HUD timer + outline-fill display mode with a 10 s crossfade.
+- LaunchAgent no longer relaunches the app after a normal Quit.
+- Clipboard race and ITN punctuation-artifact fixes.
 
 ## v0.2.38 — 2026-07-26
 

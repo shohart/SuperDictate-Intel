@@ -1,25 +1,64 @@
-# 🎙️ SuperDictate
+# 🎙️ SuperDictate Next
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform: macOS](https://img.shields.io/badge/platform-macOS%2014%2B-lightgrey.svg)](#-one-minute-install)
-[![Latest release](https://img.shields.io/github/v/release/shohart/SuperDictate-Intel?label=release)](https://github.com/shohart/SuperDictate-Intel/releases/latest)
+[![Latest release](https://img.shields.io/github/v/release/shohart/SuperDictate-Next?label=release)](https://github.com/shohart/SuperDictate-Next/releases/latest)
 [![100% local](https://img.shields.io/badge/speech%20processing-100%25%20local-success.svg)](#-privacy--data)
 
-**Fast, private, local dictation for macOS.** Hold a hotkey, speak, and your
-words are typed into whatever field is focused — no cloud, no account, no
-audio ever leaving your Mac.
+**Fast, private, local dictation for macOS — including the Intel Macs other
+projects left behind.** Hold a hotkey, speak, and your words are typed into
+whatever field is focused. No cloud, no account, no audio ever leaving your
+Mac.
 
 **[Читать по-русски](README.ru.md)**
 
+## 🌱 Why this project exists
+
+SuperDictate Next is an independent continuation of the
+[SuperDictate](https://github.com/shlgd/SuperDictate) project — itself based
+on [Parakey](https://github.com/rcourtman/parakey) by Richard Courtman —
+forked in July 2026. It is **not** a mirror: 170+ commits of original work,
+its own speech engine, its own release channel, its own update checker.
+
+Three things were missing upstream, and they are the reason this project
+exists:
+
+1. **Intel Macs.** Upstream development and CI target Apple Silicon only.
+   Plenty of still-capable Intel machines (this project is built and tested
+   on a Xeon E5-2678 v3 with an AMD Radeon RX 6600) were untested territory
+   there. Here they are a first-class target.
+2. **A different speech engine.** Upstream stayed on whisper.cpp. SuperDictate
+   Next migrated to [parakeet.cpp](https://github.com/mudler/parakeet.cpp)
+   running NVIDIA Parakeet TDT 0.6B v3 (GGUF, q8_0): fast on CPU, and with a
+   real Vulkan GPU path for AMD cards via MoltenVK, with automatic fallback
+   to CPU.
+3. **Room to iterate on dictation ergonomics** for a Russian+English daily
+   workflow: filler-word management, auto-stop on silence, a proper settings
+   window, Russian number normalization, long-dictation segmentation.
+
+## 🔀 How it differs from upstream SuperDictate
+
+| Area | Upstream (at fork point) | SuperDictate Next |
+|---|---|---|
+| Speech engine | whisper.cpp, large-v3-turbo | parakeet.cpp + Parakeet TDT 0.6B v3 (GGUF q8_0) — whisper removed entirely |
+| GPU acceleration | none in this path | Vulkan backend (ggml + MoltenVK), verified on AMD RX 6600, honest CPU fallback |
+| Intel Macs | untested | first-class target, verified on real hardware |
+| Filler words | single on/off toggle | per-word checklist: 27 curated RU/EN presets in 4 columns + your own words/phrases |
+| Auto-stop | — | ends dictation after 1–10 s of silence (optional) |
+| Settings window | partial | adds Launch at Login, mute-while-recording, adaptive **Contrast** HUD color, capsule size, indicator modes (level bars / elapsed-timer outline) |
+| Russian numbers | words | optional ITN: dictated numbers written as digits (25, not двадцать пять) |
+| Long dictations | single pass | pause-based segmentation with overlap seam deduplication |
+| Corrections | — | text-corrections manager (menu bar) for persistent ASR fixes |
+
 ## 🚀 One-minute install
 
-**Requires an Apple Silicon Mac (`M1` or newer) or Intel, running macOS 14+.**
+**Requires a Mac on macOS 14+ — Apple Silicon or Intel.**
 
 1. Open the **Terminal** app.
 2. Paste this command and press Enter:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shohart/SuperDictate-Intel/main/install.sh | /bin/bash
+curl -fsSL https://raw.githubusercontent.com/shohart/SuperDictate-Next/main/install.sh | /bin/bash
 ```
 
 3. When SuperDictate opens, click `Allow` for **Microphone**,
@@ -32,9 +71,6 @@ On first launch, SuperDictate downloads a local speech-recognition model once
 disk; plan for at least 1.5 GB of free space during installation. After the
 download completes, dictation works fully offline.
 
-SuperDictate is fast, local dictation for macOS. Your audio and transcripts
-are never sent to a cloud API.
-
 ## ⬆️ Updating
 
 **If SuperDictate already shows an `Update` button:** open the app from the
@@ -45,7 +81,7 @@ version, replaces the old one, and relaunches on its own.
 delete anything. Open Terminal and run the same command again:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shohart/SuperDictate-Intel/main/install.sh | /bin/bash
+curl -fsSL https://raw.githubusercontent.com/shohart/SuperDictate-Next/main/install.sh | /bin/bash
 ```
 
 The command only replaces `/Applications/SuperDictate.app`. Your history,
@@ -53,8 +89,8 @@ settings, and already-downloaded model stay in place. After this, future
 updates can be installed straight from the app.
 
 The latest published version is always visible on the
-[GitHub Releases](https://github.com/shohart/SuperDictate-Intel/releases/latest)
-page (this fork hasn't cut its first release yet).
+[GitHub Releases](https://github.com/shohart/SuperDictate-Next/releases/latest)
+page.
 
 ## ⌨️ Hotkeys
 
@@ -77,21 +113,40 @@ page (this fork hasn't cut its first release yet).
 - Open `SuperDictate` from Applications to check the background service,
   permissions, and updates. Settings open via the gear button.
 
-## 🖥️ Control panel
+## 🖥️ Control panel and settings
 
 The main panel is compact: it shows the background service status, any
 missing permissions, and an available update. Service controls sit to the
 right of the status; hovering shows a tooltip for each button.
 
-The gear button opens a separate window with the three shortcuts, the
-stop-action behavior, capsule size, colors, and indicator background. The
-`RU / EN` toggle instantly switches the language of both panels. Changes stay
-as a draft first; the `Save and Restart` button applies them together and
-restarts only the background service — history and the model are left
+The gear button opens the Settings window: the three shortcuts, stop-action
+behavior, filler-word manager, auto-stop on silence, microphone, Launch at
+Login, mute while recording, capsule size, indicator colors and background.
+The `RU / EN` toggle instantly switches the language of both panels. Changes
+stay as a draft first; the `Save and Restart` button applies them together
+and restarts only the background service — history and the model are left
 untouched.
 
 The panel can be closed entirely. The background service keeps running
 separately and launches automatically after the next macOS login.
+
+## 🧹 Filler-word removal
+
+Settings → `Remove filler words` opens a four-column checklist:
+
+- **27 curated presets** — hesitation sounds (`um`, `uh`, `ah`, `эм`, `м`,
+  `аа`…, on by default) and verbal-tic phrases (`как бы`, `типа`, `короче`,
+  `это самое`, `знаешь`, `you know`, `basically`…, off until you tick them,
+  because they can be real words).
+- **Your own words and phrases**: type one, press Enter — it joins the same
+  list, already ticked. Untick to keep it on the list but unused; the `×`
+  button deletes it.
+
+## ⏸️ Auto-stop on silence
+
+Optional: dictation ends itself after a chosen stretch of continuous silence
+(1–10 seconds, default 5). Silence is measured from the last voiced sample,
+exactly as you perceive it.
 
 ## 🔐 Why the permissions are needed
 
@@ -112,7 +167,7 @@ permission.
 The installer:
 
 1. Downloads `SuperDictate.zip` from
-   [GitHub Releases](https://github.com/shohart/SuperDictate-Intel/releases).
+   [GitHub Releases](https://github.com/shohart/SuperDictate-Next/releases).
 2. Verifies a pinned SHA-256, version, bundle ID, architecture (Apple Silicon
    or Intel), code signature, and microphone entitlements.
 3. Safely replaces `/Applications/SuperDictate.app` and opens the panel.
@@ -129,7 +184,7 @@ This command downloads the open-source code, builds it locally, and installs
 the result into `/Applications`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shohart/SuperDictate-Intel/main/install.sh | SUPERDICTATE_BUILD_FROM_SOURCE=1 /bin/bash
+curl -fsSL https://raw.githubusercontent.com/shohart/SuperDictate-Next/main/install.sh | SUPERDICTATE_BUILD_FROM_SOURCE=1 /bin/bash
 ```
 
 You'll need the free Apple Command Line Tools. If they're missing, the
@@ -145,8 +200,8 @@ commit, the installer won't run the downloaded `scripts/build-app.sh`.
 
 ```bash
 xcode-select --install
-git clone https://github.com/shohart/SuperDictate-Intel.git
-cd SuperDictate
+git clone https://github.com/shohart/SuperDictate-Next.git
+cd SuperDictate-Next
 swift run -c debug --package-path swift Parakey --self-test all
 ./scripts/build-app.sh ./dist/SuperDictate.app
 open ./dist/SuperDictate.app
@@ -166,8 +221,8 @@ running from that build. For regular use, prefer the
 
 ## 🗣️ Speech recognition: Parakeet TDT 0.6B v3
 
-SuperDictate uses NVIDIA Parakeet TDT 0.6B v3 (a multilingual model, GGUF
-format, q8_0 quantization) via the
+SuperDictate Next uses NVIDIA Parakeet TDT 0.6B v3 (a multilingual model,
+GGUF format, q8_0 quantization) via the
 [parakeet.cpp](https://github.com/mudler/parakeet.cpp) engine. Whisper.cpp
 and large-v3-turbo are no longer used — this is the only production speech
 recognition model in the app.
@@ -242,9 +297,9 @@ effectively selected device. Results from a real run are in
 ## ⚠️ Limitations
 
 - Apple Silicon and Intel Macs on macOS 14 or newer are supported. Windows
-  and Linux are not supported yet. Intel support in this fork has only been
-  manually tested on one specific machine (Xeon E5-2678 v3 + AMD Radeon RX
-  6600, macOS 15.7.7), not through CI: hosted GitHub macOS runners are only
+  and Linux are not supported yet. Intel support has only been manually
+  tested on one specific machine (Xeon E5-2678 v3 + AMD Radeon RX 6600,
+  macOS 15.7.7), not through CI: hosted GitHub macOS runners are only
   available on Apple Silicon, so there's no automated coverage of this path
   yet.
 - The public build is signed ad-hoc and not notarized by Apple. Installing
@@ -262,8 +317,8 @@ effectively selected device. Results from a real run are in
   expose caret coordinates. This affects the animation's position but doesn't
   always prevent text insertion.
 - Resource footprint on the current build: about 940 MB on disk for the model
-  (`parakeet-tdt-0.6b-v3-q8_0.gguf`, parakeet.cpp engine, CPU-only in this
-  version). Peak resident memory is about 940 MB–1.2 GB depending on
+  (`parakeet-tdt-0.6b-v3-q8_0.gguf`, parakeet.cpp engine; CPU by default,
+  Vulkan optional). Peak resident memory is about 940 MB–1.2 GB depending on
   recording length (measured on real Intel hardware, see the migration
   report). Older numbers for previous engines (whisper.cpp, FluidAudio/
   CoreML) don't apply to parakeet.cpp.
@@ -284,7 +339,7 @@ More details: [PRIVACY.md](PRIVACY.md).
 ## 🗑️ Uninstalling
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shohart/SuperDictate-Intel/main/uninstall.sh | bash
+curl -fsSL https://raw.githubusercontent.com/shohart/SuperDictate-Next/main/uninstall.sh | bash
 ```
 
 The app and the background service are removed. History, settings, and the
@@ -293,10 +348,14 @@ accident.
 
 ## 📜 Origin and license
 
-SuperDictate is based on the open-source
-[Parakey](https://github.com/rcourtman/parakey) project by Richard Courtman.
-The original and modified code is distributed under the MIT License. See
-[LICENSE](LICENSE) and [NOTICE.md](NOTICE.md).
+SuperDictate Next is a fork of
+[SuperDictate](https://github.com/shlgd/SuperDictate), which is based on the
+open-source [Parakey](https://github.com/rcourtman/parakey) project by
+Richard Courtman. The original and modified code is distributed under the
+MIT License. See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md).
+
+The project was formerly named **SuperDictate-Intel**; it was renamed to
+SuperDictate Next with the v0.5.0 release. Old repository URLs redirect.
 
 ## 🤝 Contributing
 
