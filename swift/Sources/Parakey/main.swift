@@ -2868,6 +2868,7 @@ final class Settings: @unchecked Sendable {
     private static let keyRemoveFillerWords = "remove_filler_words"
     private static let keyEnabledFillerPresetKeys = "enabled_filler_preset_keys"
     private static let keyCustomFillerWords = "custom_filler_words"
+    private static let keyDisabledCustomFillerWords = "disabled_custom_filler_words"
     private static let keyNormalizeNumbersToDigits = "normalize_numbers_to_digits"
     // New key, deliberately NOT the old "use_gpu" (spec §10: "Do not
     // inherit the old Whisper `useGPU` storage value... the persisted key
@@ -3558,6 +3559,21 @@ final class Settings: @unchecked Sendable {
     var customFillerWords: [String] {
         get { (defaults.array(forKey: Self.keyCustomFillerWords) as? [String]) ?? [] }
         set { defaults.set(newValue, forKey: Self.keyCustomFillerWords) }
+    }
+
+    /// Custom words the user switched off in the checklist but kept on the
+    /// list (mirrors the Windows port: a custom word can stay visible but
+    /// unticked, instead of forcing delete-or-always-on).
+    var disabledCustomFillerWords: Set<String> {
+        get { Set((defaults.array(forKey: Self.keyDisabledCustomFillerWords) as? [String]) ?? []) }
+        set { defaults.set(Array(newValue), forKey: Self.keyDisabledCustomFillerWords) }
+    }
+
+    /// The custom-word list the transcription pipeline should actually
+    /// apply: every custom word except the ones unticked in Settings.
+    var enabledCustomFillerWords: [String] {
+        let disabled = disabledCustomFillerWords
+        return customFillerWords.filter { !disabled.contains($0) }
     }
 
     var normalizeNumbersToDigits: Bool {
@@ -11747,7 +11763,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                                        normalizeNumbersToDigits: settings.normalizeNumbersToDigits,
                                                        language: settings.dictationLanguage,
                                                        enabledFillerPresetKeys: settings.enabledFillerPresetKeys,
-                                                       customFillerWords: settings.customFillerWords)
+                                                       customFillerWords: settings.enabledCustomFillerWords)
                 if !processed.text.isEmpty {
                     addToHistory(
                         processed.text,
@@ -13314,7 +13330,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                                            normalizeNumbersToDigits: settings.normalizeNumbersToDigits,
                                                            language: settings.dictationLanguage,
                                                            enabledFillerPresetKeys: settings.enabledFillerPresetKeys,
-                                                           customFillerWords: settings.customFillerWords)
+                                                           customFillerWords: settings.enabledCustomFillerWords)
                     let postprocessingCompletedAt = ProcessInfo.processInfo.systemUptime
                     if processed.appliedCorrectionCount > 0 {
                         log("transcript corrections applied: \(processed.appliedCorrectionCount)")
@@ -13554,7 +13570,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                                            normalizeNumbersToDigits: settings.normalizeNumbersToDigits,
                                                            language: settings.dictationLanguage,
                                                            enabledFillerPresetKeys: settings.enabledFillerPresetKeys,
-                                                           customFillerWords: settings.customFillerWords)
+                                                           customFillerWords: settings.enabledCustomFillerWords)
                     if !processed.text.isEmpty {
                         addToHistory(
                             processed.text,
@@ -17758,6 +17774,8 @@ private enum ParakeySelfTest {
             return runSuite("enabled-filler-preset-keys-setting", testEnabledFillerPresetKeysSetting)
         case "silence-auto-stop-tracker":
             return runSuite("silence-auto-stop-tracker", testSilenceAutoStopTracker)
+        case "disabled-custom-filler-words":
+            return runSuite("disabled-custom-filler-words", testDisabledCustomFillerWords)
         case "recording-hud-accent-color-resolved":
             return runSuite("recording-hud-accent-color-resolved", testRecordingHUDAccentColorResolvedColor)
         case "all":
@@ -17800,6 +17818,7 @@ private enum ParakeySelfTest {
         try testFillerWordPresetDefaults()
         try testEnabledFillerPresetKeysSetting()
         try testSilenceAutoStopTracker()
+        try testDisabledCustomFillerWords()
         try testRecordingHUDAccentColorResolvedColor()
         try testAudioLevelMetering()
         try testAudioConversion()
@@ -20689,6 +20708,43 @@ private enum ParakeySelfTest {
         reusedTracker.reset()
         try expect(reusedTracker.update(level: 0.0, now: 1.5), equals: false, "after reset, clock restarts from the next tick")
         try expect(reusedTracker.update(level: 0.0, now: 2.5), equals: true, "second recording fires 1s after its own start")
+    }
+
+    private static func testDisabledCustomFillerWords() throws {
+        let defaults = UserDefaults.standard
+        let wordsKey = "custom_filler_words"
+        let disabledKey = "disabled_custom_filler_words"
+        let previousWords = defaults.array(forKey: wordsKey)
+        let previousDisabled = defaults.array(forKey: disabledKey)
+        defer {
+            if let previousWords { defaults.set(previousWords, forKey: wordsKey) } else { defaults.removeObject(forKey: wordsKey) }
+            if let previousDisabled { defaults.set(previousDisabled, forKey: disabledKey) } else { defaults.removeObject(forKey: disabledKey) }
+        }
+
+        defaults.removeObject(forKey: wordsKey)
+        defaults.removeObject(forKey: disabledKey)
+        let settings = Settings.shared
+
+        settings.customFillerWords = ["вещь", "thing"]
+        try expect(settings.enabledCustomFillerWords, equals: ["вещь", "thing"],
+                   "custom words are all enabled until explicitly unticked")
+
+        settings.disabledCustomFillerWords = ["thing"]
+        try expect(settings.enabledCustomFillerWords, equals: ["вещь"],
+                   "unticked custom word must drop out of the pipeline list but stay stored")
+
+        // The pipeline itself must skip the unticked word and keep the rest.
+        let stripped = FillerWordRemover.apply(to: "This thing is a thing, honestly.",
+                                               enabledPresetKeys: [],
+                                               customWords: settings.enabledCustomFillerWords)
+        try expect(stripped.text, equals: "This thing is a thing, honestly.",
+                   "unticked custom word must not be removed from dictated text")
+
+        let active = FillerWordRemover.apply(to: "This thing is a вещь, honestly.",
+                                             enabledPresetKeys: [],
+                                             customWords: settings.enabledCustomFillerWords)
+        try expect(active.text, equals: "This thing is a, honestly.",
+                   "ticked custom word must still be removed")
     }
 
     private static func testRecordingHUDAccentColorResolvedColor() throws {
@@ -25276,6 +25332,7 @@ private struct ControlPanelSettingsDraft: Equatable {
     var removeFillerWords: Bool
     var enabledFillerPresetKeys: Set<String>
     var customFillerWords: [String]
+    var disabledCustomFillerWords: Set<String>
     var autoStopOnSilenceEnabled: Bool
     var autoStopSilenceSeconds: Int
     var muteWhileRecording: Bool
@@ -25298,6 +25355,7 @@ private struct ControlPanelSettingsDraft: Equatable {
         removeFillerWords = settings.removeFillerWords
         enabledFillerPresetKeys = settings.enabledFillerPresetKeys
         customFillerWords = settings.customFillerWords
+        disabledCustomFillerWords = settings.disabledCustomFillerWords
         autoStopOnSilenceEnabled = settings.autoStopOnSilenceEnabled
         autoStopSilenceSeconds = settings.autoStopSilenceSeconds
         muteWhileRecording = settings.muteWhileRecording
@@ -26475,21 +26533,56 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         container.addArrangedSubview(header)
 
         if draft.removeFillerWords {
+            // One unified checklist, presets first, then the user's own
+            // words -- the same interaction shape as the Windows port:
+            // every row has a checkbox; custom rows also carry a delete
+            // button; newly added words land in this same list, ticked.
             let checklist = NSStackView()
             checklist.orientation = .vertical
             checklist.alignment = .leading
             checklist.spacing = 4
+            checklist.translatesAutoresizingMaskIntoConstraints = false
+
             for preset in FillerWordRemover.presets {
                 let row = NSButton(checkboxWithTitle: preset.displayText, target: self, action: #selector(toggleFillerPreset(_:)))
                 row.state = draft.enabledFillerPresetKeys.contains(preset.key) ? .on : .off
                 row.identifier = NSUserInterfaceItemIdentifier(preset.key)
                 checklist.addArrangedSubview(row)
             }
+            for word in draft.customFillerWords {
+                let row = NSStackView()
+                row.orientation = .horizontal
+                row.alignment = .centerY
+                row.spacing = 6
+                let box = NSButton(checkboxWithTitle: word, target: self, action: #selector(toggleCustomFillerWord(_:)))
+                box.state = draft.disabledCustomFillerWords.contains(word) ? .off : .on
+                box.identifier = NSUserInterfaceItemIdentifier(word)
+                row.addArrangedSubview(box)
+                row.addArrangedSubview(NSView())
+                let remove = NSButton(title: "×", target: self, action: #selector(removeCustomFillerWord(_:)))
+                remove.identifier = NSUserInterfaceItemIdentifier(word)
+                remove.bezelStyle = .inline
+                remove.toolTip = t("Убрать слово из списка", "Remove this word from the list")
+                row.addArrangedSubview(remove)
+                checklist.addArrangedSubview(row)
+                row.widthAnchor.constraint(equalTo: checklist.widthAnchor).isActive = true
+            }
+
             let scroll = NSScrollView()
             scroll.documentView = checklist
             scroll.hasVerticalScroller = true
             scroll.drawsBackground = false
-            scroll.heightAnchor.constraint(equalToConstant: 160).isActive = true
+            scroll.translatesAutoresizingMaskIntoConstraints = false
+            // Without explicit constraints a stack view used as a scroll
+            // document stays (0,0,0,0) and the whole checklist renders
+            // empty -- pin its width to the clip view and give the scroll
+            // view itself a real height.
+            NSLayoutConstraint.activate([
+                checklist.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+                checklist.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
+                checklist.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+                scroll.heightAnchor.constraint(equalToConstant: 180),
+            ])
             container.addArrangedSubview(scroll)
 
             let customField = NSTextField()
@@ -26499,17 +26592,15 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             customField.action = #selector(addCustomFillerWord(_:))
             container.addArrangedSubview(customField)
 
-            for word in draft.customFillerWords {
-                let row = NSStackView()
-                row.orientation = .horizontal
-                row.spacing = 8
-                row.addArrangedSubview(panelLabel(word, size: 12))
-                let remove = NSButton(title: "×", target: self, action: #selector(removeCustomFillerWord(_:)))
-                remove.identifier = NSUserInterfaceItemIdentifier(word)
-                remove.bezelStyle = .inline
-                row.addArrangedSubview(remove)
-                container.addArrangedSubview(row)
-            }
+            // The container is a vertical stack with .leading alignment, so
+            // its arranged subviews keep their intrinsic (near-zero) width
+            // unless pinned -- the outer makeSettingsContentView only pins
+            // the container itself to the window width.
+            NSLayoutConstraint.activate([
+                header.widthAnchor.constraint(equalTo: container.widthAnchor),
+                scroll.widthAnchor.constraint(equalTo: container.widthAnchor),
+                customField.widthAnchor.constraint(equalTo: container.widthAnchor),
+            ])
         }
 
         return container
@@ -27349,18 +27440,43 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             draft.enabledFillerPresetKeys.remove(key)
         }
         settingsDraft = draft
-        refreshSettingsWindow()
+        // No refreshSettingsWindow() here: the checkbox the user just
+        // clicked already shows the right state, and rebuilding the whole
+        // content view would bounce the scroll position back to the top
+        // of the checklist on every tick.
+    }
+
+    @objc private func toggleCustomFillerWord(_ sender: NSButton) {
+        guard let word = sender.identifier?.rawValue else { return }
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        if sender.state == .on {
+            draft.disabledCustomFillerWords.remove(word)
+        } else {
+            draft.disabledCustomFillerWords.insert(word)
+        }
+        settingsDraft = draft
+        // See toggleFillerPreset for why this intentionally skips refresh.
     }
 
     @objc private func addCustomFillerWord(_ sender: NSTextField) {
-        let trimmed = sender.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        // Normalize the same way the Windows port does: collapse internal
+        // whitespace and lowercase (matching is case-insensitive anyway).
+        let word = sender.stringValue
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+            .lowercased()
+        guard !word.isEmpty else { return }
         var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
-        guard !draft.customFillerWords.contains(trimmed) else {
-            sender.stringValue = ""
-            return
+        // A word typed in is a word wanted: if it already names a preset,
+        // tick that preset; if it is already a custom word, re-tick it;
+        // only genuinely new words extend the list.
+        if let preset = FillerWordRemover.presets.first(where: { $0.displayText.lowercased() == word }) {
+            draft.enabledFillerPresetKeys.insert(preset.key)
+        } else if let existing = draft.customFillerWords.first(where: { $0.lowercased() == word }) {
+            draft.disabledCustomFillerWords.remove(existing)
+        } else {
+            draft.customFillerWords.append(word)
         }
-        draft.customFillerWords.append(trimmed)
         settingsDraft = draft
         sender.stringValue = ""
         refreshSettingsWindow()
@@ -27370,6 +27486,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         guard let word = sender.identifier?.rawValue else { return }
         var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
         draft.customFillerWords.removeAll { $0 == word }
+        draft.disabledCustomFillerWords.remove(word)
         settingsDraft = draft
         refreshSettingsWindow()
     }
@@ -27500,6 +27617,7 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         settings.removeFillerWords = draft.removeFillerWords
         settings.enabledFillerPresetKeys = draft.enabledFillerPresetKeys
         settings.customFillerWords = draft.customFillerWords
+        settings.disabledCustomFillerWords = draft.disabledCustomFillerWords
         settings.autoStopOnSilenceEnabled = draft.autoStopOnSilenceEnabled
         settings.autoStopSilenceSeconds = draft.autoStopSilenceSeconds
         settings.muteWhileRecording = draft.muteWhileRecording
