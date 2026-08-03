@@ -20614,6 +20614,16 @@ private enum ParakeySelfTest {
         let ordering = FillerWordRemover.apply(to: "Это самое сложно.", enabledPresetKeys: ["ru_eto_samoe"], customWords: ["это"])
         try expect(ordering.text, equals: "Сложно.", "the longer phrase preset must be tried before the shorter custom word it contains")
 
+        // Regression coverage for the exact two presets a user reported as
+        // "не фильтруются": the pipeline itself must handle both when they
+        // are ticked (the real bug was in the Settings window, which ate
+        // the clicks before they could be saved).
+        let znaesh = FillerWordRemover.apply(to: "Ну, знаешь, как дела?", enabledPresetKeys: ["ru_znaesh"], customWords: [])
+        try expect(znaesh.text, equals: "Ну, как дела?", "ru_znaesh must be removed when ticked")
+
+        let etoSamoe = FillerWordRemover.apply(to: "Я, это самое, не знаю.", enabledPresetKeys: ["ru_eto_samoe"], customWords: [])
+        try expect(etoSamoe.text, equals: "Я, не знаю.", "ru_eto_samoe must be removed when ticked")
+
         // Blank/whitespace-only custom words must be ignored, not turned
         // into a zero-width-match pattern that inflates removedCount and
         // corrupts unrelated text via the punctuation-cleanup pass.
@@ -25398,6 +25408,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
     private var permissionClickCount: [Permission: Int] = [:]
     private var settingsDraft: ControlPanelSettingsDraft?
     private var hotkeyRecorder: HotkeyRecorderController?
+    private weak var settingsSaveButton: NSButton?
+    private weak var settingsDiscardButton: NSButton?
+    private weak var settingsStatusLabel: NSTextField?
 
     private var language: InterfaceLanguage { settings.interfaceLanguage }
 
@@ -25505,8 +25518,21 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         window.title = t("SuperDictate — панель управления", "SuperDictate — Control Panel")
         window.contentView = makeContentView()
         if let settingsWindow, settingsWindow.isVisible {
-            settingsWindow.title = t("Настройки SuperDictate", "SuperDictate Settings")
-            settingsWindow.contentView = makeSettingsContentView()
+            // Rebuilding the content view mid-edit destroys the very
+            // NSButton the user is clicking: the 0.75s refresh timer fires
+            // on any fingerprint change (update checks, agent state
+            // transitions after a save), and if it lands between
+            // mouse-down and mouse-up, the toggle is silently eaten -- the
+            // rebuilt checkbox just shows the old draft state again. Real
+            // report: two preset ticks never reached the draft and were
+            // lost on save. Freeze the settings window while there are
+            // unsaved draft changes; save/discard rebuild explicitly.
+            let hasUnsavedChanges = settingsDraft
+                .map { $0 != ControlPanelSettingsDraft(settings: settings) } ?? false
+            if force || !hasUnsavedChanges {
+                settingsWindow.title = t("Настройки SuperDictate", "SuperDictate Settings")
+                settingsWindow.contentView = makeSettingsContentView()
+            }
         }
     }
 
@@ -26946,12 +26972,13 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         row.addArrangedSubview(message)
         row.addArrangedSubview(NSView())
 
-        row.addArrangedSubview(panelButton(
+        let discard = panelButton(
             t("Отменить", "Discard"),
             action: #selector(discardSettingsClicked(_:)),
             enabled: hasChanges && serviceOperation == nil,
             toolTip: t("Отменить несохранённые изменения.", "Discard unsaved changes.")
-        ))
+        )
+        row.addArrangedSubview(discard)
         let save = panelButton(
             t("Сохранить и перезапустить", "Save & Restart"),
             action: #selector(saveSettingsClicked(_:)),
@@ -26961,7 +26988,30 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         )
         save.keyEquivalent = "\r"
         row.addArrangedSubview(save)
+        settingsStatusLabel = message
+        settingsDiscardButton = discard
+        settingsSaveButton = save
         return row
+    }
+
+    /// Updates just the Save/Discard buttons and the status label after an
+    /// in-place draft change (checkbox toggles), without rebuilding the
+    /// whole content view -- a rebuild mid-edit is what used to eat
+    /// checklist clicks and go stale the other way.
+    private func updateSettingsSaveState() {
+        guard let save = settingsSaveButton,
+              let discard = settingsDiscardButton,
+              let message = settingsStatusLabel else { return }
+        let draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        let hasChanges = draft != ControlPanelSettingsDraft(settings: settings)
+        let validation = settingsValidationMessage(draft)
+        save.isEnabled = hasChanges && validation == nil && serviceOperation == nil
+        discard.isEnabled = hasChanges && serviceOperation == nil
+        message.stringValue = validation ?? (hasChanges
+            ? t("Есть несохранённые изменения", "You have unsaved changes")
+            : t("Все изменения сохранены", "All changes are saved"))
+        message.textColor = validation == nil ? .secondaryLabelColor : .systemRed
+        message.toolTip = validation
     }
 
     private func settingsValidationMessage(_ draft: ControlPanelSettingsDraft) -> String? {
@@ -27473,7 +27523,9 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
         // No refreshSettingsWindow() here: the checkbox the user just
         // clicked already shows the right state, and rebuilding the whole
         // content view would bounce the scroll position back to the top
-        // of the checklist on every tick.
+        // of the checklist on every tick. But the Save button must still
+        // learn about the change -- update it in place.
+        updateSettingsSaveState()
     }
 
     @objc private func toggleCustomFillerWord(_ sender: NSButton) {
@@ -27485,7 +27537,8 @@ private final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate
             draft.disabledCustomFillerWords.insert(word)
         }
         settingsDraft = draft
-        // See toggleFillerPreset for why this intentionally skips refresh.
+        // See toggleFillerPreset for why this skips a full rebuild.
+        updateSettingsSaveState()
     }
 
     @objc private func addCustomFillerWord(_ sender: NSTextField) {
