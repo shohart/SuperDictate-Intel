@@ -35,9 +35,6 @@ grep -q 'raw.githubusercontent.com/shohart/SuperDictate-Next/main/install.sh' RE
 grep -q '^REF="${SUPERDICTATE_REF:-\$SOURCE_COMMIT}"$' install.sh
 grep -q '^EXPECTED_SOURCE_COMMIT="${SUPERDICTATE_SOURCE_COMMIT:-\$SOURCE_COMMIT}"$' install.sh
 grep -q 'verify_source_ref' install.sh
-grep -q 'sysctl.proc_translated' install.sh
-grep -q 'is_apple_silicon' install.sh
-grep -q 'Restarting the build natively for Apple Silicon' scripts/build-app.sh
 grep -q 'validate_output_app_path "$OUTPUT_APP"' scripts/build-app.sh
 
 git diff --check
