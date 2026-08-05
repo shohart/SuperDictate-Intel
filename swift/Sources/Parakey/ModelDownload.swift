@@ -1,0 +1,625 @@
+// SuperDictate — extracted from the monolithic main.swift
+// during the refactor/split-main refactor (model download).
+//
+import AppKit
+import AVFoundation
+import AudioToolbox
+import Foundation
+import CoreGraphics
+import parakeet_cpp
+import CryptoKit
+import Darwin
+import ApplicationServices
+import IOKit
+import QuartzCore
+import ServiceManagement
+import UniformTypeIdentifiers
+
+// MARK: - Parakeet model download + checksum verification
+
+/// Progress callback for `TranscriptionWorker.load`. Parakeet-neutral name
+/// per spec §4.2 (renamed from the pre-migration `WhisperDownloadProgressHandler`).
+/// `downloadParakeetModelIfNeeded()` takes no progress callback today (single
+/// `URLSession.shared.download` call, no incremental byte reporting), so this
+/// parameter currently goes unused inside it — kept so call sites retain a
+/// progress-handler parameter of some concrete type.
+typealias SpeechModelDownloadProgressHandler = @Sendable (Double) -> Void
+
+enum ParakeetModelDownloadError: LocalizedError {
+    case checksumMismatch(expected: String, actual: String)
+    case sizeMismatch(expected: Int64, actual: Int64)
+    case downloadFailed(underlying: Error)
+    case httpError(statusCode: Int)
+    case unsafeDestination(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .checksumMismatch(let expected, let actual):
+            return "Downloaded Parakeet model checksum mismatch: expected \(expected), got \(actual)"
+        case .sizeMismatch(let expected, let actual):
+            return "Downloaded Parakeet model size mismatch: expected \(expected) bytes, got \(actual) bytes"
+        case .downloadFailed(let underlying):
+            return "Failed to download Parakeet model: \(underlying.localizedDescription)"
+        case .httpError(let statusCode):
+            return "Parakeet model download failed with HTTP \(statusCode)"
+        case .unsafeDestination(let detail):
+            return "Refusing unsafe Parakeet model destination: \(detail)"
+        }
+    }
+}
+
+/// Pinned to a specific Hugging Face revision commit, never `main`/`latest` —
+/// see docs/parakeet-intel-backend.md §3. Values verified for real on the
+/// target Intel Mac in Phase 2 of the migration (see
+/// .superpowers/sdd/2026-07-28-parakeet-cpp-migration/phase-2-cpu-spike-report.md):
+/// exact byte size and SHA-256 both computed from the actual downloaded
+/// bytes, not copied from any Hugging Face API metadata response.
+let PARAKEET_MODEL_REPOSITORY = "mudler/parakeet-cpp-gguf"
+let PARAKEET_MODEL_REVISION = "bf0af9f425fa01809cadec671b3cb672709d13e9"
+let PARAKEET_MODEL_FILENAME = "tdt-0.6b-v3-q8_0.gguf"
+let PARAKEET_MODEL_ARCH = "parakeet (TDT, hybrid)"
+let PARAKEET_MODEL_QUANTIZATION = "q8_0"
+private let PARAKEET_MODEL_URL = URL(
+    string: "https://huggingface.co/\(PARAKEET_MODEL_REPOSITORY)/resolve/\(PARAKEET_MODEL_REVISION)/\(PARAKEET_MODEL_FILENAME)"
+)!
+let PARAKEET_MODEL_SHA256 = "4d69a4a6683f4f2d952bad794c1357ca6eb628027695b4699c5a9ad4cd07d757"
+let PARAKEET_MODEL_SIZE_BYTES: Int64 = 940_663_680
+
+/// Computes the SHA-256 digest of a single known file, hex-encoded.
+///
+/// This is intentionally separate from `ModelIntegrity.sha256Hex(of:relativePath:)`,
+/// which verifies files within the previous ASR stack's CoreML manifest tree (relative-path
+/// aware, part of the manifest-verification machinery above). This function has
+/// a simpler job: verify one specific downloaded model file against a single
+/// pinned checksum.
+func sha256Hex(ofFileAt url: URL) throws -> String {
+    let data = try Data(contentsOf: url, options: .mappedIfSafe)
+    var hasher = SHA256()
+    hasher.update(data: data)
+    return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+}
+
+/// Regular-file-only guard (spec §4.2 items 1-2: "Treat the destination as a
+/// known regular file only. Reject symlinks, directories and special
+/// files."). Returns `false` for anything that isn't a plain regular file
+/// (symlink, directory, device node, socket, etc.) — including the
+/// nothing-there case, which callers treat as "no cached file yet", not a
+/// safety violation.
+func isPlainRegularFile(_ path: String) -> Bool {
+    var st = stat()
+    guard lstat(path, &st) == 0 else { return false }
+    return (st.st_mode & S_IFMT) == S_IFREG
+}
+
+@discardableResult
+func downloadParakeetModelIfNeeded() async throws -> URL {
+    let destination = speechModelCacheDirectory(for: .productionDefault)
+    if FileManager.default.fileExists(atPath: destination.path) {
+        guard isPlainRegularFile(destination.path) else {
+            throw ParakeetModelDownloadError.unsafeDestination(
+                "existing cache path is not a plain regular file: \(destination.path)"
+            )
+        }
+        let attributes = try? FileManager.default.attributesOfItem(atPath: destination.path)
+        let actualSize = (attributes?[.size] as? Int64) ?? -1
+        if actualSize == PARAKEET_MODEL_SIZE_BYTES {
+            let actualHash = try sha256Hex(ofFileAt: destination)
+            if actualHash == PARAKEET_MODEL_SHA256 {
+                return destination
+            }
+        }
+        log("ASR: cached Parakeet model failed size/checksum verification; redownloading")
+        try? FileManager.default.removeItem(at: destination)
+    }
+
+    try assertSufficientDiskSpaceForSpeechModelDownload(profile: .productionDefault)
+
+    let destinationDirectory = destination.deletingLastPathComponent()
+    try FileManager.default.createDirectory(
+        at: destinationDirectory,
+        withIntermediateDirectories: true
+    )
+
+    // Download to a temp file ON THE SAME VOLUME as the destination (spec
+    // §4.2 item 5) so the final move below is a same-volume atomic rename,
+    // never a cross-volume copy that could leave a partial file visible
+    // under a production-looking name. `URLSession.shared.download` itself
+    // already writes to a private temp location; the explicit move to a
+    // sibling temp file here guarantees the same-volume property regardless
+    // of where the system temp directory happens to be mounted.
+    let (systemTempURL, response) = try await URLSession.shared.download(from: PARAKEET_MODEL_URL)
+    guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+        try? FileManager.default.removeItem(at: systemTempURL)
+        let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+        throw ParakeetModelDownloadError.httpError(statusCode: code)
+    }
+
+    let sameVolumeTempURL = destinationDirectory.appendingPathComponent(
+        ".\(PARAKEET_MODEL_FILENAME).download-\(UUID().uuidString)", isDirectory: false
+    )
+    try FileManager.default.moveItem(at: systemTempURL, to: sameVolumeTempURL)
+
+    func cleanupTemp() {
+        try? FileManager.default.removeItem(at: sameVolumeTempURL)
+    }
+
+    let attributes = try? FileManager.default.attributesOfItem(atPath: sameVolumeTempURL.path)
+    let actualSize = (attributes?[.size] as? Int64) ?? -1
+    guard actualSize == PARAKEET_MODEL_SIZE_BYTES else {
+        cleanupTemp()
+        throw ParakeetModelDownloadError.sizeMismatch(expected: PARAKEET_MODEL_SIZE_BYTES, actual: actualSize)
+    }
+
+    let actualHash = try sha256Hex(ofFileAt: sameVolumeTempURL)
+    guard actualHash == PARAKEET_MODEL_SHA256 else {
+        cleanupTemp()
+        throw ParakeetModelDownloadError.checksumMismatch(expected: PARAKEET_MODEL_SHA256, actual: actualHash)
+    }
+
+    // Atomic rename into place (spec §4.2 items 6-8): the verified temp file
+    // is only ever exposed under the production filename once fully
+    // verified. `replacingItemAt` performs an atomic swap on the same
+    // volume.
+    _ = try FileManager.default.replaceItemAt(destination, withItemAt: sameVolumeTempURL)
+    return destination
+}
+
+private func resolvedParakeetSupportDirectory(_ override: URL?) -> URL? {
+    override
+        ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("SuperDictate", isDirectory: true)
+}
+
+func isSafeSpeechModelCacheDirectory(_ cacheDir: URL,
+                                     parakeetSupportDirectory: URL? = nil) -> Bool {
+    let supportDirectory = resolvedParakeetSupportDirectory(parakeetSupportDirectory)
+    guard let supportDirectory else { return false }
+
+    let cacheURL = cacheDir.standardizedFileURL
+    let supportURL = supportDirectory.standardizedFileURL
+    guard cacheURL.isFileURL, supportURL.isFileURL else { return false }
+
+    let cachePath = cacheURL.path
+    let supportPath = supportURL.path
+    let supportPrefix = supportPath.hasSuffix("/") ? supportPath : "\(supportPath)/"
+    guard cachePath.hasPrefix(supportPrefix), cachePath != supportPath else { return false }
+
+    let relativePath = String(cachePath.dropFirst(supportPrefix.count))
+    let components = relativePath.split(separator: "/", omittingEmptySubsequences: false)
+    return !components.isEmpty
+        && !components.contains("")
+        && !components.contains(".")
+        && !components.contains("..")
+}
+
+func isExistingSpeechModelCacheDirectorySafeForRemoval(
+    _ cacheDir: URL,
+    parakeetSupportDirectory: URL? = nil
+) -> Bool {
+    guard isSafeSpeechModelCacheDirectory(cacheDir,
+                                          parakeetSupportDirectory: parakeetSupportDirectory),
+          let supportDirectory = resolvedParakeetSupportDirectory(parakeetSupportDirectory) else {
+        return false
+    }
+
+    let cachePath = cacheDir.standardizedFileURL.path
+    let supportPath = supportDirectory.standardizedFileURL.path
+    let supportPrefix = supportPath.hasSuffix("/") ? supportPath : "\(supportPath)/"
+    let relativePath = String(cachePath.dropFirst(supportPrefix.count))
+    let components = relativePath.split(separator: "/", omittingEmptySubsequences: false)
+
+    guard isExistingPlainDirectory(supportPath) else { return false }
+    var currentPath = supportPath
+    // Walk every component except the last through the plain-directory
+    // check — that confirms the whole parent chain is real directories with
+    // no symlink hops. The cache target itself (last component) may be
+    // either a plain file (the Parakeet `.gguf` model) or a plain directory
+    // (older cache shapes), so it gets a looser leaf check below rather
+    // than being forced through isExistingPlainDirectory.
+    for component in components.dropLast() {
+        currentPath = (currentPath as NSString).appendingPathComponent(String(component))
+        guard isExistingPlainDirectory(currentPath) else { return false }
+    }
+    guard let lastComponent = components.last else { return false }
+    currentPath = (currentPath as NSString).appendingPathComponent(String(lastComponent))
+    guard currentPath == cachePath else { return false }
+    return isExistingPlainDirectory(currentPath) || isExistingPlainFile(currentPath)
+}
+
+func speechModelCacheBaseDirectory() -> URL {
+    resolvedParakeetSupportDirectory(nil) ?? FileManager.default.temporaryDirectory
+}
+
+/// The directory Parakeet model files live under (`~/Library/Application
+/// Support/SuperDictate/Models`), per spec §4.1 — a new location, NOT the
+/// legacy `~/Library/Application Support/Whisper` tree (left untouched, spec
+/// §4.4).
+func parakeetModelCacheDirectory() -> URL {
+    resolvedParakeetSupportDirectory(nil)!
+        .appendingPathComponent("Models", isDirectory: true)
+}
+
+/// The single Parakeet model file Parakey downloads and loads.
+func parakeetModelPath() -> URL {
+    parakeetModelCacheDirectory().appendingPathComponent(PARAKEET_MODEL_FILENAME, isDirectory: false)
+}
+
+func speechModelCacheDirectory(for _: SpeechModelProfile) -> URL {
+    parakeetModelPath()
+}
+
+/// Legacy Whisper model cache file this migration leaves behind (spec §4.4).
+/// Never used for Parakeet operation. Optionally removed by
+/// `removeLegacyWhisperModelFileIfPresent()` below, ONLY after Parakeet has
+/// itself successfully downloaded, verified, loaded, and warmed up — and
+/// ONLY this exact known file, never the whole `~/Library/Application
+/// Support/Whisper` directory.
+private func legacyWhisperModelFilePath() -> URL? {
+    FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
+        .appendingPathComponent("Whisper", isDirectory: true)
+        .appendingPathComponent("Models", isDirectory: true)
+        .appendingPathComponent("ggml-large-v3-turbo.bin", isDirectory: false)
+}
+
+/// Best-effort cleanup of the exact legacy Whisper model file. Never throws;
+/// failure to remove it must not prevent application startup (spec §4.4).
+/// Call only after a successful Parakeet warm-up.
+func removeLegacyWhisperModelFileIfPresent() {
+    guard let legacyPath = legacyWhisperModelFilePath() else { return }
+    guard isPlainRegularFile(legacyPath.path) else { return }
+    try? FileManager.default.removeItem(at: legacyPath)
+}
+
+func speechModelDownloadRequiredBytes(for profile: SpeechModelProfile,
+                                      headroomBytes: Int64 = MODEL_DOWNLOAD_HEADROOM_BYTES) -> Int64 {
+    profile.estimatedDownloadBytes + headroomBytes
+}
+
+func speechModelDiskSpaceFailureDetail(profile: SpeechModelProfile,
+                                       availableBytes: Int64?,
+                                       requiredBytes: Int64) -> String? {
+    guard let availableBytes, availableBytes >= 0, availableBytes < requiredBytes else {
+        return nil
+    }
+    return """
+    Parakey needs \(profile.downloadSizeText) of free disk space to download \(profile.shortName), plus room for parakeet.cpp to prepare it.
+
+    Available: \(formattedByteCount(UInt64(availableBytes)))
+    Needed: \(formattedByteCount(UInt64(requiredBytes)))
+
+    Free some disk space, then retry loading the speech model. Audio is not uploaded.
+    """
+}
+
+func availableImportantDiskSpaceBytes(containing url: URL) -> Int64? {
+    let fm = FileManager.default
+    var probe = url.standardizedFileURL
+    while !fm.fileExists(atPath: probe.path), probe.path != "/" {
+        probe.deleteLastPathComponent()
+    }
+    guard let values = try? probe.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
+          let capacity = values.volumeAvailableCapacityForImportantUsage else {
+        return nil
+    }
+    return Int64(capacity)
+}
+
+func speechModelCacheExists(for profile: SpeechModelProfile) -> Bool {
+    FileManager.default.fileExists(atPath: speechModelCacheDirectory(for: profile).path)
+}
+
+func assertSufficientDiskSpaceForSpeechModelDownload(profile: SpeechModelProfile) throws {
+    let requiredBytes = speechModelDownloadRequiredBytes(for: profile)
+    let availableBytes = availableImportantDiskSpaceBytes(containing: speechModelCacheBaseDirectory())
+    guard let detail = speechModelDiskSpaceFailureDetail(profile: profile,
+                                                        availableBytes: availableBytes,
+                                                        requiredBytes: requiredBytes) else {
+        return
+    }
+    throw NSError(domain: "Parakey",
+                  code: -8,
+                  userInfo: [NSLocalizedDescriptionKey: detail])
+}
+
+func removeSpeechModelCacheDirectory(_ cacheDir: URL) async throws -> Bool {
+    guard isSafeSpeechModelCacheDirectory(cacheDir) else {
+        throw NSError(
+            domain: "Parakey",
+            code: -3,
+            userInfo: [
+                NSLocalizedDescriptionKey: "Refusing to remove unexpected speech model cache path: \(cacheDir.path)"
+            ]
+        )
+    }
+
+    return try await Task.detached(priority: .userInitiated) {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: cacheDir.path) else {
+            return false
+        }
+        guard isExistingSpeechModelCacheDirectorySafeForRemoval(cacheDir) else {
+            throw NSError(
+                domain: "Parakey",
+                code: -4,
+                userInfo: [
+                    NSLocalizedDescriptionKey: "Refusing to remove unsafe speech model cache path: \(cacheDir.path)"
+                ]
+            )
+        }
+        try fm.removeItem(at: cacheDir)
+        return true
+    }.value
+}
+
+private func isExistingPlainDirectory(_ path: String) -> Bool {
+    var st = stat()
+    guard lstat(path, &st) == 0 else { return false }
+    return (st.st_mode & S_IFMT) == S_IFDIR
+}
+
+private func isExistingPlainFile(_ path: String) -> Bool {
+    var st = stat()
+    guard lstat(path, &st) == 0 else { return false }
+    return (st.st_mode & S_IFMT) == S_IFREG
+}
+
+func normalizedTranscriptCorrectionSource(_ source: String) -> String {
+    source
+        .split(whereSeparator: { $0.isWhitespace })
+        .joined(separator: " ")
+        .lowercased()
+}
+
+func normalizedTranscriptCorrections(_ corrections: [TranscriptCorrection]) -> [TranscriptCorrection] {
+    var result: [TranscriptCorrection] = []
+    var indexBySource: [String: Int] = [:]
+
+    for correction in corrections {
+        let source = correction.source.trimmingCharacters(in: .whitespacesAndNewlines)
+        let replacement = correction.replacement.trimmingCharacters(in: .whitespacesAndNewlines)
+        let key = normalizedTranscriptCorrectionSource(source)
+        guard !source.isEmpty,
+              !replacement.isEmpty,
+              !key.isEmpty,
+              source.utf8.count <= MAX_TRANSCRIPT_CORRECTION_SOURCE_BYTES,
+              replacement.utf8.count <= MAX_TRANSCRIPT_CORRECTION_REPLACEMENT_BYTES,
+              !source.unicodeScalars.contains(where: { $0.value == 0 }),
+              !replacement.unicodeScalars.contains(where: { $0.value == 0 }) else {
+            continue
+        }
+
+        let cleaned = TranscriptCorrection(source: source, replacement: replacement)
+        if let existing = indexBySource[key] {
+            result[existing] = cleaned
+        } else {
+            guard result.count < MAX_TRANSCRIPT_CORRECTIONS else { continue }
+            indexBySource[key] = result.count
+            result.append(cleaned)
+        }
+    }
+
+    return result
+}
+
+/// First line of the import-confirmation dialog. When the file holds
+/// more entries than survive normalization (over the
+/// MAX_TRANSCRIPT_CORRECTIONS cap, or invalid/duplicate entries), the
+/// dialog must state the file's real count and how many will actually
+/// be kept — normalization runs before the dialog, so without this the
+/// user is told an oversized file "contains 512 corrections".
+func correctionImportCountText(sourceName: String, originalCount: Int, keptCount: Int) -> String {
+    guard originalCount > keptCount else {
+        return "\(sourceName) contains \(keptCount) corrections."
+    }
+    return "\(sourceName) contains \(originalCount) entries; only the first \(keptCount) valid corrections (Parakey keeps at most \(MAX_TRANSCRIPT_CORRECTIONS)) will be imported."
+}
+
+/// Appended to the import dialog when choosing Merge would push the
+/// combined set over the correction cap. The merge path drops over-cap
+/// entries silently, so the dialog has to warn before the user picks.
+func correctionImportMergeCapWarningText(existingCount: Int,
+                                         newCount: Int,
+                                         cap: Int = MAX_TRANSCRIPT_CORRECTIONS) -> String? {
+    let mergedCount = existingCount + newCount
+    guard mergedCount > cap else { return nil }
+    return "Merging would produce \(mergedCount) corrections; Parakey keeps at most \(cap), so \(mergedCount - cap) would be dropped."
+}
+
+private func utf8ClippedPrefix(_ text: String, maxBytes: Int) -> String {
+    guard maxBytes > 0 else { return "" }
+    var result = ""
+    var usedBytes = 0
+    for character in text {
+        let byteCount = String(character).utf8.count
+        guard usedBytes + byteCount <= maxBytes else { break }
+        result.append(character)
+        usedBytes += byteCount
+    }
+    return result
+}
+
+func correctionSourcePrefill(from transcript: String) -> String {
+    let flat = transcript
+        .split(whereSeparator: { $0.isWhitespace })
+        .joined(separator: " ")
+    return utf8ClippedPrefix(flat, maxBytes: MAX_TRANSCRIPT_CORRECTION_SOURCE_BYTES)
+}
+
+func normalizedAudioLevel(from samples: [Float]) -> Float {
+    var sumSquares: Double = 0
+    var count = 0
+
+    for sample in samples where sample.isFinite {
+        let clamped = max(-1, min(1, sample))
+        sumSquares += Double(clamped * clamped)
+        count += 1
+    }
+
+    return normalizedAudioLevel(sumSquares: sumSquares, sampleCount: count)
+}
+
+func normalizedAudioLevel(sumSquares: Double, sampleCount: Int) -> Float {
+    guard sampleCount > 0, sumSquares > 0 else { return 0 }
+    let rms = sqrt(sumSquares / Double(sampleCount))
+    guard rms.isFinite, rms > 0 else { return 0 }
+
+    // This is a voice-visibility meter, not a calibrated VU meter.
+    // Keep low room tone calm, then aggressively lift speech-range RMS
+    // so normal close-mic speech visibly opens the HUD without shouting.
+    let decibels = 20 * log10(rms)
+    let gated = (decibels + 52) / 20
+    guard gated > 0.06 else { return 0 }
+    let lifted = pow(max(0, min(1, gated)), 0.42)
+    return Float(max(0, min(1, lifted)))
+}
+
+func visibleRecordingLevel(rawLevel: Float) -> Float {
+    guard rawLevel.isFinite else { return 0 }
+    return max(0, min(1, rawLevel))
+}
+
+func recordingHUDPhaseSpeed(mode: RecordingHUDMode, level: Float) -> CGFloat {
+    switch mode {
+    case .recording:
+        let voiceLevel = CGFloat(visibleRecordingLevel(rawLevel: level))
+        return RECORDING_HUD_RECORDING_BASE_PHASE_SPEED
+            + (voiceLevel * RECORDING_HUD_RECORDING_LEVEL_PHASE_SPEED)
+    case .transcribing:
+        return RECORDING_HUD_TRANSCRIBING_PHASE_SPEED
+    case .error:
+        return 0
+    }
+}
+
+struct TranscriptCorrectionSyncMergeResult: Equatable {
+    let corrections: [TranscriptCorrection]
+    let conflictingSources: [String]
+}
+
+struct CorrectionSyncFileFingerprint: Equatable {
+    let modifiedAt: Date?
+    let size: Int?
+    let sha256: String
+}
+
+func correctionSyncFingerprint(for url: URL) -> CorrectionSyncFileFingerprint? {
+    do {
+        let digest = try correctionSyncFileSHA256Hex(url)
+        let values = try url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+        return CorrectionSyncFileFingerprint(modifiedAt: values.contentModificationDate,
+                                             size: values.fileSize,
+                                             sha256: digest)
+    } catch {
+        return nil
+    }
+}
+
+/// Fingerprint for bytes this process just wrote to `url`. Content
+/// hash and size come from the in-memory data — never from re-reading
+/// the file, which races with a sync provider replacing it in the
+/// write-to-fingerprint window and would swallow that remote change
+/// until the next local edit. Only the modification date is read
+/// back; if even that races, the SHA mismatch on the next scan still
+/// detects the remote change.
+func correctionSyncFingerprint(forWrittenData data: Data, at url: URL) -> CorrectionSyncFileFingerprint {
+    var hasher = SHA256()
+    hasher.update(data: data)
+    let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    let modifiedAt = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
+        .contentModificationDate
+    return CorrectionSyncFileFingerprint(modifiedAt: modifiedAt,
+                                         size: data.count,
+                                         sha256: digest)
+}
+
+private func correctionSyncFileSHA256Hex(_ url: URL) throws -> String {
+    let fd = Darwin.open(url.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+    guard fd >= 0 else {
+        throw currentPOSIXError()
+    }
+    defer { _ = Darwin.close(fd) }
+
+    var st = stat()
+    guard Darwin.fstat(fd, &st) == 0 else {
+        throw currentPOSIXError()
+    }
+    guard (st.st_mode & S_IFMT) == S_IFREG else {
+        throw TranscriptCorrectionsTransferError.notRegularFile
+    }
+    guard st.st_size <= TranscriptCorrectionsTransfer.maxFileBytes else {
+        throw TranscriptCorrectionsTransferError.fileTooLarge(Int(st.st_size),
+                                                              TranscriptCorrectionsTransfer.maxFileBytes)
+    }
+
+    let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
+    var hasher = SHA256()
+    while true {
+        guard let chunk = try handle.read(upToCount: 1024 * 1024), !chunk.isEmpty else {
+            break
+        }
+        hasher.update(data: chunk)
+    }
+    return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+}
+
+func mergedTranscriptCorrectionsForSync(base: [TranscriptCorrection],
+                                        local: [TranscriptCorrection],
+                                        remote: [TranscriptCorrection]) -> TranscriptCorrectionSyncMergeResult {
+    let base = normalizedTranscriptCorrections(base)
+    let local = normalizedTranscriptCorrections(local)
+    let remote = normalizedTranscriptCorrections(remote)
+
+    func dictionaryBySource(_ corrections: [TranscriptCorrection]) -> [String: TranscriptCorrection] {
+        Dictionary(uniqueKeysWithValues: corrections.map {
+            (normalizedTranscriptCorrectionSource($0.source), $0)
+        })
+    }
+
+    let baseBySource = dictionaryBySource(base)
+    let localBySource = dictionaryBySource(local)
+    let remoteBySource = dictionaryBySource(remote)
+
+    var orderedSources: [String] = []
+    var seenSources: Set<String> = []
+    func appendSources(from corrections: [TranscriptCorrection]) {
+        for correction in corrections {
+            let key = normalizedTranscriptCorrectionSource(correction.source)
+            if seenSources.insert(key).inserted {
+                orderedSources.append(key)
+            }
+        }
+    }
+
+    appendSources(from: local)
+    appendSources(from: remote)
+    appendSources(from: base)
+
+    var merged: [TranscriptCorrection] = []
+    var conflicts: [String] = []
+
+    for source in orderedSources {
+        let baseline = baseBySource[source]
+        let localCorrection = localBySource[source]
+        let remoteCorrection = remoteBySource[source]
+
+        let chosen: TranscriptCorrection?
+        if localCorrection == remoteCorrection {
+            chosen = localCorrection
+        } else if localCorrection == baseline {
+            chosen = remoteCorrection
+        } else if remoteCorrection == baseline {
+            chosen = localCorrection
+        } else {
+            conflicts.append(localCorrection?.source ?? remoteCorrection?.source ?? baseline?.source ?? source)
+            continue
+        }
+
+        if let chosen {
+            merged.append(chosen)
+        }
+    }
+
+    return TranscriptCorrectionSyncMergeResult(corrections: merged,
+                                               conflictingSources: conflicts)
+}
+
