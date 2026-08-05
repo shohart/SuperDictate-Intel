@@ -70,7 +70,7 @@ private struct CapturedRecording {
     let flattenSeconds: TimeInterval
 }
 
-private enum PendingDictationRecovery {
+enum PendingDictationRecovery {
     private static let directoryName = "PendingDictations"
     private static let lostDirectoryName = "LostDictations"
     private static let fileExtension = "sdaudio"
@@ -223,7 +223,7 @@ private enum PendingDictationRecovery {
     }
 }
 
-private final class PendingDictationJournal: @unchecked Sendable {
+final class PendingDictationJournal: @unchecked Sendable {
     let url: URL
     private let queue = DispatchQueue(label: "SuperDictate.PendingDictationJournal",
                                       qos: .utility)
@@ -277,7 +277,7 @@ private final class PendingDictationJournal: @unchecked Sendable {
     }
 }
 
-private struct AudioSampleAccumulator {
+struct AudioSampleAccumulator {
     private var segments: [[Float]] = []
     private(set) var sampleCount = 0
 
@@ -806,7 +806,7 @@ final class AudioCapture: @unchecked Sendable {
     }
 }
 
-private final class AudioConverterInputProvider: @unchecked Sendable {
+final class AudioConverterInputProvider: @unchecked Sendable {
     private let buffer: AVAudioPCMBuffer
     private let lock = NSLock()
     private var didProvideBuffer = false

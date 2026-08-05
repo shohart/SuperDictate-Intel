@@ -214,20 +214,20 @@ func systemAudioUnmuteRequestDecision(phase: SystemAudioMutePhase) -> SystemAudi
     }
 }
 
-private func systemAudioMuteMarkerURL() -> URL {
+func systemAudioMuteMarkerURL() -> URL {
     FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         .appendingPathComponent(APP_SUPPORT_DIR_NAME, isDirectory: true)
         .appendingPathComponent("system-audio-muted", isDirectory: false)
 }
 
-private func systemAudioMuteMarkerText(pid: pid_t = getpid(), date: Date = Date()) -> String {
+func systemAudioMuteMarkerText(pid: pid_t = getpid(), date: Date = Date()) -> String {
     """
     pid=\(pid)
     created=\(ISO8601DateFormatter().string(from: date))
     """
 }
 
-private func systemAudioMuteMarkerProcessID(from text: String) -> pid_t? {
+func systemAudioMuteMarkerProcessID(from text: String) -> pid_t? {
     for line in text.split(separator: "\n") {
         guard line.hasPrefix("pid="),
               let raw = Int32(line.dropFirst(4)),
@@ -237,7 +237,7 @@ private func systemAudioMuteMarkerProcessID(from text: String) -> pid_t? {
     return nil
 }
 
-private func writeSystemAudioMuteMarker(to url: URL = systemAudioMuteMarkerURL(),
+func writeSystemAudioMuteMarker(to url: URL = systemAudioMuteMarkerURL(),
                                         text: String = systemAudioMuteMarkerText()) throws {
     let fm = FileManager.default
     let directory = url.deletingLastPathComponent()
@@ -261,11 +261,11 @@ private func writeSystemAudioMuteMarker(to url: URL = systemAudioMuteMarkerURL()
     _ = Darwin.fchmod(fd, 0o600)
 }
 
-private func removeSystemAudioMuteMarker(at url: URL = systemAudioMuteMarkerURL()) {
+func removeSystemAudioMuteMarker(at url: URL = systemAudioMuteMarkerURL()) {
     try? FileManager.default.removeItem(at: url)
 }
 
-private func systemAudioMuteWatchdogScript() -> String {
+func systemAudioMuteWatchdogScript() -> String {
     #"""
     PID="$1"
     MARKER="$2"

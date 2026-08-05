@@ -23,7 +23,7 @@ private enum RecordingReleaseAction: Equatable {
     case transcribe(duration: Double)
 }
 
-private func recordingReleaseAction(capturedSampleCount: Int,
+func recordingReleaseAction(capturedSampleCount: Int,
                                     sampleRate: Double = SAMPLE_RATE,
                                     minimumClipSeconds: Double = MIN_CLIP_SECONDS) -> RecordingReleaseAction {
     let duration = sampleRate > 0 ? Double(max(0, capturedSampleCount)) / sampleRate : 0
@@ -32,13 +32,13 @@ private func recordingReleaseAction(capturedSampleCount: Int,
         : .transcribe(duration: duration)
 }
 
-private struct DictationTextProcessingResult: Equatable {
+struct DictationTextProcessingResult: Equatable {
     let text: String
     let appliedCorrectionCount: Int
     let removedFillerWordCount: Int
 }
 
-private func processedDictationText(rawTranscript: String,
+func processedDictationText(rawTranscript: String,
                                     corrections: [TranscriptCorrection],
                                     removeFillerWords: Bool,
                                     normalizeNumbersToDigits: Bool = false,

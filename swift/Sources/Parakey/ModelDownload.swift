@@ -351,7 +351,7 @@ func removeSpeechModelCacheDirectory(_ cacheDir: URL) async throws -> Bool {
     }.value
 }
 
-private func isExistingPlainDirectory(_ path: String) -> Bool {
+func isExistingPlainDirectory(_ path: String) -> Bool {
     var st = stat()
     guard lstat(path, &st) == 0 else { return false }
     return (st.st_mode & S_IFMT) == S_IFDIR

@@ -371,7 +371,7 @@ func insertionTargetQueryContext(overriding context: InsertionTargetQueryContext
     )
 }
 
-private enum FocusedInsertionTargetLocator {
+enum FocusedInsertionTargetLocator {
     private static let editableAttributeName = "AXEditable"
     private static let frameAttributeName = "AXFrame"
     private static let selectedTextMarkerRangeAttributeName = "AXSelectedTextMarkerRange"
@@ -955,13 +955,13 @@ func unicodeInsertionChunks(for text: String, maxUTF16UnitsPerEvent maxUnits: In
     return chunks
 }
 
-private struct KeyboardEventStep: Equatable {
+struct KeyboardEventStep: Equatable {
     let virtualKey: CGKeyCode
     let keyDown: Bool
     let flags: CGEventFlags
 }
 
-private func clipboardPasteKeyboardEventSteps(commandKey: CGKeyCode,
+func clipboardPasteKeyboardEventSteps(commandKey: CGKeyCode,
                                               pasteKey: CGKeyCode) -> [KeyboardEventStep] {
     [
         KeyboardEventStep(virtualKey: commandKey, keyDown: true, flags: .maskCommand),
@@ -991,7 +991,7 @@ private func postKeyboardEventSteps(_ steps: [KeyboardEventStep]) -> Bool {
 }
 
 @MainActor
-private enum KeyboardShortcutPoster {
+enum KeyboardShortcutPoster {
     @discardableResult
     static func postReturn() -> Bool {
         postKeyboardEventSteps([
@@ -1047,7 +1047,7 @@ enum TextInserter {
 extension NSPasteboard: @unchecked Sendable {}
 
 @MainActor
-private enum ClipboardPasteInserter {
+enum ClipboardPasteInserter {
     private static let virtualKeyCommand: CGKeyCode = 0x37  // left Command
     private static let virtualKeyV: CGKeyCode = 0x09  // ANSI 'v'
     private static let confirmationPollInterval: TimeInterval = 0.05
@@ -1153,7 +1153,7 @@ private enum ClipboardPasteInserter {
 }
 
 @MainActor
-private struct PasteboardSnapshot {
+struct PasteboardSnapshot {
     private struct Item {
         let values: [(type: NSPasteboard.PasteboardType, data: Data)]
     }
@@ -1186,7 +1186,7 @@ private struct PasteboardSnapshot {
 }
 
 @MainActor
-private enum DirectUnicodeInserter {
+enum DirectUnicodeInserter {
     private static let maxUTF16UnitsPerEvent = 20
 
     static func insert(_ text: String) -> Bool {

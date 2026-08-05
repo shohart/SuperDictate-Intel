@@ -429,11 +429,11 @@ private func trustedProcessEnvironment(path: String,
     return env
 }
 
-private func systemToolProcessEnvironment(current: [String: String] = ProcessInfo.processInfo.environment) -> [String: String] {
+func systemToolProcessEnvironment(current: [String: String] = ProcessInfo.processInfo.environment) -> [String: String] {
     trustedProcessEnvironment(path: "/usr/bin:/bin:/usr/sbin:/sbin", current: current)
 }
 
-private func updateProcessEnvironment(current: [String: String] = ProcessInfo.processInfo.environment) -> [String: String] {
+func updateProcessEnvironment(current: [String: String] = ProcessInfo.processInfo.environment) -> [String: String] {
     trustedProcessEnvironment(path: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
                               current: current)
 }
@@ -742,7 +742,7 @@ func superDictateDirectUpdateHelperScript(pid: pid_t,
     """#
 }
 
-private func writePrivateUpdateHelperScript(_ script: String,
+func writePrivateUpdateHelperScript(_ script: String,
                                             directory: String = NSTemporaryDirectory(),
                                             fileName: String? = nil) throws -> String {
     guard !directory.isEmpty else { throw posixError(EINVAL) }
@@ -780,12 +780,12 @@ private func writePrivateUpdateHelperScript(_ script: String,
     }
 }
 
-private struct PrivateOutputFile {
+struct PrivateOutputFile {
     let path: String
     let handle: FileHandle
 }
 
-private func openPrivateUpdateHelperLog(preferredPath: String = UPDATE_HELPER_LOG_PATH,
+func openPrivateUpdateHelperLog(preferredPath: String = UPDATE_HELPER_LOG_PATH,
                                         fallbackDirectory: String = NSTemporaryDirectory()) throws -> PrivateOutputFile {
     do {
         let fd = try openPrivateOutputFileDescriptor(atPath: preferredPath,
@@ -804,7 +804,7 @@ private func openPrivateUpdateHelperLog(preferredPath: String = UPDATE_HELPER_LO
     }
 }
 
-private func createPrivateUpdateProgressStateFile(directory: String = NSTemporaryDirectory()) throws -> String {
+func createPrivateUpdateProgressStateFile(directory: String = NSTemporaryDirectory()) throws -> String {
     let path = (directory as NSString)
         .appendingPathComponent("\(UPDATE_PROGRESS_APP_PREFIX)\(UUID().uuidString).state")
     let fd = try openPrivateOutputFileDescriptor(atPath: path,
@@ -821,7 +821,7 @@ private func createPrivateUpdateProgressStateFile(directory: String = NSTemporar
     }
 }
 
-private func writePrivateUpdateProgressState(phase: String,
+func writePrivateUpdateProgressState(phase: String,
                                              message: String,
                                              to path: String) throws {
     let safePhase = phase.replacingOccurrences(of: "\t", with: " ")

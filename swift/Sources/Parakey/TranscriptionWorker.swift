@@ -72,7 +72,7 @@ private struct TokenTranscriptionWorkerResult: Sendable {
     let engineProcessingSeconds: Double
 }
 
-private struct CompletedTranscriptionWorkerResult: Sendable {
+struct CompletedTranscriptionWorkerResult: Sendable {
     let transcription: TranscriptionWorkerResult
     let completedAt: TimeInterval
 }
@@ -480,7 +480,7 @@ actor TranscriptionWorker {
 /// For a recording short enough to produce exactly one segment (the
 /// overwhelming majority of dictations), this is one ASR call, identical
 /// to today's behavior.
-fileprivate func transcribeSegmented(
+func transcribeSegmented(
     samples: [Float],
     worker: TranscriptionWorker,
     language: DictationLanguage?,
