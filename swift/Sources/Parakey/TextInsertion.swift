@@ -1044,7 +1044,7 @@ enum TextInserter {
 // holds the reference, never touches it — so this conformance describes
 // how this file uses NSPasteboard, not a claim that NSPasteboard is safe
 // for arbitrary concurrent access in general.
-extension NSPasteboard: @unchecked Sendable {}
+extension NSPasteboard: @retroactive @unchecked Sendable {}
 
 @MainActor
 enum ClipboardPasteInserter {
@@ -1102,7 +1102,7 @@ enum ClipboardPasteInserter {
     // hand-copied implementation. Not private (fileprivate, i.e. visible
     // anywhere in this file) for exactly that reason — ParakeySelfTest lives
     // in this same file and calls this real function directly.
-    fileprivate static func restorePasteboard(_ snapshot: PasteboardSnapshot,
+    static func restorePasteboard(_ snapshot: PasteboardSnapshot,
                                               ifStillTemporaryText text: String,
                                               changeCount: Int,
                                               pasteboard: NSPasteboard,

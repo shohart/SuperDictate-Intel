@@ -47,7 +47,7 @@ import UniformTypeIdentifiers
 // the observer and that clears `onConfigurationChange` at
 // termination.
 
-private struct CapturedAudioSegments {
+struct CapturedAudioSegments {
     let segments: [[Float]]
     let sampleCount: Int
 
@@ -62,7 +62,7 @@ private struct CapturedAudioSegments {
     }
 }
 
-private struct CapturedRecording {
+struct CapturedRecording {
     let samples: [Float]
     let recoveryURL: URL?
     let detachSeconds: TimeInterval
@@ -371,7 +371,7 @@ final class AudioCapture: @unchecked Sendable {
         return engineStarted
     }
 
-    fileprivate func startEngine(inputDevicePreference: String = "",
+    func startEngine(inputDevicePreference: String = "",
                                  recordingImmediately: Bool = false,
                                  recoveryJournal: PendingDictationJournal? = nil) throws {
         if isEngineStarted {
@@ -414,7 +414,7 @@ final class AudioCapture: @unchecked Sendable {
         log("AudioCapture: engine started")
     }
 
-    fileprivate func startRecording(inputDevicePreference: String = "",
+    func startRecording(inputDevicePreference: String = "",
                                     recoveryJournal: PendingDictationJournal? = nil) throws {
         if isEngineStarted {
             beginRecording(recoveryJournal: recoveryJournal)
@@ -429,7 +429,7 @@ final class AudioCapture: @unchecked Sendable {
     /// device changes sample rate or channel layout. Rebuild the tap and
     /// converter on the existing engine so its explicitly selected HAL
     /// device remains attached and an active recording can continue.
-    fileprivate func recoverAfterConfigurationChange() throws -> Bool {
+    func recoverAfterConfigurationChange() throws -> Bool {
         guard isEngineStarted else { return false }
 
         let input = engine.inputNode
@@ -497,7 +497,7 @@ final class AudioCapture: @unchecked Sendable {
         engine = AVAudioEngine()
     }
 
-    fileprivate func beginRecording(recoveryJournal: PendingDictationJournal? = nil) {
+    func beginRecording(recoveryJournal: PendingDictationJournal? = nil) {
         lock.lock()
         let previousJournal = self.recoveryJournal
         recordingGeneration &+= 1
@@ -536,7 +536,7 @@ final class AudioCapture: @unchecked Sendable {
     }
 
     /// Stops recording, flushes its crash-recovery journal, and returns the captured samples.
-    fileprivate func endRecording() -> CapturedRecording {
+    func endRecording() -> CapturedRecording {
         let startedAt = ProcessInfo.processInfo.systemUptime
         lock.lock()
         _isRunning = false

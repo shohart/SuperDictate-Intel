@@ -105,6 +105,7 @@ let package = Package(
                 // for brew-upgrade resilience.
                 .unsafeFlags([
                     "-mavx2", "-mfma", "-mf16c", "-mbmi2", "-msse4.2",
+                    "-Wno-ambiguous-macro",
                     "-I/usr/local/opt/vulkan-headers/include",
                 ]),
             ],
@@ -139,6 +140,7 @@ let package = Package(
                 .headerSearchPath("upstream-vad/include"),
                 .unsafeFlags([
                     "-mavx2", "-mfma", "-mf16c", "-mbmi2", "-msse4.2",
+                    "-Wno-ambiguous-macro",
                     "-I/usr/local/opt/vulkan-headers/include",
                 ]),
             ],

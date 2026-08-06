@@ -7701,7 +7701,4 @@ enum ParakeySelfTest {
     }
 }
 
-if let status = ParakeySelfTest.run(arguments: Array(CommandLine.arguments.dropFirst())) {
-    exit(status)
-}
 #endif

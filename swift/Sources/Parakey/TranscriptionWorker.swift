@@ -37,7 +37,7 @@ import UniformTypeIdentifiers
 // `.whisperLargeV3Turbo(WhisperEngine)` single-case enum this replaces) is
 // gone entirely rather than gaining a second case.
 
-private struct TranscriptionWorkerResult: Sendable {
+struct TranscriptionWorkerResult: Sendable {
     let text: String
     let workerQueueSeconds: Double
     let decoderPreparationSeconds: Double
@@ -65,7 +65,7 @@ private struct TranscriptionWorkerResult: Sendable {
 /// (`TranscriptionWorker.transcribeWithTokens`). Carries no
 /// `hadSegmentFailure`: the overlap path never produces one (it throws and
 /// defers to the plain path instead — see `assembleOverlapTranscript`).
-private struct TokenTranscriptionWorkerResult: Sendable {
+struct TokenTranscriptionWorkerResult: Sendable {
     let transcription: TokenTranscription
     let workerQueueSeconds: Double
     let engineCallSeconds: Double
@@ -264,7 +264,7 @@ actor TranscriptionWorker {
         log("ASR model: Parakeet TDT 0.6B v3 \(PARAKEET_MODEL_QUANTIZATION)")
         log("ASR runtime: parakeet.cpp \(parakeetRuntimeVersion())")
         log("ASR device requested: \(requestedGPU ? "Vulkan" : "CPU")")
-        let loadedDeviceIsVulkan = await loaded.engine.device == .vulkan
+        let loadedDeviceIsVulkan = loaded.engine.device == .vulkan
         log("ASR device selected: \(loadedDeviceIsVulkan ? "Vulkan" : "CPU")\(loaded.status == .cpuFallbackAfterVulkanError ? " (fallback after Vulkan error)" : "")")
         // Best-effort legacy cleanup, only after Parakeet has itself
         // succeeded (spec §4.3/§4.4) — never blocks readiness on failure.
@@ -327,7 +327,7 @@ actor TranscriptionWorker {
         attemptedVulkan ? .cpuFallbackAfterVulkanError : .cpu
     }
 
-    fileprivate func transcribe(samples: [Float],
+    func transcribe(samples: [Float],
                                language: DictationLanguage? = nil,
                                resolveViaKeyboard: Bool = true,
                                requestedAt: TimeInterval) async throws -> TranscriptionWorkerResult {
@@ -359,7 +359,7 @@ actor TranscriptionWorker {
         }
 
         let engineCallStartedAt = ProcessInfo.processInfo.systemUptime
-        let isVulkanEngine = await engine.device == .vulkan
+        let isVulkanEngine = engine.device == .vulkan
         let result: ParakeetTranscriptionResult
         do {
             result = try await engine.transcribe(samples: samples)
@@ -422,7 +422,7 @@ actor TranscriptionWorker {
     /// fallback exactly as it does today. One fallback implementation, one
     /// site mutating `vulkanFailedThisSession`/`runtimeStatus`/`engine`.
     /// See task-9-report.md for the full reasoning.
-    fileprivate func transcribeWithTokens(samples: [Float],
+    func transcribeWithTokens(samples: [Float],
                                           requestedAt: TimeInterval) async throws -> TokenTranscriptionWorkerResult {
         let workerEnteredAt = ProcessInfo.processInfo.systemUptime
         guard let engine else { throw NSError(domain: "Parakey", code: -2) }
@@ -578,7 +578,7 @@ func transcribeSegmented(
 /// (a pure function — see KeyboardLanguage.swift — whose result that path
 /// also discards, since parakeet.cpp's PCM entry point accepts no forced
 /// language), so omitting it here changes nothing observable.
-fileprivate func transcribeWithOverlapWindows(
+func transcribeWithOverlapWindows(
     samples: [Float],
     segments: [AudioSegment],
     worker: TranscriptionWorker,

@@ -18,7 +18,7 @@ import UniformTypeIdentifiers
 
 // MARK: - Recording lifecycle decisions
 
-private enum RecordingReleaseAction: Equatable {
+enum RecordingReleaseAction: Equatable {
     case discardTooShort(duration: Double)
     case transcribe(duration: Double)
 }
