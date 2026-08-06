@@ -6,6 +6,15 @@ chronological order. This file covers the release history published on
 
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## v0.5.1 — 2026-08-07
+
+Internal refactor: the monolithic `main.swift` was split into
+per-topic source files (constants/config/metrics/models, logger,
+settings, permissions, hotkeys, audio capture, transcription worker,
+text insertion, HUD, app entry, self-test, control panel, diagnostics).
+No behaviour changes — the refactor preserves the 0.5.0 feature set, and
+the clean release build now compiles with zero warnings on this Intel Mac.
+
 ## v0.5.0 — 2026-08-02
 
 **SuperDictate Next** — the first release under the new project name
