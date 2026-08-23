@@ -488,14 +488,22 @@ final class RecordingHUDView: NSView {
     private func drawCorrectingStars(in capsuleRect: NSRect, accent: NSColor, alpha: CGFloat) {
         guard alpha > 0.001 else { return }
         let visualScale = self.visualScale
-        let starCount = 6
-        let edgePadding: CGFloat = 9.0 * visualScale
+        // Three large, saturated sparkles -- deliberately fewer-and-bigger
+        // than a dense row, so each flash reads as a distinct event.
+        let starCount = 3
+        // Edge inset covers the WORST-CASE glow radius too (baseVertical
+        // * 1.63 flash peak * 1.4 halo ≈ 11.9x visualScale): neither the
+        // ray nor its halo ever touches the capsule edge.
+        let edgePadding: CGFloat = 12.0 * visualScale
         let availableWidth = capsuleRect.width - (2 * edgePadding)
         guard starCount > 1, availableWidth > 0 else { return }
         let spacing = availableWidth / CGFloat(starCount - 1)
         let centerY = capsuleRect.midY
-        let baseVertical: CGFloat = 3.4 * visualScale
-        let baseHorizontal = min(1.9 * visualScale, spacing * 0.42)
+        // Vertical flash is capped well inside the capsule (max ≈ 8.5x
+        // visualScale vs the 19x half-height of the standard capsule):
+        // rays stretch hard but NEVER reach the popup's edges.
+        let baseVertical: CGFloat = 5.2 * visualScale
+        let baseHorizontal = min(2.8 * visualScale, spacing * 0.42)
         for index in 0..<starCount {
             let i = CGFloat(index)
             let x = capsuleRect.minX + edgePadding + (i * spacing)
@@ -507,28 +515,30 @@ final class RecordingHUDView: NSView {
             let slow = sin((phase * 0.97) + (i * 2.399))
             let mid = sin((phase * 1.93) + (i * 4.102))
             let fast = sin((phase * 2.71) + (i * 1.618))
-            let twinkle = max(0, min(1, (slow * 0.5 + mid * 0.3 + fast * 0.2) * 0.5 + 0.5))
-            // The vertical ray is the main twinkle axis: it rests at ~45%
-            // and flashes out to ~135%; the horizontal ray only breathes
-            // gently so the row reads as sparkle points, not diamonds.
-            let vertical = baseVertical * (0.45 + (0.9 * twinkle))
-            let horizontal = baseHorizontal * (0.65 + (0.35 * twinkle))
+            let rawTwinkle = max(0, min(1, (slow * 0.5 + mid * 0.3 + fast * 0.2) * 0.5 + 0.5))
+            // Sharpened flash curve: long quiet rests, punchy bright peaks.
+            let flash = pow(rawTwinkle, 1.5)
+            // The vertical ray is the main twinkle axis and stretches
+            // dramatically (28% rest -> 163% flash); the horizontal ray
+            // breathes much less so the shape keeps its sparkle identity.
+            let vertical = baseVertical * (0.28 + (1.35 * flash))
+            let horizontal = baseHorizontal * (0.55 + (0.45 * flash))
             let center = NSPoint(x: x, y: centerY)
             let star = sparklePath(center: center,
                                    verticalRadius: vertical,
                                    horizontalRadius: horizontal,
-                                   waist: min(horizontal, vertical) * 0.16)
-            // Soft halo pulses with the flash; kept tight (1.35x the ray)
-            // so two neighbouring flashes never visually merge into one
-            // blob -- the row must read as discrete stars.
-            let glowRadius = max(vertical, horizontal) * 1.35
+                                   waist: min(horizontal, vertical) * 0.18)
+            // Tight halo + HIGH-contrast core (55% at rest -> fully opaque
+            // at the flash peak): no washed-out translucency, the accent
+            // color reads saturated.
+            let glowRadius = max(vertical, horizontal) * 1.4
             let glowRect = NSRect(x: center.x - glowRadius,
                                   y: center.y - glowRadius,
                                   width: glowRadius * 2,
                                   height: glowRadius * 2)
-            accent.withAlphaComponent((0.045 + (0.11 * twinkle)) * alpha).setFill()
+            accent.withAlphaComponent((0.06 + (0.14 * flash)) * alpha).setFill()
             NSBezierPath(ovalIn: glowRect).fill()
-            accent.withAlphaComponent((0.38 + (0.57 * twinkle)) * alpha).setFill()
+            accent.withAlphaComponent((0.55 + (0.45 * flash)) * alpha).setFill()
             star.fill()
         }
     }
