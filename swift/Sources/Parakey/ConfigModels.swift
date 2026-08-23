@@ -28,11 +28,12 @@ enum RecordingHUDMode {
     case transcribing
     /// Shown while the LLM correction pass (LLMPostprocessingCoordinator)
     /// is running on already-transcribed text -- a visually distinct
-    /// "improving" animation (orbiting sparkles, see
-    /// RecordingHUDView.drawCorrectingStars) so it doesn't read as a
-    /// continuation of transcription. Only entered when correction mode is
-    /// actually enabled (ParakeyApp.showCorrectingHUD gates the call), so
-    /// nothing changes for users who never turned this feature on.
+    /// "improving" animation (a row of twinkling four-ray night-sky
+    /// sparkles, see RecordingHUDView.drawCorrectingStars) so it doesn't
+    /// read as a continuation of transcription. Only entered when
+    /// correction or rewrite is actually enabled (ParakeyApp.
+    /// showCorrectingHUD gates the call), so nothing changes for users
+    /// who never turned either feature on.
     case correcting
     /// Brief flash shown when a dictation fails (transcription error,
     /// paste failure). Renders a static yellow capsule so the user

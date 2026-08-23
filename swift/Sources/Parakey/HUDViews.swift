@@ -475,56 +475,80 @@ final class RecordingHUDView: NSView {
             path.fill()
         }
     }
-    /// Small 4-point sparkles orbiting the capsule center while LLM
-    /// correction runs -- visually distinct from `drawTranscribingWave`'s
-    /// running bars so the popup doesn't read as "still transcribing" once
-    /// correction takes over. `phase` (already scaled by
-    /// RECORDING_HUD_CORRECTING_PHASE_SPEED via recordingHUDPhaseSpeed) drives
-    /// both the orbit and each sparkle's own twinkle/spin, same convention
-    /// the level-bar and transcribing-wave animations already use.
+    /// A row of night-sky sparkles (4-ray stars with elongated vertical
+    /// rays) while LLM postprocessing runs -- visually distinct from
+    /// `drawTranscribingWave`'s running bars, and replacing the older
+    /// orbiting-stars animation. The sparkles sit on a straight line with
+    /// a CONSTANT inset from the capsule's left/right edges (padding does
+    /// not depend on how wide the HUD happens to be), and each twinkles
+    /// on its own decorrelated rhythm: the vertical ray grows and shrinks
+    /// while brightness follows it (longer ray == brighter flash), like a
+    /// real star's twinkle. Horizontal extent is capped below half the
+    /// inter-star spacing, so neighbours can never touch.
     private func drawCorrectingStars(in capsuleRect: NSRect, accent: NSColor, alpha: CGFloat) {
         guard alpha > 0.001 else { return }
         let visualScale = self.visualScale
-        let starCount = 3
-        let orbitRadius = min(capsuleRect.width, capsuleRect.height) * 0.30
-        let baseStarSize: CGFloat = 3.6 * visualScale
-        let center = NSPoint(x: capsuleRect.midX, y: capsuleRect.midY)
-        let orbitAngle = phase * 0.62
+        let starCount = 6
+        let edgePadding: CGFloat = 9.0 * visualScale
+        let availableWidth = capsuleRect.width - (2 * edgePadding)
+        guard starCount > 1, availableWidth > 0 else { return }
+        let spacing = availableWidth / CGFloat(starCount - 1)
+        let centerY = capsuleRect.midY
+        let baseVertical: CGFloat = 3.4 * visualScale
+        let baseHorizontal = min(1.9 * visualScale, spacing * 0.42)
         for index in 0..<starCount {
             let i = CGFloat(index)
-            let angle = orbitAngle + ((2 * CGFloat.pi / CGFloat(starCount)) * i)
-            let position = NSPoint(x: center.x + (cos(angle) * orbitRadius),
-                                   y: center.y + (sin(angle) * orbitRadius))
-            let twinkle = (sin((phase * 1.35) + (i * 2.3)) + 1) / 2
-            let starSize = baseStarSize * (0.62 + (0.5 * twinkle))
-            let spin = (phase * 1.4) + (i * 0.9)
-            let star = starPath(center: position, outerRadius: starSize, innerRadius: starSize * 0.42, rotation: spin)
-            let glowDiameter = starSize * 3.4
-            let glowRect = NSRect(x: position.x - (glowDiameter / 2),
-                                  y: position.y - (glowDiameter / 2),
-                                  width: glowDiameter,
-                                  height: glowDiameter)
-            accent.withAlphaComponent((0.10 + (0.16 * twinkle)) * alpha).setFill()
+            let x = capsuleRect.minX + edgePadding + (i * spacing)
+            // Three decorrelated sine waves per star (incommensurate
+            // ratios, golden-angle-ish per-star offsets) read as random
+            // twinkling rather than a synchronized pulse -- while staying
+            // fully deterministic in `phase`, same convention as the
+            // level-bar animations.
+            let slow = sin((phase * 0.97) + (i * 2.399))
+            let mid = sin((phase * 1.93) + (i * 4.102))
+            let fast = sin((phase * 2.71) + (i * 1.618))
+            let twinkle = max(0, min(1, (slow * 0.5 + mid * 0.3 + fast * 0.2) * 0.5 + 0.5))
+            // The vertical ray is the main twinkle axis: it rests at ~45%
+            // and flashes out to ~135%; the horizontal ray only breathes
+            // gently so the row reads as sparkle points, not diamonds.
+            let vertical = baseVertical * (0.45 + (0.9 * twinkle))
+            let horizontal = baseHorizontal * (0.65 + (0.35 * twinkle))
+            let center = NSPoint(x: x, y: centerY)
+            let star = sparklePath(center: center,
+                                   verticalRadius: vertical,
+                                   horizontalRadius: horizontal,
+                                   waist: min(horizontal, vertical) * 0.16)
+            // Soft halo pulses with the flash; kept tight (1.35x the ray)
+            // so two neighbouring flashes never visually merge into one
+            // blob -- the row must read as discrete stars.
+            let glowRadius = max(vertical, horizontal) * 1.35
+            let glowRect = NSRect(x: center.x - glowRadius,
+                                  y: center.y - glowRadius,
+                                  width: glowRadius * 2,
+                                  height: glowRadius * 2)
+            accent.withAlphaComponent((0.045 + (0.11 * twinkle)) * alpha).setFill()
             NSBezierPath(ovalIn: glowRect).fill()
-            accent.withAlphaComponent((0.55 + (0.40 * twinkle)) * alpha).setFill()
+            accent.withAlphaComponent((0.38 + (0.57 * twinkle)) * alpha).setFill()
             star.fill()
         }
     }
-    /// A simple concave 4-point star/sparkle polygon, alternating outer and
-    /// inner radius points around `center`, rotated by `rotation` radians.
-    private func starPath(center: NSPoint, outerRadius: CGFloat, innerRadius: CGFloat, rotation: CGFloat) -> NSBezierPath {
+    /// A night-sky sparkle: a 4-point star whose vertical ray is elongated
+    /// relative to the horizontal one, with a thin concave `waist` -- the
+    /// classic four-ray glint shape (as drawn for stars on a night sky),
+    /// not a symmetric four-point polygon.
+    private func sparklePath(center: NSPoint,
+                             verticalRadius: CGFloat,
+                             horizontalRadius: CGFloat,
+                             waist: CGFloat) -> NSBezierPath {
         let path = NSBezierPath()
-        let points = 4
-        for i in 0..<(points * 2) {
-            let radius = i % 2 == 0 ? outerRadius : innerRadius
-            let angle = rotation + (CGFloat(i) * CGFloat.pi / CGFloat(points))
-            let point = NSPoint(x: center.x + (cos(angle) * radius), y: center.y + (sin(angle) * radius))
-            if i == 0 {
-                path.move(to: point)
-            } else {
-                path.line(to: point)
-            }
-        }
+        path.move(to: NSPoint(x: center.x, y: center.y + verticalRadius))
+        path.line(to: NSPoint(x: center.x + waist, y: center.y + waist))
+        path.line(to: NSPoint(x: center.x + horizontalRadius, y: center.y))
+        path.line(to: NSPoint(x: center.x + waist, y: center.y - waist))
+        path.line(to: NSPoint(x: center.x, y: center.y - verticalRadius))
+        path.line(to: NSPoint(x: center.x - waist, y: center.y - waist))
+        path.line(to: NSPoint(x: center.x - horizontalRadius, y: center.y))
+        path.line(to: NSPoint(x: center.x - waist, y: center.y + waist))
         path.close()
         return path
     }
