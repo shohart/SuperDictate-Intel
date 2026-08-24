@@ -156,7 +156,15 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // `if let textInsertionTarget, ...` wiring at the insertion call site.
     private lazy var postInsertionWatcher = PostInsertionEditWatcher(
         store: settings.vocabularyStore,
-        onLearned: { [weak self] record, targetFrame in self?.showVocabularyLearnedToast(record, targetFrame: targetFrame) }
+        onLearned: { [weak self] _, _ in
+            self?.vocabularyLearnedToastController.markSaved()
+        },
+        onPendingCandidate: { [weak self] candidate, targetFrame in
+            self?.showPendingLearnToast(candidate: candidate, targetFrame: targetFrame)
+        },
+        onPendingCleared: { [weak self] in
+            self?.vocabularyLearnedToastController.dismissPending()
+        }
     )
     private let vocabularyLearnedToastController = VocabularyLearnedToastController()
     private var globalMouseDownMonitor: Any?
@@ -6727,8 +6735,19 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    private func showVocabularyLearnedToast(_ record: VocabularyRecord, targetFrame: NSRect?) {
-        vocabularyLearnedToastController.show(record, store: settings.vocabularyStore, targetFrame: targetFrame)
+    /// Shows the pending vocabulary-learn toast. A method (not inline in
+    /// the watcher's lazy initializer) because the onSave/onCancel closures
+    /// reach back into `postInsertionWatcher` itself — referencing the lazy
+    /// property from inside its own initializer is a compile-time circular
+    /// reference, and by call time it is fully initialized.
+    private func showPendingLearnToast(candidate: LearnCandidate, targetFrame: NSRect?) {
+        vocabularyLearnedToastController.showPending(
+            candidate: candidate,
+            targetFrame: targetFrame,
+            autoSaveSeconds: PostInsertionEditWatcher.confirmSeconds,
+            onSave: { [weak self] in self?.postInsertionWatcher.confirmPendingCandidateNow() },
+            onCancel: { [weak self] in self?.postInsertionWatcher.cancelPendingCandidate() }
+        )
     }
 
 }

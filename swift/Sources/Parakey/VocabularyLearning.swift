@@ -224,16 +224,20 @@ final class PostInsertionEditWatcher {
     /// (edit, pause, edit again) keeps resetting the clock instead of
     /// having a half-finished correction learned.
     ///
-    /// Kept short deliberately: the toast's own dismiss window (see
-    /// VocabularyLearnedToastController.autoDismissSeconds, 7s) is where the
-    /// user actually gets time to review/undo a learned correction, so this
-    /// stage only needs to rule out "still mid-correction," not also serve
-    /// as review time.
-    static let confirmSeconds: TimeInterval = 0.5
+    /// Long enough to be a real review window: the pending toast shows the
+    /// candidate with Enter (save now) / Escape (cancel) affordances, so
+    /// this timer IS the auto-save deadline the user sees.
+    static let confirmSeconds: TimeInterval = 4.0
     private static let secureSubroles: Set<String> = ["AXSecureTextField"]
 
     private let store: VocabularyStore
     private let onLearned: (VocabularyRecord, NSRect?) -> Void
+    /// A learn candidate entered its confirm window — the UI shows the
+    /// pending toast (Enter = save now, Esc = cancel, timer = auto-save).
+    private let onPendingCandidate: (LearnCandidate, NSRect?) -> Void
+    /// The pending candidate evaporated without a user decision — the UI
+    /// must take the pending toast down.
+    private let onPendingCleared: () -> Void
 
     private var observer: AXObserver?
     private var observedElement: AXUIElement?
@@ -247,9 +251,35 @@ final class PostInsertionEditWatcher {
     private var pendingCandidate: LearnCandidate?
     private var watchGeneration: Int = 0
 
-    init(store: VocabularyStore, onLearned: @escaping (VocabularyRecord, NSRect?) -> Void) {
+    init(store: VocabularyStore,
+         onLearned: @escaping (VocabularyRecord, NSRect?) -> Void,
+         onPendingCandidate: @escaping (LearnCandidate, NSRect?) -> Void,
+         onPendingCleared: @escaping () -> Void) {
         self.store = store
         self.onLearned = onLearned
+        self.onPendingCandidate = onPendingCandidate
+        self.onPendingCleared = onPendingCleared
+    }
+
+    /// Enter on the pending toast: save the candidate immediately instead
+    /// of waiting out the auto-save timer. No-op when nothing is pending.
+    func confirmPendingCandidateNow() {
+        guard pendingCandidate != nil else { return }
+        confirmTask?.cancel()
+        confirmTask = nil
+        commitPendingCandidate()
+    }
+
+    /// Escape on the pending toast: discard the candidate WITHOUT saving
+    /// and keep watching the field for further edits. No-op when nothing
+    /// is pending.
+    func cancelPendingCandidate() {
+        guard pendingCandidate != nil else { return }
+        confirmTask?.cancel()
+        confirmTask = nil
+        pendingCandidate = nil
+        onPendingCleared()
+        log("PostInsertionEditWatcher: pending candidate cancelled by user (Escape); continuing to watch")
     }
 
     func beginWatching(insertedText: String, target: FocusedTextTarget) {
@@ -321,7 +351,10 @@ final class PostInsertionEditWatcher {
         debounceTask = nil
         confirmTask?.cancel()
         confirmTask = nil
-        pendingCandidate = nil
+        if pendingCandidate != nil {
+            pendingCandidate = nil
+            onPendingCleared()
+        }
         if let observer {
             CFRunLoopRemoveSource(CFRunLoopGetCurrent(), AXObserverGetRunLoopSource(observer), .defaultMode)
         }
@@ -391,7 +424,10 @@ final class PostInsertionEditWatcher {
         // fresh, exactly as if this were the first edit.
         confirmTask?.cancel()
         confirmTask = nil
-        pendingCandidate = nil
+        if pendingCandidate != nil {
+            pendingCandidate = nil
+            onPendingCleared()
+        }
 
         let generation = watchGeneration
         debounceTask?.cancel()
@@ -435,18 +471,27 @@ final class PostInsertionEditWatcher {
         let currentInsertedRegion = currentNSString.substring(with: middleRange)
 
         guard let candidate = LearnCandidateDetector.candidate(insertedText: insertedText, editedText: currentInsertedRegion) else {
-            // No learnable candidate yet (or a spurious no-op notification) —
-            // the anchor region is still valid, so keep watching for a
+            // No learnable candidate anymore: a pending toast for the stale
+            // candidate must come down with it.
+            if pendingCandidate != nil {
+                confirmTask?.cancel()
+                confirmTask = nil
+                pendingCandidate = nil
+                onPendingCleared()
+                log("PostInsertionEditWatcher: evaluateEdit — pending candidate no longer present in the field; cleared")
+            }
+            // The anchor region is still valid, so keep watching for a
             // subsequent edit within the remaining window.
             log("PostInsertionEditWatcher: evaluateEdit — inserted region is now \"\(currentInsertedRegion)\" (was \"\(insertedText)\"), no ≤3-word learn candidate; continuing to watch")
             return
         }
-        log("PostInsertionEditWatcher: evaluateEdit — learn candidate found: \"\(candidate.source)\" → \"\(candidate.replacement)\"; starting \(Int(Self.confirmSeconds))s confirm stage before saving")
-        // A candidate was found, but don't commit it yet — the user may
-        // still be mid-correction. Start (or restart) a second, longer
-        // timer; only if it fires uninterrupted (no further edits, which
-        // would cancel it via handleNotification) do we actually save.
+        log("PostInsertionEditWatcher: evaluateEdit — learn candidate found: \"\(candidate.source)\" → \"\(candidate.replacement)\"; showing pending toast, auto-save in \(Int(Self.confirmSeconds))s (Enter = now, Esc = cancel)")
+        // A candidate was found. Show the pending toast and start (or
+        // restart) the auto-save timer; only if it fires uninterrupted
+        // (no further edits, which would cancel it via handleNotification)
+        // do we actually save.
         pendingCandidate = candidate
+        onPendingCandidate(candidate, resolveElementFrame(observedElement))
         let generation = watchGeneration
         confirmTask?.cancel()
         confirmTask = Task { [weak self] in

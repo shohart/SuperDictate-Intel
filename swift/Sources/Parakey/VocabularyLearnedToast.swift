@@ -31,6 +31,7 @@ final class VocabularyLearnedToastController {
     private var escapeRunLoopSource: CFRunLoopSource?
     private var suppressEscapeKeyUp = false
     private var pendingUndo: (() -> Void)?
+    private var pendingSave: (() -> Void)?
 
     // Supplied by ParakeyApp at construction time, reading the same
     // recording-active state HotkeyListener.isRecordingActive already
@@ -43,7 +44,11 @@ final class VocabularyLearnedToastController {
     // it defers to HotkeyListener's own cancel-recording handling.
     var isRecordingActive: (() -> Bool)?
 
-    func show(_ record: VocabularyRecord, store: VocabularyStore, targetFrame: NSRect? = nil) {
+    func showPending(candidate: LearnCandidate,
+                     targetFrame: NSRect?,
+                     autoSaveSeconds: TimeInterval,
+                     onSave: @escaping () -> Void,
+                     onCancel: @escaping () -> Void) {
         dismissTask?.cancel()
         panel?.orderOut(nil)
         teardownEscapeTap()
@@ -53,25 +58,36 @@ final class VocabularyLearnedToastController {
         let accentColor = Settings.shared.recordingHUDRecordingColor.resolvedColor(lightBackground: lightBackground)
         self.accentColor = accentColor
 
-        // Single shared undo action, guarded by its own one-shot flag so it
-        // is idempotent no matter which of the three triggers (Escape via
-        // the global tap, Escape via the local button keyEquivalent
-        // fallback, or a click on the pill) fires first — the rest become
-        // no-ops.
-        var didUndo = false
-        let undo: () -> Void = { [weak self] in
-            guard !didUndo else { return }
-            didUndo = true
-            store.delete(id: record.id)
-            self?.dismiss(confirmed: false)
+        // Resolution actions, guarded by one-shot flags so they are
+        // idempotent no matter which trigger fires first (Enter/Escape via
+        // the global taps, the buttons' local keyEquivalent fallbacks, or a
+        // click on a button). Cancel plays the rejected restyle itself;
+        // save defers to the watcher (ParakeyApp calls markSaved() after
+        // the commit lands).
+        var didSave = false
+        var didCancel = false
+        let save: () -> Void = {
+            guard !didSave, !didCancel else { return }
+            didSave = true
+            onSave()
         }
-        pendingUndo = undo
+        let cancel: () -> Void = { [weak self] in
+            guard !didSave, !didCancel else { return }
+            didCancel = true
+            self?.dismiss(confirmed: false)
+            onCancel()
+        }
+        pendingUndo = cancel
+        pendingSave = save
 
         let content = Self.makeContentView(
-            record: record,
+            record: candidate.source,
+            replacement: candidate.replacement,
             lightBackground: lightBackground,
             accentColor: accentColor,
-            onUndo: undo
+            autoSaveSeconds: autoSaveSeconds,
+            onSave: save,
+            onCancel: cancel
         )
         self.label = content.label
         self.arrowRange = content.arrowRange
@@ -146,6 +162,24 @@ final class VocabularyLearnedToastController {
             guard !Task.isCancelled else { return }
             self?.dismiss(confirmed: true)
         }
+    }
+
+    /// The watcher committed the candidate (auto-save timer or Enter) —
+    /// play the accepted glow pulse and dismiss.
+    func markSaved() {
+        dismiss(confirmed: true)
+    }
+
+    /// The user cancelled (Escape) — strike the candidate through and
+    /// dismiss.
+    func markCancelled() {
+        dismiss(confirmed: false)
+    }
+
+    /// The candidate evaporated without a user decision — take the toast
+    /// down with the plain exit animation.
+    func dismissPending() {
+        dismiss(confirmed: true)
     }
 
     // MARK: - Global Escape interception (Task 1)
@@ -241,11 +275,8 @@ final class VocabularyLearnedToastController {
     private func handleEscapeTapEvent(isKeyDown: Bool, flags: CGEventFlags) -> Bool {
         if isKeyDown {
             // Modified Escape (e.g. Cmd+Opt+Escape / Force Quit) is a
-            // different gesture entirely, not "undo the correction" — only
-            // bare Escape should be swallowed. Without this check, Force
-            // Quit (and any other modified-Escape combo) would get eaten by
-            // this tap for up to 7 seconds after every auto-learned
-            // correction.
+            // different gesture entirely, not "cancel the correction" —
+            // only bare Escape should be swallowed.
             guard flags.intersection([.maskCommand, .maskAlternate, .maskControl]).isEmpty else { return false }
             guard isRecordingActive?() != true, pendingUndo != nil else { return false }
             suppressEscapeKeyUp = true
@@ -255,6 +286,89 @@ final class VocabularyLearnedToastController {
         guard suppressEscapeKeyUp else { return false }
         suppressEscapeKeyUp = false
         return true
+    }
+
+    // MARK: - Global Return interception (mirror of the Escape tap)
+
+    private var returnTap: CFMachPort?
+    private var returnTapRunLoopSource: CFRunLoopSource?
+    private var suppressReturnKeyUp = false
+
+    /// Installs a CGEventTap scoped to the Return key only — a structural
+    /// mirror of installEscapeTap() above (same tap options, same callback
+    /// shape) so Enter resolves the pending toast as SAVE globally. Kept as
+    /// a SEPARATE tap with its own handler rather than extending the Escape
+    /// tap's callback with keycode dispatch: the extra dispatch flow
+    /// tripped a Swift 6.1.2 SendNonSendable compiler crash, while this
+    /// mirror-of-a-proven-tap shape compiles and behaves identically.
+    private func installReturnTap() {
+        let mask: CGEventMask = (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.keyUp.rawValue)
+        let opaqueSelf = Unmanaged.passUnretained(self).toOpaque()
+        guard let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: mask,
+            callback: { _, type, event, userInfo in
+                guard let userInfo else { return Unmanaged.passUnretained(event) }
+                let controller = Unmanaged<VocabularyLearnedToastController>.fromOpaque(userInfo).takeUnretainedValue()
+                if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                    MainActor.assumeIsolated {
+                        if let returnTap = controller.returnTap {
+                            CGEvent.tapEnable(tap: returnTap, enable: true)
+                        }
+                    }
+                    return Unmanaged.passUnretained(event)
+                }
+                guard type == .keyDown || type == .keyUp,
+                      CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode)) == RETURN_KEYCODE
+                else {
+                    return Unmanaged.passUnretained(event)
+                }
+                let suppress = MainActor.assumeIsolated {
+                    controller.handleReturnTapEvent(isKeyDown: type == .keyDown, flags: event.flags)
+                }
+                return suppress ? nil : Unmanaged.passUnretained(event)
+            },
+            userInfo: opaqueSelf
+        ) else {
+            log("VocabularyLearnedToastController: return tap create failed — falling back to local keyEquivalent")
+            return
+        }
+
+        returnTap = tap
+        returnTapRunLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        CFRunLoopAddSource(CFRunLoopGetMain(), returnTapRunLoopSource, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+    }
+
+    /// Same keyDown-arms/keyUp-swallows discipline as handleEscapeTapEvent.
+    private func handleReturnTapEvent(isKeyDown: Bool, flags: CGEventFlags) -> Bool {
+        if isKeyDown {
+            // Modified Return (Cmd+Enter "send", Opt+Enter, etc.) is a
+            // different gesture entirely — only bare Return is swallowed.
+            guard flags.intersection([.maskCommand, .maskAlternate, .maskControl]).isEmpty else { return false }
+            guard isRecordingActive?() != true, pendingSave != nil else { return false }
+            suppressReturnKeyUp = true
+            pendingSave?()
+            return true
+        }
+        guard suppressReturnKeyUp else { return false }
+        suppressReturnKeyUp = false
+        return true
+    }
+
+    private func teardownReturnTap() {
+        if let returnTap {
+            CGEvent.tapEnable(tap: returnTap, enable: false)
+            CFMachPortInvalidate(returnTap)
+        }
+        if let returnTapRunLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), returnTapRunLoopSource, .commonModes)
+        }
+        returnTap = nil
+        returnTapRunLoopSource = nil
+        suppressReturnKeyUp = false
     }
 
     /// Invalidates the tap and removes its run loop source. Safe to call
@@ -271,6 +385,8 @@ final class VocabularyLearnedToastController {
         escapeRunLoopSource = nil
         suppressEscapeKeyUp = false
         pendingUndo = nil
+        teardownReturnTap()
+        pendingSave = nil
     }
 
     /// Scale the toast animates from (on appear) / to (on dismiss). Applied
@@ -341,6 +457,7 @@ final class VocabularyLearnedToastController {
         // later teardownEscapeTap() call, once this tap is actually torn
         // down) may clear it.
         pendingUndo = nil
+        pendingSave = nil
 
         let content = panel.contentView
 
@@ -497,10 +614,12 @@ final class VocabularyLearnedToastController {
 
     // Pill geometry, chosen to read as an obviously-rounded capsule (like
     // RecordingHUDView's pill) rather than a barely-rounded rectangle.
-    private static let pillHeight: CGFloat = 60
-    private static let horizontalPadding: CGFloat = 26
-    private static let minPillWidth: CGFloat = 180
-    private static let maxPillWidth: CGFloat = 540
+    // Taller than a single-row pill: the candidate pair, the key-hint row
+    // and the button row all live inside.
+    private static let pillHeight: CGFloat = 118
+    private static let horizontalPadding: CGFloat = 22
+    private static let minPillWidth: CGFloat = 320
+    private static let maxPillWidth: CGFloat = 560
 
     private static func makePanel() -> NSPanel {
         let panel = NSPanel(
@@ -551,10 +670,13 @@ final class VocabularyLearnedToastController {
         let textColor: NSColor
     }
 
-    private static func makeContentView(record: VocabularyRecord,
+    private static func makeContentView(record: String,
+                                        replacement: String,
                                         lightBackground: Bool,
                                         accentColor: NSColor,
-                                        onUndo: @escaping () -> Void) -> ContentViewResult {
+                                        autoSaveSeconds: TimeInterval,
+                                        onSave: @escaping () -> Void,
+                                        onCancel: @escaping () -> Void) -> ContentViewResult {
         // Mirrors RecordingHUDView.drawTimerOutlineFill's textColor formula
         // (HUDViews.swift) — NSColor.labelColor resolves against the
         // *system* appearance, which can mismatch this container's forced
@@ -565,12 +687,12 @@ final class VocabularyLearnedToastController {
             : NSColor(calibratedWhite: 1.0, alpha: 0.92)
         let font = NSFont.systemFont(ofSize: 17, weight: .bold)
 
-        let text = NSMutableAttributedString(string: record.source, attributes: [
+        let text = NSMutableAttributedString(string: record, attributes: [
             .font: font,
             .foregroundColor: textColor,
         ])
         // Take the arrow's range off the attributed string's own UTF-16
-        // length (NSRange's unit) rather than record.source.count (Swift's
+        // length (NSRange's unit) rather than record.count (Swift's
         // grapheme-cluster count) — the two can disagree for combining
         // characters/emoji, and an out-of-bounds NSRange later would trap.
         let arrowStart = text.length
@@ -579,7 +701,7 @@ final class VocabularyLearnedToastController {
             .foregroundColor: accentColor,
         ]))
         let arrowRange = NSRange(location: arrowStart, length: text.length - arrowStart)
-        text.append(NSAttributedString(string: record.replacement, attributes: [
+        text.append(NSAttributedString(string: replacement, attributes: [
             .font: font,
             .foregroundColor: textColor,
         ]))
@@ -598,7 +720,7 @@ final class VocabularyLearnedToastController {
         container.wantsLayer = true
         let palette = backgroundPalette(lightBackground: lightBackground)
         container.layer?.backgroundColor = palette.fill.cgColor
-        container.layer?.cornerRadius = pillHeight / 2
+        container.layer?.cornerRadius = 18
         container.layer?.borderWidth = 1
         container.layer?.borderColor = palette.stroke.cgColor
 
@@ -610,43 +732,62 @@ final class VocabularyLearnedToastController {
             label.centerYAnchor.constraint(equalTo: container.centerYAnchor),
         ])
 
-        // Undo/cancel affordance: clicking anywhere on the toast, or
-        // pressing Escape, cancels the just-learned save — same mechanism
-        // as before (UndoButtonAction + keyEquivalent), but with all
-        // visible button chrome stripped so nothing reads as a button. The
-        // user explicitly doesn't want any "press Escape to cancel" text
-        // shown; they already know the shortcut.
-        let undoButton = NSButton(title: "", target: nil, action: nil)
-        undoButton.isBordered = false
-        // isTransparent guarantees the cell draws nothing at all (an empty
-        // bordered/borderless title can still leave faint cell artifacts on
-        // some bezel styles) while still tracking mouse-down and honoring
-        // keyEquivalent, so clicking anywhere on the toast — or pressing
-        // Escape — still fires onUndo with zero visible button chrome.
-        undoButton.isTransparent = true
-        // ...but isTransparent does NOT suppress the AppKit focus ring:
-        // clicking the pill makes this nonactivating panel the key window
-        // and the full-size button its first responder, so a dotted focus
-        // outline would appear around the toast and linger through the
-        // dismiss animations. Kill it at the source: no focus ring, and
-        // never become first responder in the first place (keyEquivalent
-        // matching works via performKeyEquivalent regardless of first
-        // responder status, so the Escape fallback is unaffected).
-        undoButton.focusRingType = .none
-        undoButton.refusesFirstResponder = true
-        undoButton.keyEquivalent = "\u{1b}"
-        undoButton.translatesAutoresizingMaskIntoConstraints = false
-        let action = UndoButtonAction(handler: onUndo)
-        undoButton.target = action
-        undoButton.action = #selector(UndoButtonAction.undoTapped)
-        objc_setAssociatedObject(undoButton, &UndoButtonAction.associationKey, action, .OBJC_ASSOCIATION_RETAIN)
+        // Hint row: what Enter/Esc do, and that doing nothing auto-saves.
+        let hintFont = NSFont.systemFont(ofSize: 11, weight: .medium)
+        let hintColor = textColor.withAlphaComponent(textColor.alphaComponent * 0.55)
+        let hint = NSTextField(labelWithAttributedString: NSAttributedString(string: String(
+            format: NSLocalizedString(
+                "⏎ запомнить · ⎋ отменить · автосохранение через %d с",
+                comment: "Pending vocabulary-correction toast key hints"),
+            Int(autoSaveSeconds)
+        ), attributes: [
+            .font: hintFont,
+            .foregroundColor: hintColor,
+        ]))
+        hint.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(hint)
 
-        container.addSubview(undoButton)
+        // The save element: accent-tinted, marked as the default (it owns
+        // the Return key equivalent — pressing Enter anywhere while the
+        // toast is visible resolves the toast as SAVE, via the global tap
+        // or this key equivalent as the local fallback).
+        let saveButton = NSButton(title: NSLocalizedString("Запомнить ⏎", comment: "Pending vocabulary-correction toast save button"), target: nil, action: nil)
+        saveButton.bezelStyle = .rounded
+        saveButton.controlSize = .small
+        saveButton.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
+        saveButton.keyEquivalent = "\r"
+        saveButton.contentTintColor = accentColor
+        let saveAction = UndoButtonAction(handler: onSave)
+        saveButton.target = saveAction
+        saveButton.action = #selector(UndoButtonAction.undoTapped)
+        objc_setAssociatedObject(saveButton, &UndoButtonAction.associationKey, saveAction, .OBJC_ASSOCIATION_RETAIN)
+        saveButton.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(saveButton)
+
+        let cancelButton = NSButton(title: NSLocalizedString("Отмена ⎋", comment: "Pending vocabulary-correction toast cancel button"), target: nil, action: nil)
+        cancelButton.bezelStyle = .rounded
+        cancelButton.controlSize = .small
+        cancelButton.font = NSFont.systemFont(ofSize: 12, weight: .regular)
+        cancelButton.keyEquivalent = "\u{1b}"
+        let cancelAction = UndoButtonAction(handler: onCancel)
+        cancelButton.target = cancelAction
+        cancelButton.action = #selector(UndoButtonAction.undoTapped)
+        objc_setAssociatedObject(cancelButton, &UndoButtonAction.associationKey, cancelAction, .OBJC_ASSOCIATION_RETAIN)
+        cancelButton.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(cancelButton)
+
         NSLayoutConstraint.activate([
-            undoButton.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            undoButton.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            undoButton.topAnchor.constraint(equalTo: container.topAnchor),
-            undoButton.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            hint.topAnchor.constraint(equalTo: label.bottomAnchor, constant: 6),
+            hint.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            hint.leadingAnchor.constraint(greaterThanOrEqualTo: container.leadingAnchor, constant: horizontalPadding),
+
+            saveButton.topAnchor.constraint(equalTo: hint.bottomAnchor, constant: 8),
+            saveButton.trailingAnchor.constraint(equalTo: container.centerXAnchor, constant: -6),
+            saveButton.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -12),
+
+            cancelButton.topAnchor.constraint(equalTo: saveButton.topAnchor),
+            cancelButton.leadingAnchor.constraint(equalTo: container.centerXAnchor, constant: 6),
+            cancelButton.centerYAnchor.constraint(equalTo: saveButton.centerYAnchor),
         ])
 
         return ContentViewResult(view: container, label: label, arrowRange: arrowRange, textColor: textColor)
