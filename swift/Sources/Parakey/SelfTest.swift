@@ -3288,24 +3288,24 @@ enum ParakeySelfTest {
 
     /// Hermetic coverage for the tiered-correction + rewrite settings and
     /// pipeline plumbing (docs/specs/rewrite-tiered-correction-spec.md):
-    /// defaults, corruption-tolerant normalization, correction/rewrite
-    /// toggle independence, host-identity sharing between the quality tier
-    /// and bundled rewrite, neededHostIdentities (the delayed-unload
-    /// keep-set), and per-tier/per-style prompt selection. No model, no
-    /// network; part of `all`.
+    /// defaults, corruption-tolerant normalization, legacy-key migration,
+    /// correction/rewrite toggle independence, path-based host identities,
+    /// neededHostIdentities (the delayed-unload keep-set), and per-model/
+    /// per-style prompt selection. No model, no network; part of `all`.
     private static func testRewriteAndTierSettings() throws {
         func freshSettings() -> Settings {
             Settings(defaults: UserDefaults(suiteName: "com.local.superdictate.selftest.rewrite-tier-\(UUID().uuidString)")!,
                      vocabularyStore: .inMemoryFallback())
         }
 
-        // Defaults: fast tier (the branch's fixed VoiceScribe choice),
-        // rewrite off, polish style, bundled rewrite backend, YandexGPT as
-        // the bundled rewrite model, empty custom endpoint fields.
+        // Defaults: VoiceScribe correction (the benchmark's best fast
+        // model), rewrite off, polish style, bundled rewrite backend,
+        // YandexGPT as the bundled rewrite model, empty custom endpoint
+        // fields.
         do {
             let settings = freshSettings()
-            try expect(settings.correctionModelTier, equals: .fast,
-                       "fresh install must default to the fast (VoiceScribe) correction tier")
+            try expect(settings.correctionBundledModel, equals: .voiceScribe,
+                       "fresh install must default to the VoiceScribe correction model")
             try expect(settings.rewriteEnabled, equals: false,
                        "rewrite must be off by default")
             try expect(settings.rewriteStyle, equals: .polish,
@@ -3322,15 +3322,75 @@ enum ParakeySelfTest {
         // Corruption tolerance: unknown stored values fall back to defaults.
         do {
             let defaults = UserDefaults(suiteName: "com.local.superdictate.selftest.rewrite-tier-corrupt-\(UUID().uuidString)")!
-            defaults.set("yolo", forKey: "correction_model_tier_v1")
+            defaults.set("yolo", forKey: "correction_bundled_model_v2")
             defaults.set("ultra", forKey: "rewrite_style_v1")
             defaults.set("quantum", forKey: "rewrite_engine_backend_v1")
-            defaults.set("weird", forKey: "rewrite_bundled_model_v1")
+            defaults.set("weird", forKey: "rewrite_bundled_model_v2")
             let settings = Settings(defaults: defaults, vocabularyStore: .inMemoryFallback())
-            try expect(settings.correctionModelTier, equals: .fast, "unknown tier raw value must normalize to .fast")
+            try expect(settings.correctionBundledModel, equals: .voiceScribe, "unknown correction model raw value must normalize to .voiceScribe")
             try expect(settings.rewriteStyle, equals: .polish, "unknown style raw value must normalize to .polish")
             try expect(settings.rewriteEngineBackend, equals: .bundledLocal, "unknown backend raw value must normalize to .bundledLocal")
             try expect(settings.rewriteBundledModel, equals: .yandexGPT, "unknown rewrite model raw value must normalize to .yandexGPT")
+        }
+
+        // Legacy migration: the retired tier/rewrite pickers map onto the
+        // new model settings (fast→VoiceScribe, quality→YandexGPT — the
+        // benchmark correction winner, offered in the correction picker;
+        // voiceScribe rewrite→YandexGPT).
+        do {
+            let defaults = UserDefaults(suiteName: "com.local.superdictate.selftest.rewrite-tier-legacy-\(UUID().uuidString)")!
+            defaults.set("quality", forKey: "correction_model_tier_v1")
+            defaults.set("voicescribe", forKey: "rewrite_bundled_model_v1")
+            let settings = Settings(defaults: defaults, vocabularyStore: .inMemoryFallback())
+            try expect(settings.correctionBundledModel, equals: .yandexGPT,
+                       "legacy quality tier must migrate to YandexGPT (the correction winner)")
+            try expect(settings.rewriteBundledModel, equals: .yandexGPT,
+                       "legacy voiceScribe rewrite choice must migrate to YandexGPT")
+            defaults.set("fast", forKey: "correction_model_tier_v1")
+            try expect(settings.correctionBundledModel, equals: .voiceScribe,
+                       "legacy fast tier must migrate to VoiceScribe")
+        }
+
+        // The pickers mirror the benchmark's test roles: correction offers
+        // every small tested model plus YandexGPT; rewrite offers the
+        // curated rewrite-table set. Several models serve BOTH roles.
+        do {
+            try expect(BundledLLMModel.correctionModels.contains(.voiceScribe), equals: true,
+                       "correction list must contain VoiceScribe")
+            try expect(BundledLLMModel.correctionModels.contains(.loqira), equals: true,
+                       "correction list must contain Loqira (small model tested for correction)")
+            try expect(BundledLLMModel.correctionModels.contains(.vanilla08b), equals: true,
+                       "correction list must contain vanilla 0.8B")
+            try expect(BundledLLMModel.correctionModels.contains(.lfm25), equals: true,
+                       "correction list must contain LFM2.5 (every small tested model)")
+            try expect(BundledLLMModel.correctionModels.contains(.yandexGPT), equals: true,
+                       "correction list must contain YandexGPT (correction winner)")
+            try expect(BundledLLMModel.rewriteModels.contains(.yandexGPT), equals: true,
+                       "rewrite list must contain YandexGPT")
+            try expect(BundledLLMModel.rewriteModels.contains(.qwen35_9b), equals: true,
+                       "rewrite list must contain Qwen3.5-9B")
+            try expect(BundledLLMModel.rewriteModels.contains(.gemma4e4b), equals: true,
+                       "rewrite list must contain Gemma 4 E4B")
+            try expect(BundledLLMModel.rewriteModels.contains(.phi4mini)
+                        && BundledLLMModel.rewriteModels.contains(.ministral3b)
+                        && BundledLLMModel.rewriteModels.contains(.ruAdapt4b),
+                       equals: true,
+                       "rewrite list must contain the small models tested for rewrite")
+            try expect(BundledLLMModel.rewriteModels.contains(.lfm25), equals: true,
+                       "rewrite list must contain LFM2.5 (experimental, thinking forced off)")
+            try expect(BundledLLMModel(rawValue: "qwen3_8b"), equals: nil,
+                       "the removed Qwen3-8B case must not exist in the enum")
+            // Prompt-lock policy: Loqira's system prompt is mandatory.
+            try expect(BundledLLMModel.loqira.allowsCustomSystemPrompt, equals: false,
+                       "Loqira must have a locked (mandatory) system prompt")
+            try expect(BundledLLMModel.voiceScribe.allowsCustomSystemPrompt, equals: true,
+                       "VoiceScribe's system prompt must stay editable")
+            // NB thinking mode needs NO launch flags: the bundled helper
+            // hardcodes COMMON_REASONING_FORMAT_NONE and honors the
+            // request-level enable_thinking=false. NEVER pass llama-server
+            // flags (e.g. --reasoning-format) to the helper — it rejects
+            // unknown arguments and exits at startup, silently disabling
+            // the whole correction/rewrite pass.
         }
 
         // Toggle independence: flipping rewrite never touches correction
@@ -3360,21 +3420,22 @@ enum ParakeySelfTest {
                        "the two endpoint model names must stay separate values")
         }
 
-        // Host identities: the quality correction tier and bundled
-        // yandexGPT rewrite SHARE one YandexGPT host; the fast tier and
-        // bundled voiceScribe rewrite share one 0.8B host; the two tiers
-        // are always distinct.
+        // Host identities are path-based: distinct models get distinct
+        // hosts; the SAME model picked for both passes would share one
+        // host (the pickers offer disjoint lists, so this is a unit-level
+        // invariant, not a UI-reachable state).
         do {
-            let fast = LLMPostprocessingCoordinator.correctionHostIdentity(tier: .fast)
-            let quality = LLMPostprocessingCoordinator.correctionHostIdentity(tier: .quality)
+            let voiceScribe = LLMPostprocessingCoordinator.correctionHostIdentity(model: .voiceScribe)
+            let qwen4b = LLMPostprocessingCoordinator.correctionHostIdentity(model: .qwen35_4b)
             let rewriteYandex = LLMPostprocessingCoordinator.rewriteHostIdentity(model: .yandexGPT)
-            let rewriteVoiceScribe = LLMPostprocessingCoordinator.rewriteHostIdentity(model: .voiceScribe)
-            try expect(fast != quality, equals: true,
-                       "fast and quality correction tiers must map to different host identities")
-            try expect(quality == rewriteYandex, equals: true,
-                       "quality correction and bundled yandexGPT rewrite must share one YandexGPT host identity")
-            try expect(fast == rewriteVoiceScribe, equals: true,
-                       "fast correction and bundled voiceScribe rewrite must share one 0.8B host identity")
+            try expect(voiceScribe != qwen4b, equals: true,
+                       "different bundled models must map to different host identities")
+            try expect(voiceScribe != rewriteYandex, equals: true,
+                       "correction and rewrite models must map to different host identities")
+            try expect(LLMPostprocessingCoordinator.rewriteHostIdentity(model: .yandexGPT)
+                        == LLMPostprocessingCoordinator.correctionHostIdentity(model: .yandexGPT),
+                       equals: true,
+                       "the same bundled model must resolve to the same host identity for both passes")
         }
 
         // neededHostIdentities (the delayed-unload keep-set) across the
@@ -3389,27 +3450,25 @@ enum ParakeySelfTest {
 
             settings.textPostprocessingMode = .correction
             settings.llmEngineBackend = .bundledLocal
-            settings.correctionModelTier = .fast
+            settings.correctionBundledModel = .voiceScribe
             try expect(LLMPostprocessingCoordinator.neededHostIdentities(settings: settings).count, equals: 1,
-                       "fast correction alone needs exactly its own host")
+                       "correction alone needs exactly its own host")
 
             settings.rewriteEnabled = true
             settings.rewriteEngineBackend = .bundledLocal
             try expect(LLMPostprocessingCoordinator.neededHostIdentities(settings: settings).count, equals: 2,
-                       "fast correction + bundled rewrite need two hosts")
+                       "correction + bundled rewrite need two hosts when the models differ")
 
-            settings.correctionModelTier = .quality
+            // Same model in BOTH passes (YandexGPT is offered for both):
+            // one shared host identity.
+            settings.correctionBundledModel = .yandexGPT
             try expect(LLMPostprocessingCoordinator.neededHostIdentities(settings: settings).count, equals: 1,
-                       "quality correction + bundled rewrite share ONE YandexGPT host")
+                       "YandexGPT correction + YandexGPT rewrite must share ONE host")
+            settings.correctionBundledModel = .voiceScribe
 
             settings.textPostprocessingMode = .off
             try expect(LLMPostprocessingCoordinator.neededHostIdentities(settings: settings).count, equals: 1,
-                       "rewrite alone keeps the shared YandexGPT host (correction toggle-off must not unload it)")
-
-            settings.rewriteBundledModel = .voiceScribe
-            try expect(LLMPostprocessingCoordinator.neededHostIdentities(settings: settings).count, equals: 1,
-                       "voiceScribe rewrite alone needs exactly the fast 0.8B host")
-            settings.rewriteBundledModel = .yandexGPT
+                       "rewrite alone keeps its host (correction toggle-off must not unload it)")
 
             settings.rewriteEngineBackend = .customEndpoint
             try expect(LLMPostprocessingCoordinator.neededHostIdentities(settings: settings).isEmpty, equals: true,
@@ -3421,20 +3480,20 @@ enum ParakeySelfTest {
                        "custom-endpoint correction needs no bundled host")
         }
 
-        // Prompt selection: fast tier keeps the VoiceScribe-tuned few-shot
-        // prompt; quality tier gets the benchmark zero-shot prompt; rewrite
+        // Prompt selection: VoiceScribe keeps its tuned few-shot prompt;
+        // every instruct model gets the benchmark zero-shot prompt; rewrite
         // prompts carry their mode instructions and «Режим:» user suffix.
         do {
-            let fastPrompt = LLMCorrectionPrompt.systemPrompt(vocabulary: [], tier: .fast)
-            let qualityPrompt = LLMCorrectionPrompt.systemPrompt(vocabulary: [], tier: .quality)
-            try expect(fastPrompt.contains("Корректор русской диктовки"), equals: true,
-                       "fast tier must keep the VoiceScribe-tuned correction prompt")
-            try expect(LLMCorrectionPrompt.exampleTurns(vocabulary: [], tier: .fast).count, equals: 8,
-                       "fast tier must keep its 4 few-shot pairs (8 user+assistant messages)")
-            try expect(qualityPrompt.contains("минимальный корректор"), equals: true,
-                       "quality tier must use the benchmark-validated zero-shot prompt")
-            try expect(LLMCorrectionPrompt.exampleTurns(vocabulary: [], tier: .quality).isEmpty, equals: true,
-                       "quality tier must be zero-shot (benchmark configuration)")
+            let voiceScribePrompt = LLMCorrectionPrompt.systemPrompt(vocabulary: [], model: .voiceScribe)
+            let instructPrompt = LLMCorrectionPrompt.systemPrompt(vocabulary: [], model: .qwen35_4b)
+            try expect(voiceScribePrompt.contains("Корректор русской диктовки"), equals: true,
+                       "VoiceScribe must keep its tuned correction prompt")
+            try expect(LLMCorrectionPrompt.exampleTurns(vocabulary: [], model: .voiceScribe).count, equals: 8,
+                       "VoiceScribe must keep its 4 few-shot pairs (8 user+assistant messages)")
+            try expect(instructPrompt.contains("минимальный корректор"), equals: true,
+                       "instruct models must use the benchmark-validated zero-shot prompt")
+            try expect(LLMCorrectionPrompt.exampleTurns(vocabulary: [], model: .qwen35_4b).isEmpty, equals: true,
+                       "instruct models must be zero-shot (benchmark configuration)")
 
             let polish = LLMRewritePrompt.systemPrompt(style: .polish)
             try expect(polish.contains("повторы"), equals: true, "polish prompt must instruct repeat removal")
@@ -3454,6 +3513,25 @@ enum ParakeySelfTest {
                 try expect(LLMRewritePrompt.systemPrompt(style: style).contains("Не добавляй новых фактов"), equals: true,
                            "every rewrite style must keep the fact-preservation base")
             }
+        }
+
+        // Prompt overrides: empty = built-in default; correction override
+        // is role-wide, rewrite overrides are independent per style; the
+        // Loqira lock is a model property the pipeline reads.
+        do {
+            let settings = freshSettings()
+            try expect(settings.correctionSystemPromptOverride.isEmpty, equals: true,
+                       "no correction prompt override by default")
+            settings.correctionSystemPromptOverride = "Свой промпт коррекции"
+            try expect(settings.correctionSystemPromptOverride, equals: "Свой промпт коррекции",
+                       "correction prompt override must round-trip")
+            try expect(settings.rewriteSystemPromptOverride(for: .polish).isEmpty, equals: true,
+                       "no rewrite prompt override by default")
+            settings.setRewriteSystemPromptOverride("Свой промпт задачи", for: .structuredTask)
+            try expect(settings.rewriteSystemPromptOverride(for: .structuredTask), equals: "Свой промпт задачи",
+                       "rewrite prompt override must round-trip per style")
+            try expect(settings.rewriteSystemPromptOverride(for: .polish).isEmpty, equals: true,
+                       "rewrite prompt overrides must be independent per style")
         }
     }
 

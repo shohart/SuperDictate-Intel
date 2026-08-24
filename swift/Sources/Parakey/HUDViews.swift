@@ -159,6 +159,14 @@ final class RecordingHUDView: NSView {
             if !oldValue.isEqual(transcribingColor) { needsDisplay = true }
         }
     }
+    /// End color of the `.correcting` gradient (start = `transcribingColor`):
+    /// the AI improvement pass draws the transcription wave re-forming into a
+    /// left->right gradient that lands on this second accent.
+    var correctingColor: NSColor = .systemPurple {
+        didSet {
+            if !oldValue.isEqual(correctingColor) { needsDisplay = true }
+        }
+    }
     var backgroundStyle: RecordingHUDBackgroundStyle = .system {
         didSet {
             if oldValue != backgroundStyle { needsDisplay = true }
@@ -276,7 +284,7 @@ final class RecordingHUDView: NSView {
             return
         }
         if mode == .correcting {
-            drawCorrectingStars(in: capsuleRect, accent: vividAccent, alpha: 1)
+            drawCorrectingWave(in: capsuleRect, alpha: 1)
             return
         }
         if mode == .error {
@@ -475,92 +483,83 @@ final class RecordingHUDView: NSView {
             path.fill()
         }
     }
-    /// A row of night-sky sparkles (4-ray stars with elongated vertical
-    /// rays) while LLM postprocessing runs -- visually distinct from
-    /// `drawTranscribingWave`'s running bars, and replacing the older
-    /// orbiting-stars animation. The sparkles sit on a straight line with
-    /// a CONSTANT inset from the capsule's left/right edges (padding does
-    /// not depend on how wide the HUD happens to be), and each twinkles
-    /// on its own decorrelated rhythm: the vertical ray grows and shrinks
-    /// while brightness follows it (longer ray == brighter flash), like a
-    /// real star's twinkle. Horizontal extent is capped below half the
-    /// inter-star spacing, so neighbours can never touch.
-    private func drawCorrectingStars(in capsuleRect: NSRect, accent: NSColor, alpha: CGFloat) {
+    /// "Transmutation" animation while LLM postprocessing runs: the same
+    /// 8-bar wave language as `drawTranscribingWave`, but a luminous front
+    /// sweeps left->right and RE-FORMS the wave behind it -- bars ahead of
+    /// the front murmur low and dimmed (raw speech), bars behind it breathe
+    /// taller, slower and fully saturated (polished text), with a white-hot
+    /// flash exactly at the crossing point. Bars carry a left->right gradient
+    /// from `transcribingColor` to `correctingColor`, so the AI pass reads as
+    /// the transcription wave being re-written into a new color. All motion
+    /// derives deterministically from `phase`, same convention as the other
+    /// HUD animations.
+    private func drawCorrectingWave(in capsuleRect: NSRect, alpha: CGFloat) {
         guard alpha > 0.001 else { return }
+        let barCount = 8
         let visualScale = self.visualScale
-        // Three large, saturated sparkles -- deliberately fewer-and-bigger
-        // than a dense row, so each flash reads as a distinct event.
-        let starCount = 3
-        // Edge inset covers the WORST-CASE glow radius too (baseVertical
-        // * 1.63 flash peak * 1.4 halo ≈ 11.9x visualScale): neither the
-        // ray nor its halo ever touches the capsule edge.
-        let edgePadding: CGFloat = 12.0 * visualScale
-        let availableWidth = capsuleRect.width - (2 * edgePadding)
-        guard starCount > 1, availableWidth > 0 else { return }
-        let spacing = availableWidth / CGFloat(starCount - 1)
+        let barWidth: CGFloat = 2.05 * visualScale
+        let barGap: CGFloat = 2.55 * visualScale
+        let minHeight: CGFloat = 3.2 * visualScale
+        let maxHeight = min(capsuleRect.height * 0.60, 14.6 * visualScale)
+        let totalWidth = CGFloat(barCount) * barWidth + CGFloat(barCount - 1) * barGap
+        let startX = capsuleRect.midX - (totalWidth / 2)
         let centerY = capsuleRect.midY
-        // Vertical flash is capped well inside the capsule (max ≈ 8.5x
-        // visualScale vs the 19x half-height of the standard capsule):
-        // rays stretch hard but NEVER reach the popup's edges.
-        let baseVertical: CGFloat = 5.2 * visualScale
-        let baseHorizontal = min(2.8 * visualScale, spacing * 0.42)
-        for index in 0..<starCount {
+
+        // `phase` advances at RECORDING_HUD_CORRECTING_PHASE_SPEED radians per
+        // second; one full sweep of the front spans SWEEP_RADIANS of phase.
+        let sweepPosition = (phase / RECORDING_HUD_CORRECTING_SWEEP_RADIANS)
+            .truncatingRemainder(dividingBy: 1)
+
+        for index in 0..<barCount {
             let i = CGFloat(index)
-            let x = capsuleRect.minX + edgePadding + (i * spacing)
-            // Three decorrelated sine waves per star (incommensurate
-            // ratios, golden-angle-ish per-star offsets) read as random
-            // twinkling rather than a synchronized pulse -- while staying
-            // fully deterministic in `phase`, same convention as the
-            // level-bar animations.
-            let slow = sin((phase * 0.97) + (i * 2.399))
-            let mid = sin((phase * 1.93) + (i * 4.102))
-            let fast = sin((phase * 2.71) + (i * 1.618))
-            let rawTwinkle = max(0, min(1, (slow * 0.5 + mid * 0.3 + fast * 0.2) * 0.5 + 0.5))
-            // Sharpened flash curve: long quiet rests, punchy bright peaks.
-            let flash = pow(rawTwinkle, 1.5)
-            // The vertical ray is the main twinkle axis and stretches
-            // dramatically (28% rest -> 163% flash); the horizontal ray
-            // breathes much less so the shape keeps its sparkle identity.
-            let vertical = baseVertical * (0.28 + (1.35 * flash))
-            let horizontal = baseHorizontal * (0.55 + (0.45 * flash))
-            let center = NSPoint(x: x, y: centerY)
-            let star = sparklePath(center: center,
-                                   verticalRadius: vertical,
-                                   horizontalRadius: horizontal,
-                                   waist: min(horizontal, vertical) * 0.18)
-            // Tight halo + HIGH-contrast core (55% at rest -> fully opaque
-            // at the flash peak): no washed-out translucency, the accent
-            // color reads saturated.
-            let glowRadius = max(vertical, horizontal) * 1.4
-            let glowRect = NSRect(x: center.x - glowRadius,
-                                  y: center.y - glowRadius,
-                                  width: glowRadius * 2,
-                                  height: glowRadius * 2)
-            accent.withAlphaComponent((0.06 + (0.14 * flash)) * alpha).setFill()
-            NSBezierPath(ovalIn: glowRect).fill()
-            accent.withAlphaComponent((0.55 + (0.45 * flash)) * alpha).setFill()
-            star.fill()
+            let xNorm = i / CGFloat(barCount - 1)
+
+            // Distance BEHIND the sweep front (0 exactly at the front).
+            var behind = sweepPosition - xNorm
+            if behind < 0 { behind += 1 }
+            // Refinement band trailing the front: sharp rise right behind it,
+            // long plateau, gentle fade-out toward the tail; seamless loop.
+            let band = smoothstep(0.03, 0.20, behind) * (1 - smoothstep(0.52, 0.92, behind))
+            // White-hot flash exactly where the front crosses this bar.
+            let dist = min(abs(sweepPosition - xNorm), 1 - abs(sweepPosition - xNorm))
+            let flash = exp(-((dist * dist) / (2 * 0.05 * 0.05)))
+
+            // Raw state: low, restless murmur (unrefined speech).
+            let raw = 0.26
+                + (0.10 * sin((2 * .pi * 4 * sweepPosition) + (i * 0.85)))
+                + (0.07 * sin((2 * .pi * 7 * sweepPosition) + (i * 1.9)))
+            // Refined state: tall, slow, confident breathing (polished text).
+            let refined = 0.58 + (0.13 * sin((2 * .pi * 2 * sweepPosition) - (i * 0.32)))
+            let activity = min(1, raw + ((refined - raw) * band) + (0.34 * flash))
+
+            let height = minHeight + ((maxHeight - minHeight) * activity)
+            let x = startX + i * (barWidth + barGap)
+            let rect = NSRect(x: x,
+                              y: centerY - (height / 2),
+                              width: barWidth,
+                              height: height)
+
+            // Left->right gradient across the bar row: transcription accent on
+            // the left, correcting accent on the right. Raw bars dim toward
+            // black; refined bars hold the full color; the flash goes white.
+            var color = transcribingColor.blended(withFraction: xNorm, of: correctingColor)
+                ?? transcribingColor
+            color = color.blended(withFraction: 0.30 * (1 - band), of: .black) ?? color
+            color = color.blended(withFraction: flash * 0.75, of: .white) ?? color
+
+            let glowRect = rect.insetBy(dx: -1.35 * visualScale, dy: -1.45 * visualScale)
+            let glowAlpha = min(1, 0.05 + (0.16 * band) + (0.30 * flash)) * alpha
+            color.withAlphaComponent(glowAlpha).setFill()
+            NSBezierPath(roundedRect: glowRect,
+                         xRadius: glowRect.width / 2,
+                         yRadius: glowRect.width / 2).fill()
+
+            let coreAlpha = min(1, 0.60 + (0.34 * band) + (0.40 * flash)) * alpha
+            color.withAlphaComponent(coreAlpha).setFill()
+            NSBezierPath(roundedRect: rect,
+                          xRadius: barWidth / 2,
+                          yRadius: barWidth / 2).fill()
         }
-    }
-    /// A night-sky sparkle: a 4-point star whose vertical ray is elongated
-    /// relative to the horizontal one, with a thin concave `waist` -- the
-    /// classic four-ray glint shape (as drawn for stars on a night sky),
-    /// not a symmetric four-point polygon.
-    private func sparklePath(center: NSPoint,
-                             verticalRadius: CGFloat,
-                             horizontalRadius: CGFloat,
-                             waist: CGFloat) -> NSBezierPath {
-        let path = NSBezierPath()
-        path.move(to: NSPoint(x: center.x, y: center.y + verticalRadius))
-        path.line(to: NSPoint(x: center.x + waist, y: center.y + waist))
-        path.line(to: NSPoint(x: center.x + horizontalRadius, y: center.y))
-        path.line(to: NSPoint(x: center.x + waist, y: center.y - waist))
-        path.line(to: NSPoint(x: center.x, y: center.y - verticalRadius))
-        path.line(to: NSPoint(x: center.x - waist, y: center.y - waist))
-        path.line(to: NSPoint(x: center.x - horizontalRadius, y: center.y))
-        path.line(to: NSPoint(x: center.x - waist, y: center.y + waist))
-        path.close()
-        return path
     }
     /// Static exclamation mark drawn inside the yellow error capsule.
     private func drawErrorIndicator(in capsuleRect: NSRect) {
@@ -640,11 +639,15 @@ func exportRecordingHUDAnimationFrames(to directory: URL) throws {
     let emptyLead = 0.35
     let recordingDuration = 6.20
     let transcribingDuration = 2.40
+    // A short `.correcting` segment follows transcription so the export also
+    // previews the LLM-improvement animation (one full sweep is 3.2s).
+    let correctingDuration = 4.00
     let emptyTail = 0.50
     let totalDuration = emptyLead
         + RECORDING_HUD_ANIMATE_IN_SECONDS
         + recordingDuration
         + transcribingDuration
+        + correctingDuration
         + RECORDING_HUD_ANIMATE_OUT_SECONDS
         + emptyTail
     let frameCount = Int((totalDuration * framesPerSecond).rounded())
@@ -653,6 +656,7 @@ func exportRecordingHUDAnimationFrames(to directory: URL) throws {
     let settings = Settings.shared
     view.recordingColor = settings.recordingHUDRecordingColor.resolvedColor(lightBackground: false)
     view.transcribingColor = settings.recordingHUDTranscribingColor.resolvedColor(lightBackground: false)
+    view.correctingColor = settings.recordingHUDCorrectingColor.resolvedColor(lightBackground: false)
     view.backgroundStyle = .dark
     view.showsCapsuleStroke = false
     view.mode = .recording
@@ -663,7 +667,8 @@ func exportRecordingHUDAnimationFrames(to directory: URL) throws {
             let revealStart = emptyLead
             let recordingStart = revealStart + RECORDING_HUD_ANIMATE_IN_SECONDS
             let transcribingStart = recordingStart + recordingDuration
-            let hideStart = transcribingStart + transcribingDuration
+            let correctingStart = transcribingStart + transcribingDuration
+            let hideStart = correctingStart + correctingDuration
             let tailStart = hideStart + RECORDING_HUD_ANIMATE_OUT_SECONDS
             let reveal: CGFloat
             let level: Float
@@ -688,21 +693,26 @@ func exportRecordingHUDAnimationFrames(to directory: URL) throws {
                 level = Float(min(0.94, 0.10 + (0.78 * syllables * phrasing * detail)))
                 mode = .recording
                 transcribingElapsed = nil
-            } else if time < hideStart {
+            } else if time < correctingStart {
                 reveal = 1
                 level = 0
                 mode = .transcribing
                 transcribingElapsed = CGFloat(time - transcribingStart)
+            } else if time < hideStart {
+                reveal = 1
+                level = 0
+                mode = .correcting
+                transcribingElapsed = nil
             } else if time < tailStart {
                 reveal = 1 - CGFloat((time - hideStart) / RECORDING_HUD_ANIMATE_OUT_SECONDS)
                 level = 0
-                mode = .transcribing
-                transcribingElapsed = CGFloat(time - transcribingStart)
+                mode = .correcting
+                transcribingElapsed = nil
             } else {
                 reveal = 0
                 level = 0
-                mode = .transcribing
-                transcribingElapsed = CGFloat(time - transcribingStart)
+                mode = .correcting
+                transcribingElapsed = nil
             }
             phase += recordingHUDPhaseSpeed(mode: mode, level: level)
                 / CGFloat(framesPerSecond)

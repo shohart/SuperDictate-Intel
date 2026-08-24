@@ -63,6 +63,7 @@ struct ControlPanelSettingsDraft: Equatable {
     var inputDevicePreference: String
     var recordingColor: RecordingHUDAccentColor
     var transcribingColor: RecordingHUDAccentColor
+    var correctingColor: RecordingHUDAccentColor
     var backgroundStyle: RecordingHUDBackgroundStyle
     var hudSize: RecordingHUDSize
     var hudDisplayMode: RecordingHUDDisplayMode
@@ -81,10 +82,20 @@ struct ControlPanelSettingsDraft: Equatable {
     var llmCustomBaseURL: String
     var llmCustomAPIKey: String
     var llmCustomModelName: String
-    var correctionModelTier: CorrectionModelTier
+    var correctionModel: BundledLLMModel
+    /// The correction system prompt AS SHOWN IN THE EDITOR: either the
+    /// stored override or (when none) the selected model's built-in
+    /// default, pre-filled so the user edits the standard text in place
+    /// instead of writing a replacement from scratch.
+    var correctionSystemPrompt: String
     var rewriteEnabled: Bool
     var rewriteStyle: RewriteStyle
-    var rewriteBundledModel: RewriteBundledModel
+    var rewriteBundledModel: BundledLLMModel
+    /// Per-style rewrite system prompts AS SHOWN IN THE EDITOR — one
+    /// independent editable prompt per rewrite mode (polish / task /
+    /// official), each pre-filled with its built-in default when no
+    /// override is stored.
+    var rewriteSystemPrompts: [RewriteStyle: String]
     var rewriteEngineBackend: LLMEngineBackend
     var rewriteCustomBaseURL: String
     var rewriteCustomAPIKey: String
@@ -102,6 +113,7 @@ struct ControlPanelSettingsDraft: Equatable {
         inputDevicePreference = audioInputDevice(matching: savedInput)?.uid ?? savedInput
         recordingColor = settings.recordingHUDRecordingColor
         transcribingColor = settings.recordingHUDTranscribingColor
+        correctingColor = settings.recordingHUDCorrectingColor
         backgroundStyle = settings.recordingHUDBackgroundStyle
         hudSize = settings.recordingHUDSize
         hudDisplayMode = settings.recordingHUDDisplayMode
@@ -120,10 +132,26 @@ struct ControlPanelSettingsDraft: Equatable {
         llmCustomBaseURL = settings.llmCustomBaseURL
         llmCustomAPIKey = settings.llmCustomAPIKey
         llmCustomModelName = settings.llmCustomModelName
-        correctionModelTier = settings.correctionModelTier
+        correctionModel = settings.correctionBundledModel
+        correctionSystemPrompt = {
+            let override = settings.correctionSystemPromptOverride
+            return override.isEmpty
+                ? LLMCorrectionPrompt.systemPrompt(vocabulary: [], model: settings.correctionBundledModel)
+                : override
+        }()
         rewriteEnabled = settings.rewriteEnabled
         rewriteStyle = settings.rewriteStyle
         rewriteBundledModel = settings.rewriteBundledModel
+        rewriteSystemPrompts = {
+            var map: [RewriteStyle: String] = [:]
+            for style in RewriteStyle.allCases {
+                let override = settings.rewriteSystemPromptOverride(for: style)
+                map[style] = override.isEmpty
+                    ? LLMRewritePrompt.systemPrompt(style: style)
+                    : override
+            }
+            return map
+        }()
         rewriteEngineBackend = settings.rewriteEngineBackend
         rewriteCustomBaseURL = settings.rewriteCustomBaseURL
         rewriteCustomAPIKey = settings.rewriteCustomAPIKey
@@ -163,15 +191,6 @@ enum LLMModelDownloadState: Equatable {
     case failed(String)
 }
 
-/// Which bundled LLM model a Settings download button refers to
-/// (docs/specs/rewrite-tiered-correction-spec.md §2): the fast VoiceScribe
-/// correction pair (~0.7 GB) or YandexGPT 5 Light (~4.9 GB, one file
-/// serving both the quality correction tier and bundled rewrite).
-enum LLMBundledModelKind: Equatable {
-    case fastCorrection
-    case yandex
-}
-
 private enum SettingsTab: Int, CaseIterable {
     case dictation
     case text
@@ -182,7 +201,7 @@ private enum SettingsTab: Int, CaseIterable {
 }
 
 @MainActor
-final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextFieldDelegate {
+final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextFieldDelegate, NSTextViewDelegate {
     private var window: NSWindow?
     private var settingsWindow: NSWindow?
     private lazy var vocabularyManagerWindowController = VocabularyManagerWindowController(store: Settings.shared.vocabularyStore)
@@ -202,13 +221,30 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
     private var llmModelDownloadState: LLMModelDownloadState = .idle
     private var llmModelDownloadTask: Task<Void, Never>?
     /// Which bundled LLM model an in-flight download is for (the Settings
-    /// UI offers two independently downloadable files: the fast VoiceScribe
-    /// pair and the YandexGPT 5 Light shared by quality correction + rewrite).
-    private var llmModelDownloadKind: LLMBundledModelKind = .fastCorrection
+    /// UI offers every benchmark-listed model as an independent download).
+    private var llmModelDownloadModel: BundledLLMModel = .voiceScribe
+    /// Which rewrite style's system prompt the editor is currently showing
+    /// (UI state only — never persisted; the persisted setting is the
+    /// ACTIVE rewrite style).
+    private var rewritePromptEditorStyle: RewriteStyle = .polish
     static let llmCustomBaseURLFieldTag = 9001
     static let llmCustomAPIKeyFieldTag = 9002
     static let llmCustomModelNameFieldTag = 9003
     static let rewriteCustomBaseURLFieldTag = 9004
+    // Prompt editors are NSTextViews; NSView.tag is get-only in Swift, so
+    // they are identified through NSUserInterfaceItemIdentifier instead.
+    static let correctionSystemPromptEditorID = NSUserInterfaceItemIdentifier("correction-system-prompt-editor")
+    static let rewriteSystemPromptEditorID = NSUserInterfaceItemIdentifier("rewrite-system-prompt-editor")
+
+    /// The built-in benchmark system prompt for a correction model — the
+    /// text the prompt editor pre-fills and resets to.
+    private func defaultCorrectionSystemPrompt(for model: BundledLLMModel) -> String {
+        LLMCorrectionPrompt.systemPrompt(vocabulary: [], model: model)
+    }
+
+    private func defaultRewriteSystemPrompt(for style: RewriteStyle) -> String {
+        LLMRewritePrompt.systemPrompt(style: style)
+    }
     static let rewriteCustomAPIKeyFieldTag = 9005
     static let rewriteCustomModelNameFieldTag = 9006
 
@@ -330,10 +366,17 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
             let hasUnsavedChanges = settingsDraft
                 .map { $0 != ControlPanelSettingsDraft(settings: settings) } ?? false
             if force || !hasUnsavedChanges {
-                settingsWindow.title = t("Настройки SuperDictate Next", "SuperDictate Next Settings")
+                settingsWindow.title = settingsWindowTitle()
                 settingsWindow.contentView = makeTabbedSettingsContentView()
             }
         }
+    }
+
+    /// Settings window title carries the running version, so a test/dev
+    /// build (CFBundleShortVersionString suffixed "-dev" by
+    /// scripts/build-test-app.sh) is unmistakable at a glance.
+    private func settingsWindowTitle() -> String {
+        t("Настройки SuperDictate Next", "SuperDictate Next Settings") + " · v" + currentBundleVersion()
     }
 
     private func resizeCompactPanel(_ window: NSWindow) {
@@ -519,6 +562,16 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
                        "Indicator color while speech is being transcribed.")
         ))
         root.addArrangedSubview(popupRow(
+            title: t("Цвет AI-улучшения", "AI polish color"),
+            detail: t("Второй цвет градиента анимации улучшения текста: волна перетекает слева направо от цвета транскрибации к этому цвету.",
+                      "Second color of the AI-improvement wave gradient: bars fade left-to-right from the transcribing color to this one."),
+            selectedValue: draft.correctingColor.rawValue,
+            options: RecordingHUDAccentColor.allCases.map { (localizedColorName($0), $0.rawValue) },
+            action: #selector(selectRecordingHUDCorrectingColor(_:)),
+            toolTip: t("Конечный цвет градиента анимации AI-улучшения.",
+                       "Gradient end color of the AI-improvement animation.")
+        ))
+        root.addArrangedSubview(popupRow(
             title: t("Фон капсулы", "HUD background"),
             detail: t("Системная тема или постоянный светлый/тёмный фон.",
                       "Follow the system appearance or use a fixed background."),
@@ -668,19 +721,15 @@ case .text:
                            "Turn correction on or off without opening Settings.")
             ))
             if draft.textPostprocessingMode == .correction {
-                content.addArrangedSubview(correctionModelTierRow(draft))
+                content.addArrangedSubview(correctionModelRow(draft))
                 content.addArrangedSubview(llmEngineBackendRow(draft))
                 switch draft.llmEngineBackend {
                 case .bundledLocal:
-                    switch draft.correctionModelTier {
-                    case .fast:
-                        content.addArrangedSubview(llmBundledModelStatusRow(kind: .fastCorrection))
-                    case .quality:
-                        content.addArrangedSubview(llmBundledModelStatusRow(kind: .yandex))
-                    }
+                    content.addArrangedSubview(llmBundledModelStatusRow(model: draft.correctionModel))
                 case .customEndpoint:
                     content.addArrangedSubview(llmCustomEndpointRows(draft))
                 }
+                content.addArrangedSubview(correctionPromptRow(draft))
             }
             // Rewrite section — fully independent toggles/endpoint from
             // correction (docs/specs/rewrite-tiered-correction-spec.md §1).
@@ -691,15 +740,11 @@ case .text:
                 content.addArrangedSubview(rewriteEngineBackendRow(draft))
                 switch draft.rewriteEngineBackend {
                 case .bundledLocal:
-                    switch draft.rewriteBundledModel {
-                    case .yandexGPT:
-                        content.addArrangedSubview(llmBundledModelStatusRow(kind: .yandex))
-                    case .voiceScribe:
-                        content.addArrangedSubview(llmBundledModelStatusRow(kind: .fastCorrection))
-                    }
+                    content.addArrangedSubview(llmBundledModelStatusRow(model: draft.rewriteBundledModel))
                 case .customEndpoint:
                     content.addArrangedSubview(rewriteCustomEndpointRows(draft))
                 }
+                content.addArrangedSubview(rewritePromptRow(draft))
             }
 
         case .audio:
@@ -747,6 +792,16 @@ case .text:
                 action: #selector(selectRecordingHUDTranscribingColor(_:)),
                 toolTip: t("Цвет индикатора во время распознавания речи.",
                            "Color used while speech is being transcribed.")
+            ))
+            content.addArrangedSubview(popupRow(
+                title: t("Цвет AI-улучшения", "AI polish color"),
+                detail: t("Второй цвет градиента анимации улучшения текста: волна перетекает слева направо от цвета транскрибации к этому цвету.",
+                          "Second color of the AI-improvement wave gradient: bars fade left-to-right from the transcribing color to this one."),
+                selectedValue: draft.correctingColor.rawValue,
+                options: RecordingHUDAccentColor.allCases.map { (localizedColorName($0), $0.rawValue) },
+                action: #selector(selectRecordingHUDCorrectingColor(_:)),
+                toolTip: t("Конечный цвет градиента анимации AI-улучшения.",
+                           "Gradient end color of the AI-improvement animation.")
             ))
             content.addArrangedSubview(popupRow(
                 title: t("Фон капсулы", "HUD background"),
@@ -2007,11 +2062,10 @@ header.addArrangedSubview(panelLabel(
         )
     }
 
-    /// Status + download row for a bundled LLM model file. `kind` picks
-    /// which: `.fastCorrection` = the VoiceScribe pair (Qwen3.5 0.8B Q6_K +
-    /// corrector LoRA, ~0.7 GB); `.yandex` = YandexGPT 5 Light (~4.9 GB,
-    /// shared by the quality correction tier and bundled rewrite).
-    private func llmBundledModelStatusRow(kind: LLMBundledModelKind) -> NSView {
+    /// Status + download row for a bundled LLM model file: shows the
+    /// model's benchmark digest and its on-disk size, ready/missing state,
+    /// and a Download/Re-download/Cancel button (tag carries the model).
+    private func llmBundledModelStatusRow(model: BundledLLMModel) -> NSView {
         let container = NSStackView()
         container.orientation = .vertical
         container.alignment = .leading
@@ -2026,35 +2080,20 @@ header.addArrangedSubview(panelLabel(
         text.orientation = .vertical
         text.alignment = .leading
         text.spacing = 3
-        let title: String
-        switch kind {
-        case .fastCorrection:
-            title = t("Модель быстрой коррекции", "Fast correction model")
-        case .yandex:
-            title = t("YandexGPT 5 Light", "YandexGPT 5 Light")
-        }
-        text.addArrangedSubview(panelLabel(title, size: 13, weight: .semibold))
+        text.addArrangedSubview(panelLabel(model.displayName, size: 13, weight: .semibold))
 
-        let modelReady: Bool
-        let readyText: String
-        let missingText: String
-        switch kind {
-        case .fastCorrection:
-            modelReady = gecModelCacheExists()
-            readyText = t("Готова (VoiceScribe: Qwen3.5 0.8B Q6_K + корректор LoRA, ~0,7 ГБ)",
-                          "Ready (VoiceScribe: Qwen3.5 0.8B Q6_K + corrector LoRA, ~0.7 GB)")
-            missingText = t("Не скачана (~0,7 ГБ, ~0,2 с на фразу)", "Not downloaded (~0.7 GB, ~0.2 s per phrase)")
-        case .yandex:
-            modelReady = yandexGPTModelCacheExists()
-            readyText = t("Готова (YandexGPT-5-Lite-8B Q4_K_M, ~4,9 ГБ)", "Ready (YandexGPT-5-Lite-8B Q4_K_M, ~4.9 GB)")
-            missingText = t("Не скачана (~4,9 ГБ) — качественная коррекция и реврайтинг", "Not downloaded (~4.9 GB) — quality correction and rewrite")
-        }
+        let sizeLabel = formattedByteCount(UInt64(bundledLLMModelDownloadSize(model)))
+        let modelReady = bundledLLMModelExists(model)
+        let readyText = t("Готова (\(model.benchmarkSummary))",
+                          "Ready (\(model.benchmarkSummary))")
+        let missingText = t("Не скачана (\(sizeLabel)) · \(model.benchmarkSummary)",
+                            "Not downloaded (\(sizeLabel)) · \(model.benchmarkSummary)")
 
         let statusText: String
         let statusColor: NSColor
-        // A download in flight is only shown by the row(s) for THAT model;
-        // the other model's row keeps its plain ready/missing status.
-        let downloadInFlight = llmModelDownloadTask != nil && llmModelDownloadKind == kind
+        // A download in flight is only shown by the row for THAT model;
+        // other models' rows keep their plain ready/missing status.
+        let downloadInFlight = llmModelDownloadTask != nil && llmModelDownloadModel == model
         if downloadInFlight, case .downloading = llmModelDownloadState {
             statusText = t("Скачивание…", "Downloading…")
             statusColor = .systemBlue
@@ -2074,10 +2113,11 @@ header.addArrangedSubview(panelLabel(
         } else {
             button = panelButton(
                 modelReady ? t("Скачать заново", "Re-download") : t("Скачать", "Download"),
-                action: kind == .fastCorrection
-                    ? #selector(startFastCorrectionModelDownload(_:))
-                    : #selector(startYandexModelDownload(_:))
+                action: #selector(startBundledModelDownloadClicked(_:))
             )
+            // The tag carries the model through the @objc selector
+            // (BundledLLMModel.allCases index — stable within a run).
+            button.tag = BundledLLMModel.allCases.firstIndex(of: model) ?? 0
         }
 
         row.addArrangedSubview(text)
@@ -2208,22 +2248,25 @@ header.addArrangedSubview(panelLabel(
         return container
     }
 
-    /// Fast vs quality bundled correction model picker
-    /// (docs/specs/rewrite-tiered-correction-spec.md §2). Benchmark
-    /// numbers in the detail line come from benchmark/REPORT.md; the "?"
-    /// button opens the same benchmark summary.
-    private func correctionModelTierRow(_ draft: ControlPanelSettingsDraft) -> NSView {
+    /// Bundled correction model picker — the benchmark's small-model class
+    /// (benchmark/REPORT.md correction table). Numbers in the detail line
+    /// come from the same report; the "?" button opens the benchmark
+    /// summary.
+    private func correctionModelRow(_ draft: ControlPanelSettingsDraft) -> NSView {
         popupRow(
             title: t("Модель коррекции", "Correction model"),
-            detail: t("Быстрая — VoiceScribe: ~0,2 с, мгновенная реакция. Качественная — YandexGPT 5 Light: заметно точнее (~4,9 ГБ).",
-                      "Fast — VoiceScribe: ~0.2 s, instant response. Quality — YandexGPT 5 Light: noticeably more accurate (~4.9 GB)."),
-            selectedValue: draft.correctionModelTier.rawValue,
-            options: [
-                (t("Быстрая (VoiceScribe)", "Fast (VoiceScribe)"), CorrectionModelTier.fast.rawValue),
-                (t("Качественная (YandexGPT 5 Light)", "Quality (YandexGPT 5 Light)"), CorrectionModelTier.quality.rawValue),
-            ],
-            action: #selector(selectCorrectionModelTier(_:)),
-            toolTip: t("Выбрать встроенную модель коррекции.", "Choose the bundled correction model."),
+            detail: t("Маленькие модели из замеров: VoiceScribe — мгновенная (0,19 с), Qwen3.5-4B — точнейшая из малых (EM 0,72). Подробности — кнопка «?».",
+                      "Small models from the benchmark: VoiceScribe — instant (0.19 s), Qwen3.5-4B — most accurate of the small ones (EM 0.72). Details — the \"?\" button."),
+            selectedValue: draft.correctionModel.rawValue,
+            options: BundledLLMModel.correctionModels.map { model in
+                (model == .voiceScribe
+                    ? t("\(model.displayName) — рекомендуется", "\(model.displayName) — recommended")
+                    : model.displayName,
+                 model.rawValue)
+            },
+            action: #selector(selectCorrectionBundledModel(_:)),
+            toolTip: t("Выбрать встроенную модель коррекции (замеры — кнопка «?»).",
+                       "Choose the bundled correction model (benchmark — the \"?\" button)."),
             showsHelp: true
         )
     }
@@ -2284,30 +2327,227 @@ header.addArrangedSubview(panelLabel(
         )
     }
 
-    /// Bundled rewrite model picker — mirrors the correction tier popup:
-    /// YandexGPT 5 Light (recommended, benchmark winner) or VoiceScribe
-    /// (reuses the fast correction pair; faster but compresses text).
+    /// Bundled rewrite model picker — the benchmark's big-model class
+    /// (benchmark/REPORT.md rewrite table): YandexGPT 5 Lite is the
+    /// measured winner (facts preserved, output length closest to input).
     private func rewriteModelRow(_ draft: ControlPanelSettingsDraft) -> NSView {
         popupRow(
             title: t("Модель реврайта", "Rewrite model"),
-            detail: t("YandexGPT 5 Light — лучший по замерам. VoiceScribe — быстрее, но сильнее сжимает текст и чаще теряет детали.",
-                      "YandexGPT 5 Light — best measured. VoiceScribe — faster, but compresses text more and drops details more often."),
+            detail: t("Большие модели из замеров: YandexGPT 5 Lite — лучший (факты 0,53, длина 0,97×). Подробности — кнопка «?».",
+                      "Big models from the benchmark: YandexGPT 5 Lite — the winner (fact recall 0.53, length 0.97×). Details — the \"?\" button."),
             selectedValue: draft.rewriteBundledModel.rawValue,
-            options: [
-                (t("YandexGPT 5 Light (рекомендуется)", "YandexGPT 5 Light (recommended)"), RewriteBundledModel.yandexGPT.rawValue),
-                (t("VoiceScribe (быстрая)", "VoiceScribe (fast)"), RewriteBundledModel.voiceScribe.rawValue),
-            ],
+            options: BundledLLMModel.rewriteModels.map { model in
+                let suffix: String
+                if model == .yandexGPT {
+                    suffix = t(" — рекомендуется", " — recommended")
+                } else if model == .lfm25 {
+                    // Not benchmark-tested for rewrite — offered experimentally.
+                    suffix = t(" — экспериментальная", " — experimental")
+                } else {
+                    suffix = ""
+                }
+                return ("\(model.displayName)\(suffix)", model.rawValue)
+            },
             action: #selector(selectRewriteBundledModel(_:)),
-            toolTip: t("Выбрать встроенную модель реврайта.", "Choose the bundled rewrite model."),
+            toolTip: t("Выбрать встроенную модель реврайта (замеры — кнопка «?»).",
+                       "Choose the bundled rewrite model (benchmark — the \"?\" button)."),
             showsHelp: true
         )
+    }
+
+    /// Editable SYSTEM prompt for the correction pass. Pre-filled with the
+    /// built-in benchmark default (or the stored override), so the user
+    /// edits the standard text in place. Read-only for models with a
+    /// mandatory prompt (Loqira).
+    private func correctionPromptRow(_ draft: ControlPanelSettingsDraft) -> NSView {
+        let model = draft.correctionModel
+        let locked = !model.allowsCustomSystemPrompt
+        let container = NSStackView()
+        container.orientation = .vertical
+        container.alignment = .leading
+        container.spacing = 6
+
+        let header = NSStackView()
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 10
+        header.addArrangedSubview(panelLabel(
+            t("Системный промпт коррекции", "Correction system prompt"),
+            size: 13,
+            weight: .semibold
+        ))
+        header.addArrangedSubview(NSView())
+        if !locked {
+            let isDefault = draft.correctionSystemPrompt == defaultCorrectionSystemPrompt(for: model)
+            let reset = panelButton(
+                t("Вернуть стандартный", "Reset to default"),
+                action: #selector(resetCorrectionPromptClicked(_:)),
+                enabled: !isDefault
+            )
+            reset.toolTip = t("Вернуть стандартный промпт бенчмарка для выбранной модели.",
+                              "Restore the benchmark default prompt for the selected model.")
+            header.addArrangedSubview(reset)
+        }
+        container.addArrangedSubview(header)
+
+        let field = promptEditorField(
+            text: draft.correctionSystemPrompt,
+            identifier: Self.correctionSystemPromptEditorID,
+            editable: !locked
+        )
+        container.addArrangedSubview(field)
+
+        let note: String
+        if locked {
+            note = t("У этой модели обязательный системный промпт — редактирование недоступно.",
+                     "This model has a mandatory system prompt — editing is disabled.")
+        } else {
+            note = t("Пустое поле нельзя сохранить: текст заменяет стандартный промпт бенчмарка для выбранной модели. Кнопка выше возвращает стандартный.",
+                     "This text replaces the benchmark default prompt for the selected model. The button above restores the standard.")
+        }
+        let noteLabel = panelLabel(note, size: 11, color: .secondaryLabelColor)
+        noteLabel.preferredMaxLayoutWidth = 440
+        container.addArrangedSubview(noteLabel)
+
+        NSLayoutConstraint.activate(container.arrangedSubviews.map {
+            $0.widthAnchor.constraint(equalTo: container.widthAnchor)
+        })
+        return container
+    }
+
+    /// Editable SYSTEM prompts for the rewrite pass — one INDEPENDENT
+    /// prompt per style (polish / structured task / official), each
+    /// pre-filled with its built-in default. The mini style switcher picks
+    /// which style's prompt is being edited; it is separate from the
+    /// active-style picker above.
+    private func rewritePromptRow(_ draft: ControlPanelSettingsDraft) -> NSView {
+        let container = NSStackView()
+        container.orientation = .vertical
+        container.alignment = .leading
+        container.spacing = 6
+
+        let header = NSStackView()
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 10
+        header.addArrangedSubview(panelLabel(
+            t("Системные промпты реврайта", "Rewrite system prompts"),
+            size: 13,
+            weight: .semibold
+        ))
+        header.addArrangedSubview(NSView())
+
+        let styleSwitcher = NSPopUpButton()
+        styleSwitcher.toolTip = t("Какой режим реврайта редактировать.",
+                                  "Which rewrite style's prompt to edit.")
+        for style in RewriteStyle.allCases {
+            styleSwitcher.addItem(withTitle: localizedRewriteStyleShortName(style))
+        }
+        styleSwitcher.selectItem(at: RewriteStyle.allCases.firstIndex(of: rewritePromptEditorStyle) ?? 0)
+        styleSwitcher.target = self
+        styleSwitcher.action = #selector(selectRewritePromptStyle(_:))
+        styleSwitcher.setContentHuggingPriority(.required, for: .horizontal)
+        header.addArrangedSubview(styleSwitcher)
+
+        let editingStyle = rewritePromptEditorStyle
+        let currentText = draft.rewriteSystemPrompts[editingStyle]
+            ?? defaultRewriteSystemPrompt(for: editingStyle)
+        let isDefault = currentText == defaultRewriteSystemPrompt(for: editingStyle)
+        let reset = panelButton(
+            t("Вернуть стандартный", "Reset to default"),
+            action: #selector(resetRewritePromptClicked(_:)),
+            enabled: !isDefault
+        )
+        reset.toolTip = t("Вернуть стандартный промпт бенчмарка для этого режима.",
+                          "Restore the benchmark default prompt for this style.")
+        header.addArrangedSubview(reset)
+        container.addArrangedSubview(header)
+
+        let field = promptEditorField(
+            text: currentText,
+            identifier: Self.rewriteSystemPromptEditorID,
+            editable: true
+        )
+        container.addArrangedSubview(field)
+
+        let noteLabel = panelLabel(
+            t("У каждого режима свой промпт: переключай режимы списком выше. Суффикс «Режим: …» в сообщении пользователя не редактируется.",
+              "Each style has its own prompt: switch styles with the list above. The «Режим: …» user-turn suffix is not editable."),
+            size: 11,
+            color: .secondaryLabelColor
+        )
+        noteLabel.preferredMaxLayoutWidth = 440
+        container.addArrangedSubview(noteLabel)
+
+        NSLayoutConstraint.activate(container.arrangedSubviews.map {
+            $0.widthAnchor.constraint(equalTo: container.widthAnchor)
+        })
+        return container
+    }
+
+    /// Multi-line, word-wrapping prompt editor: NSTextView in a scroll
+    /// view. (NSTextField's wrapping cell proved unreliable — the prompt
+    /// rendered as one long line.) Change tracking goes through
+    /// NSTextViewDelegate.textDidChange; the view's tag carries which
+    /// editor fired.
+    private func promptEditorField(text: String, identifier: NSUserInterfaceItemIdentifier, editable: Bool) -> NSScrollView {
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.borderType = .bezelBorder
+        let textView = NSTextView()
+        textView.isRichText = false
+        textView.font = NSFont.systemFont(ofSize: 12)
+        textView.textColor = .labelColor
+        textView.isEditable = editable
+        textView.isSelectable = true
+        textView.delegate = editable ? self : nil
+        textView.identifier = identifier
+        textView.string = text
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.textContainer?.widthTracksTextView = true
+        textView.autoresizingMask = [.width]
+        scrollView.documentView = textView
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.heightAnchor.constraint(equalToConstant: 96).isActive = true
+        return scrollView
+    }
+
+    private func localizedRewriteStyleShortName(_ style: RewriteStyle) -> String {
+        switch style {
+        case .polish: return t("Причесать", "Polish")
+        case .structuredTask: return t("Задача", "Task")
+        case .official: return t("Официальный", "Official")
+        }
+    }
+
+    @objc private func selectRewritePromptStyle(_ sender: NSPopUpButton) {
+        let index = sender.indexOfSelectedItem
+        guard RewriteStyle.allCases.indices.contains(index) else { return }
+        rewritePromptEditorStyle = RewriteStyle.allCases[index]
+        refreshSettingsWindow()
+    }
+
+    @objc private func resetCorrectionPromptClicked(_ sender: NSButton) {
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.correctionSystemPrompt = defaultCorrectionSystemPrompt(for: draft.correctionModel)
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
+    @objc private func resetRewritePromptClicked(_ sender: NSButton) {
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.rewriteSystemPrompts[rewritePromptEditorStyle] = defaultRewriteSystemPrompt(for: rewritePromptEditorStyle)
+        settingsDraft = draft
+        refreshSettingsWindow()
     }
 
     private func rewriteEngineBackendRow(_ draft: ControlPanelSettingsDraft) -> NSView {
         popupRow(
             title: t("Движок реврайта", "Rewrite engine"),
-            detail: t("Встроенная модель YandexGPT 5 Light работает локально. Свой сервер — любой OpenAI-совместимый эндпоинт, отдельный от коррекции.",
-                      "The built-in YandexGPT 5 Light runs locally. A custom server is any OpenAI-compatible endpoint, separate from correction."),
+            detail: t("Выбранная модель реврайта работает локально. Свой сервер — любой OpenAI-совместимый эндпоинт, отдельный от коррекции.",
+                      "The selected rewrite model runs locally. A custom server is any OpenAI-compatible endpoint, separate from correction."),
             selectedValue: draft.rewriteEngineBackend.rawValue,
             options: [
                 (t("Встроенная (локально)", "Built-in (local)"), LLMEngineBackend.bundledLocal.rawValue),
@@ -2334,11 +2574,18 @@ header.addArrangedSubview(panelLabel(
         refreshSettingsWindow()
     }
 
-    @objc private func selectCorrectionModelTier(_ sender: NSPopUpButton) {
+    @objc private func selectCorrectionBundledModel(_ sender: NSPopUpButton) {
         guard let raw = sender.selectedItem?.representedObject as? String,
-              let tier = CorrectionModelTier(rawValue: raw) else { return }
+              let model = BundledLLMModel(rawValue: raw),
+              BundledLLMModel.correctionModels.contains(model) else { return }
         var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
-        draft.correctionModelTier = tier
+        draft.correctionModel = model
+        // The prompt editor shows the EFFECTIVE prompt: with no stored
+        // override, switching models re-fills the editor with the new
+        // model's built-in default (a stored override keeps showing).
+        if settings.correctionSystemPromptOverride.isEmpty {
+            draft.correctionSystemPrompt = defaultCorrectionSystemPrompt(for: model)
+        }
         settingsDraft = draft
         refreshSettingsWindow()
     }
@@ -2361,43 +2608,28 @@ header.addArrangedSubview(panelLabel(
 
     @objc private func selectRewriteBundledModel(_ sender: NSPopUpButton) {
         guard let raw = sender.selectedItem?.representedObject as? String,
-              let model = RewriteBundledModel(rawValue: raw) else { return }
+              let model = BundledLLMModel(rawValue: raw),
+              BundledLLMModel.rewriteModels.contains(model) else { return }
         var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
         draft.rewriteBundledModel = model
         settingsDraft = draft
         refreshSettingsWindow()
     }
 
-    @objc private func selectRewriteEngineBackend(_ sender: NSPopUpButton) {
-        guard let raw = sender.selectedItem?.representedObject as? String,
-              let backend = LLMEngineBackend(rawValue: raw) else { return }
-        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
-        draft.rewriteEngineBackend = backend
-        settingsDraft = draft
-        refreshSettingsWindow()
+    @objc private func startBundledModelDownloadClicked(_ sender: NSButton) {
+        let index = sender.tag
+        guard BundledLLMModel.allCases.indices.contains(index) else { return }
+        startBundledModelDownload(model: BundledLLMModel.allCases[index])
     }
 
-    @objc private func startFastCorrectionModelDownload(_ sender: NSButton) {
-        startBundledModelDownload(kind: .fastCorrection)
-    }
-
-    @objc private func startYandexModelDownload(_ sender: NSButton) {
-        startBundledModelDownload(kind: .yandex)
-    }
-
-    private func startBundledModelDownload(kind: LLMBundledModelKind) {
+    private func startBundledModelDownload(model: BundledLLMModel) {
         guard llmModelDownloadTask == nil else { return }
-        llmModelDownloadKind = kind
+        llmModelDownloadModel = model
         llmModelDownloadState = .downloading
         refreshSettingsWindow()
-        llmModelDownloadTask = Task { [weak self, kind] in
+        llmModelDownloadTask = Task { [weak self, model] in
             do {
-                switch kind {
-                case .fastCorrection:
-                    _ = try await downloadCorrectionModelIfNeeded(tier: .fast)
-                case .yandex:
-                    _ = try await downloadYandexModelIfNeeded()
-                }
+                _ = try await downloadBundledLLMModelIfNeeded(model)
                 guard let self, !Task.isCancelled else { return }
                 self.llmModelDownloadState = .idle
             } catch is CancellationError {
@@ -2412,6 +2644,15 @@ header.addArrangedSubview(panelLabel(
             self.llmModelDownloadTask = nil
             self.refreshSettingsWindow()
         }
+    }
+
+    @objc private func selectRewriteEngineBackend(_ sender: NSPopUpButton) {
+        guard let raw = sender.selectedItem?.representedObject as? String,
+              let backend = LLMEngineBackend(rawValue: raw) else { return }
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.rewriteEngineBackend = backend
+        settingsDraft = draft
+        refreshSettingsWindow()
     }
 
     @objc private func cancelLLMModelDownload(_ sender: NSButton) {
@@ -2595,34 +2836,46 @@ header.addArrangedSubview(panelLabel(
     /// AMD Radeon RX 6600, llama.cpp/Vulkan, temperature 0).
     private func benchmarkHelpSummaryText() -> String {
         t("""
-        Замеры на этом Mac (AMD Radeon RX 6600, llama.cpp/Vulkan, 21 августа 2026 г.). Полный отчёт — benchmark/REPORT.md в репозитории.
+        Замеры на этом Mac (AMD Radeon RX 6600, llama.cpp/Vulkan, 21 августа 2026 г.). Полный отчёт с методикой — benchmark/REPORT.md в репозитории.
 
-        КОРРЕКЦИЯ
-        • VoiceScribe — быстрая: 0,19 с на фразу, точность (EM) 0,600, вес 0,7 ГБ. Для повседневной диктовки, где важна мгновенная реакция.
-        • YandexGPT 5 Light — качественная: 0,43 с, EM 0,892 (на 49% точнее), лучше исправляет термины и пунктуацию. Вес 4,9 ГБ.
-        • Лучшая из остальных в замерах — Gemma 4 E4B (EM 0,862), в сборку не включена.
+        КОРРЕКЦИЯ (маленькие модели; EM — доля идеально исправленных фраз)
+        • VoiceScribe V15 R-3 — EM 0,60, 0,19 с на фразу, 0,7 ГБ. Рекомендуется: мгновенная реакция для повседневной диктовки.
+        • Qwen3.5-4B Q6_K — EM 0,72 (лучшая из малых), 0,55 с, 3,8 ГБ.
+        • RuAdapt Qwen3-4B Q6_K — EM 0,68, 0,38 с, 3,3 ГБ.
+        • QVikhr-3-4B Q6_K — EM 0,60, 0,48 с, 3,3 ГБ.
+        • Ministral-3-3B Q6_K — EM 0,59, 0,38 с, 2,8 ГБ.
+        • Phi-4-mini Q6_K — EM 0,54, 0,34 с, 3,2 ГБ.
 
-        РЕВРАЙТ
-        • YandexGPT 5 Light — лучший: сохранение фактов 0,527, длина результата близка к исходной (0,97×), ~2,7 с на абзац. Рекомендуется.
-        • VoiceScribe — быстрее (~0,5 с), но сжимает текст до 0,6× и чаще теряет детали — экспериментальный вариант.
+        РЕВРАЙТ (большие модели; FactRec — сохранение фактов, длина — отношение к исходнику)
+        • YandexGPT 5 Lite 8B Q4_K_M — FactRec 0,53, длина 0,97×, ~2,7 с, 4,9 ГБ. Рекомендуется.
+        • Qwen3-8B Q4_K_M — FactRec 0,49, длина 1,26×, ~3,3 с, 5,0 ГБ.
+        • Qwen3.5-9B Q4_K_M — FactRec 0,49, длина 1,19×, ~3,2 с, 5,7 ГБ.
+        • Gemma 4 E4B Q4_0 — FactRec 0,48, длина 1,44×, ~2,3 с, 5,2 ГБ.
+        • LFM2.5-2.6B Q6_K — экспериментальная: на рерайт не замерялась; в замере коррекции думание было включено (10,8 с), в приложении оно принудительно выключено. 2,2 ГБ.
 
         СОВМЕСТНАЯ РАБОТА
-        Коррекция и реврайт независимы: при включении обеих текст сначала исправляется, затем переписывается. Обе модели занимают на диске ~5,6 ГБ.
+        Коррекция и реврайт независимы: при включении обеих текст сначала исправляется, затем переписывается. Каждая выбранная модель скачивается и хранится отдельно.
         """,
         """
-        Measured on this Mac (AMD Radeon RX 6600, llama.cpp/Vulkan, Aug 21, 2026). Full report — benchmark/REPORT.md in the repository.
+        Measured on this Mac (AMD Radeon RX 6600, llama.cpp/Vulkan, Aug 21, 2026). Full report with methodology — benchmark/REPORT.md in the repository.
 
-        CORRECTION
-        • VoiceScribe — fast: 0.19 s per phrase, accuracy (EM) 0.600, 0.7 GB. For everyday dictation where instant response matters.
-        • YandexGPT 5 Light — quality: 0.43 s, EM 0.892 (49% more accurate), better term and punctuation fixing. 4.9 GB.
-        • Best of the rest in the benchmark — Gemma 4 E4B (EM 0.862), not included in this build.
+        CORRECTION (small models; EM — share of perfectly corrected phrases)
+        • VoiceScribe V15 R-3 — EM 0.60, 0.19 s per phrase, 0.7 GB. Recommended: instant response for everyday dictation.
+        • Qwen3.5-4B Q6_K — EM 0.72 (best of the small ones), 0.55 s, 3.8 GB.
+        • RuAdapt Qwen3-4B Q6_K — EM 0.68, 0.38 s, 3.3 GB.
+        • QVikhr-3-4B Q6_K — EM 0.60, 0.48 s, 3.3 GB.
+        • Ministral-3-3B Q6_K — EM 0.59, 0.38 s, 2.8 GB.
+        • Phi-4-mini Q6_K — EM 0.54, 0.34 s, 3.2 GB.
 
-        REWRITE
-        • YandexGPT 5 Light — best: fact recall 0.527, output length close to input (0.97×), ~2.7 s per paragraph. Recommended.
-        • VoiceScribe — faster (~0.5 s) but compresses text to 0.6× and drops details more often — experimental.
+        REWRITE (big models; FactRec — fact preservation, length — output vs input ratio)
+        • YandexGPT 5 Lite 8B Q4_K_M — FactRec 0.53, length 0.97×, ~2.7 s, 4.9 GB. Recommended.
+        • Qwen3-8B Q4_K_M — FactRec 0.49, length 1.26×, ~3.3 s, 5.0 GB.
+        • Qwen3.5-9B Q4_K_M — FactRec 0.49, length 1.19×, ~3.2 s, 5.7 GB.
+        • Gemma 4 E4B Q4_0 — FactRec 0.48, length 1.44×, ~2.3 s, 5.2 GB.
+        • LFM2.5-2.6B Q6_K — experimental: never benchmarked for rewrite; its correction benchmark ran with thinking ON (10.8 s), which the app forces off. 2.2 GB.
 
         WORKING TOGETHER
-        Correction and rewrite are independent: with both enabled, text is corrected first, then rewritten. Both models take ~5.6 GB of disk.
+        Correction and rewrite are independent: with both enabled, text is corrected first, then rewritten. Each selected model downloads and stores separately.
         """)
     }
 
@@ -3074,7 +3327,7 @@ header.addArrangedSubview(panelLabel(
             backing: .buffered,
             defer: false
         )
-        settingsWindow.title = t("Настройки SuperDictate Next", "SuperDictate Next Settings")
+        settingsWindow.title = settingsWindowTitle()
         settingsWindow.contentMinSize = NSSize(width: 680, height: 560)
         settingsWindow.contentMaxSize = NSSize(width: 680, height: 560)
         settingsWindow.isReleasedWhenClosed = false
@@ -3339,6 +3592,15 @@ header.addArrangedSubview(panelLabel(
         refreshSettingsWindow()
     }
 
+    @objc private func selectRecordingHUDCorrectingColor(_ sender: NSPopUpButton) {
+        guard let raw = sender.selectedItem?.representedObject as? String,
+              let color = RecordingHUDAccentColor(rawValue: raw) else { return }
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.correctingColor = color
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
     @objc private func selectRecordingHUDBackgroundStyle(_ sender: NSPopUpButton) {
         guard let raw = sender.selectedItem?.representedObject as? String,
               let style = RecordingHUDBackgroundStyle(rawValue: raw) else { return }
@@ -3394,6 +3656,25 @@ header.addArrangedSubview(panelLabel(
     /// view and would drop keyboard focus on every keystroke. Only the
     /// Save/Discard button state needs to react live, and
     /// `updateSettingsSaveState()` already does that without a rebuild.
+    /// Prompt editors are NSTextViews (see promptEditorField) — their
+    /// edits arrive here, NOT through controlTextDidChange. Updates the
+    /// draft WITHOUT rebuilding the window (a rebuild would reset the
+    /// caret mid-typing).
+    func textDidChange(_ notification: Notification) {
+        guard let textView = notification.object as? NSTextView else { return }
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        switch textView.identifier {
+        case Self.correctionSystemPromptEditorID:
+            draft.correctionSystemPrompt = textView.string
+        case Self.rewriteSystemPromptEditorID:
+            draft.rewriteSystemPrompts[rewritePromptEditorStyle] = textView.string
+        default:
+            return
+        }
+        settingsDraft = draft
+        updateSettingsSaveState()
+    }
+
     func controlTextDidChange(_ obj: Notification) {
         guard let field = obj.object as? NSTextField else { return }
         var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
@@ -3430,6 +3711,7 @@ header.addArrangedSubview(panelLabel(
         settings.inputDevice = draft.inputDevicePreference
         settings.recordingHUDRecordingColor = draft.recordingColor
         settings.recordingHUDTranscribingColor = draft.transcribingColor
+        settings.recordingHUDCorrectingColor = draft.correctingColor
         settings.recordingHUDBackgroundStyle = draft.backgroundStyle
         settings.recordingHUDSize = draft.hudSize
         settings.recordingHUDDisplayMode = draft.hudDisplayMode
@@ -3447,7 +3729,23 @@ header.addArrangedSubview(panelLabel(
         settings.llmCustomBaseURL = draft.llmCustomBaseURL
         settings.llmCustomAPIKey = draft.llmCustomAPIKey
         settings.llmCustomModelName = draft.llmCustomModelName
-        settings.correctionModelTier = draft.correctionModelTier
+        settings.correctionBundledModel = draft.correctionModel
+        // Prompt editors: text identical to the built-in default is stored
+        // as EMPTY (no override), so "reset to default" and "typed the
+        // default back in" converge on the same state.
+        let correctionPromptDefault = defaultCorrectionSystemPrompt(for: draft.correctionModel)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let correctionPromptText = draft.correctionSystemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        settings.correctionSystemPromptOverride = correctionPromptText == correctionPromptDefault ? "" : draft.correctionSystemPrompt
+        for style in RewriteStyle.allCases {
+            let styleDefault = defaultRewriteSystemPrompt(for: style)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let styleText = (draft.rewriteSystemPrompts[style] ?? styleDefault)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            settings.setRewriteSystemPromptOverride(
+                styleText == styleDefault ? "" : (draft.rewriteSystemPrompts[style] ?? styleDefault),
+                for: style)
+        }
         settings.rewriteEnabled = draft.rewriteEnabled
         settings.rewriteStyle = draft.rewriteStyle
         settings.rewriteBundledModel = draft.rewriteBundledModel

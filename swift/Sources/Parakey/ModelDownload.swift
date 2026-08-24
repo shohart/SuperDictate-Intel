@@ -469,48 +469,206 @@ func downloadYandexModelIfNeeded() async throws -> URL {
     )
 }
 
-// MARK: - Tier-aware bundled-model resolution
+// MARK: - Benchmark model pins (2026-08-21, benchmark/REPORT.md)
+//
+// Every pin below was verified by hashing the exact local file the
+// benchmark ran on (benchmark/models/) and cross-checking that SHA256
+// against the repo's LFS metadata — the app downloads the exact bytes the
+// benchmark validated. Same policy as the GEC/YandexGPT pins above.
 
-/// The bundled model file the correction pass loads for `tier`:
-/// `.fast` → the VoiceScribe pair's base GGUF (LoRA applied on top by the
-/// host via correctionBundledLoraPath); `.quality` → YandexGPT-5-Lite-8B.
-func correctionBundledModelPath(tier: CorrectionModelTier) -> URL {
-    switch tier {
-    case .fast: return gecModelPath()
-    case .quality: return yandexGPTModelPath()
+struct BundledLLMModelPin {
+    let repository: String
+    let revision: String
+    let remoteFileName: String
+    let sha256: String
+    let sizeBytes: Int64
+
+    var url: URL {
+        URL(string: "https://huggingface.co/\(repository)/resolve/\(revision)/\(remoteFileName)")!
     }
 }
 
-/// The LoRA adapter the bundled correction host must load for `tier`
-/// (empty STRING = none; never an empty URL — `URL(fileURLWithPath:"").path`
-/// silently resolves to the process working directory). Only the fast tier
-/// has one (VoiceScribe V15 R-3, rsLoRA-compensated scale — see
-/// GEC_LORA_SCALE).
-func correctionBundledLoraPath(tier: CorrectionModelTier) -> String {
-    switch tier {
-    case .fast: return gecLoraPath().path
-    case .quality: return ""
+func bundledLLMModelPin(_ model: BundledLLMModel) -> BundledLLMModelPin {
+    switch model {
+    case .voiceScribe:
+        return BundledLLMModelPin(
+            repository: GEC_MODEL_REPOSITORY,
+            revision: GEC_MODEL_REVISION,
+            remoteFileName: GEC_MODEL_FILENAME,
+            sha256: GEC_MODEL_SHA256,
+            sizeBytes: GEC_MODEL_SIZE_BYTES)
+    case .yandexGPT:
+        return BundledLLMModelPin(
+            repository: YANDEXGPT_MODEL_REPOSITORY,
+            revision: YANDEXGPT_MODEL_REVISION,
+            remoteFileName: YANDEXGPT_MODEL_FILENAME,
+            sha256: YANDEXGPT_MODEL_SHA256,
+            sizeBytes: YANDEXGPT_MODEL_SIZE_BYTES)
+    case .qwen35_4b:
+        return BundledLLMModelPin(
+            repository: "bartowski/Qwen_Qwen3.5-4B-GGUF",
+            revision: "4168f45a16a1290d65a4ec0fa312ae917a4c15d6",
+            remoteFileName: "Qwen_Qwen3.5-4B-Q6_K.gguf",
+            sha256: "5a5bc7a3f9375b395e9f81fb69109038cf160c84606b8192f13cbb8355ca59f2",
+            sizeBytes: 3_805_358_048)
+    case .ruAdapt4b:
+        // NB: the repo names its quant files bare ("Q6_K.gguf") — the
+        // local cache filename below keeps the model name for clarity.
+        return BundledLLMModelPin(
+            repository: "RefalMachine/RuadaptQwen3-4B-Instruct-GGUF",
+            revision: "0cf4a934b379b3d070116164aaa6e5db1c7d4198",
+            remoteFileName: "Q6_K.gguf",
+            sha256: "a206b1994822653e1da29ce76e96dc57f0f2a899f09a44466b94d3c043b82d29",
+            sizeBytes: 3_295_488_128)
+    case .qvikhr4b:
+        return BundledLLMModelPin(
+            repository: "Vikhrmodels/QVikhr-3-4B-Instruction-GGUF",
+            revision: "ab5a2e9090cd1643ea48f3eb86d7b8fde8df8db6",
+            remoteFileName: "QVikhr-3-4B-Instruction-Q6_K.gguf",
+            sha256: "4b75f6682b1d84c9048f54ffe5ddb54c7c5202afccb4121d027b59c227c31076",
+            sizeBytes: 3_306_261_568)
+    case .ministral3b:
+        return BundledLLMModelPin(
+            repository: "unsloth/Ministral-3-3B-Instruct-2512-GGUF",
+            revision: "7564922f37fa5bbb62b87f09a55c12f1f91d7a6a",
+            remoteFileName: "Ministral-3-3B-Instruct-2512-Q6_K.gguf",
+            sha256: "ca22c676b97aad1d50952416f44ddd6d8130e24c11c474aed5e8865dd7e35297",
+            sizeBytes: 2_821_256_480)
+    case .phi4mini:
+        return BundledLLMModelPin(
+            repository: "unsloth/Phi-4-mini-instruct-GGUF",
+            revision: "78eb92a46fc37e6b524df991ed9aca9bc6aa7b80",
+            remoteFileName: "Phi-4-mini-instruct-Q6_K.gguf",
+            sha256: "72b8446a3db55617950bef48d296659050867cca41bd7a7be4622010c9589400",
+            sizeBytes: 3_155_622_880)
+    case .loqira:
+        return BundledLLMModelPin(
+            repository: "loqira/Qwen3.5-0.8B-GEC-KAZ-RUS-ENG",
+            revision: "ced469768d40dffc899fe459efb66a4a07aeabee",
+            remoteFileName: "Qwen3.5-0.8B-GEC-KAZ-RUS-ENG.Q4_0.gguf",
+            sha256: "893f573db88f587e823b66847e06049cdb3029eff6177d92f6577179f7178871",
+            sizeBytes: 563_035_616)
+    case .vanilla08b:
+        // The VoiceScribe base WITHOUT the LoRA — literally the same pinned
+        // file as the GEC base weights.
+        return BundledLLMModelPin(
+            repository: GEC_MODEL_REPOSITORY,
+            revision: GEC_MODEL_REVISION,
+            remoteFileName: GEC_MODEL_FILENAME,
+            sha256: GEC_MODEL_SHA256,
+            sizeBytes: GEC_MODEL_SIZE_BYTES)
+    case .lfm25:
+        return BundledLLMModelPin(
+            repository: "LiquidAI/LFM2.5-2.6B-GGUF",
+            revision: "f4a289c8a200a5ca71005ba7abc2dad33058a450",
+            remoteFileName: "LFM2.5-2.6B-Q6_K.gguf",
+            sha256: "2e74b1a0979a4a1936a408445147d103b8f15b2e2ec31c65fa0166f9069c250d",
+            sizeBytes: 2_221_615_104)
+    case .gemma4e4b:
+        return BundledLLMModelPin(
+            repository: "google/gemma-4-E4B-it-qat-q4_0-gguf",
+            revision: "4b4a2c1d584be7264f87aac328a1bc739ce81b6c",
+            remoteFileName: "gemma-4-E4B_q4_0-it.gguf",
+            sha256: "676c35070db6dbe52f93e9c864ee0fba4eddea94b9c875d9cb10daff453fbaee",
+            sizeBytes: 5_154_941_280)
+    case .qwen35_9b:
+        return BundledLLMModelPin(
+            repository: "unsloth/Qwen3.5-9B-GGUF",
+            revision: "3885219b6810b007914f3a7950a8d1b469d598a5",
+            remoteFileName: "Qwen3.5-9B-Q4_K_M.gguf",
+            sha256: "03b74727a860a56338e042c4420bb3f04b2fec5734175f4cb9fa853daf52b7e8",
+            sizeBytes: 5_680_522_464)
     }
 }
 
-/// Whether every file the bundled correction pass needs for `tier` is
-/// present and size-verified in the LLM cache.
-func correctionBundledModelExists(tier: CorrectionModelTier) -> Bool {
-    switch tier {
-    case .fast: return gecModelCacheExists()
-    case .quality: return yandexGPTModelCacheExists()
+/// Local cache filename per model — usually the remote name; the bare-named
+/// RuAdapt repo file ("Q6_K.gguf") is stored under a model-qualified name so
+/// it can never collide with another bare-named download.
+func bundledLLMModelCacheFileName(_ model: BundledLLMModel) -> String {
+    switch model {
+    case .ruAdapt4b: return "RuadaptQwen3-4B-Instruct-Q6_K.gguf"
+    default: return bundledLLMModelPin(model).remoteFileName
     }
 }
 
-/// On-demand download for whichever files `tier`'s bundled correction
-/// pass needs (no-op returning the cached file when already verified).
+func bundledLLMModelPath(_ model: BundledLLMModel) -> URL {
+    llmModelCacheDirectory().appendingPathComponent(bundledLLMModelCacheFileName(model),
+                                                    isDirectory: false)
+}
+
+/// The LoRA adapter the host must load for `model` (empty STRING = none;
+/// never an empty URL — `URL(fileURLWithPath: "").path` silently resolves
+/// to the process working directory). Only VoiceScribe has one (rsLoRA-
+/// compensated scale — see GEC_LORA_SCALE).
+func bundledLLMLoraPath(_ model: BundledLLMModel) -> String {
+    model.usesLoRAAdapter ? gecLoraPath().path : ""
+}
+
+func bundledLLMLoraScale(_ model: BundledLLMModel) -> Double {
+    model.usesLoRAAdapter ? GEC_LORA_SCALE : 1.0
+}
+
+/// Whether every file the bundled pass needs for `model` is present and
+/// size-verified in the LLM cache.
+func bundledLLMModelExists(_ model: BundledLLMModel) -> Bool {
+    let pin = bundledLLMModelPin(model)
+    let path = bundledLLMModelPath(model)
+    guard isPlainRegularFile(path.path),
+          let attributes = try? FileManager.default.attributesOfItem(atPath: path.path),
+          (attributes[.size] as? Int64) == pin.sizeBytes else {
+        return false
+    }
+    if model.usesLoRAAdapter {
+        return gecModelCacheExists() // base pair check includes the LoRA
+    }
+    return true
+}
+
+/// Total bytes a model's download needs (model file + LoRA when present).
+func bundledLLMModelDownloadSize(_ model: BundledLLMModel) -> Int64 {
+    bundledLLMModelPin(model).sizeBytes + (model.usesLoRAAdapter ? GEC_LORA_SIZE_BYTES : 0)
+}
+
+func assertSufficientDiskSpaceForBundledModel(_ model: BundledLLMModel) throws {
+    let requiredBytes = bundledLLMModelDownloadSize(model) + MODEL_DOWNLOAD_HEADROOM_BYTES
+    let availableBytes = availableImportantDiskSpaceBytes(containing: llmModelCacheDirectory())
+    guard let availableBytes, availableBytes >= 0, availableBytes < requiredBytes else {
+        return
+    }
+    let detail = """
+    Parakey needs about \(formattedByteCount(UInt64(bundledLLMModelDownloadSize(model)))) of free disk space to download \(model.displayName).
+
+    Available: \(formattedByteCount(UInt64(availableBytes)))
+    Needed: \(formattedByteCount(UInt64(requiredBytes)))
+
+    Free some disk space, then retry.
+    """
+    throw NSError(domain: "Parakey", code: -10, userInfo: [NSLocalizedDescriptionKey: detail])
+}
+
+/// On-demand download for whichever files `model`'s bundled pass needs
+/// (no-op returning the cached file when already verified).
 @discardableResult
-func downloadCorrectionModelIfNeeded(tier: CorrectionModelTier) async throws -> URL {
-    switch tier {
-    case .fast: return try await downloadGECModelIfNeeded()
-    case .quality: return try await downloadYandexModelIfNeeded()
+func downloadBundledLLMModelIfNeeded(_ model: BundledLLMModel) async throws -> URL {
+    if model == .voiceScribe {
+        // VoiceScribe is the two-file pair (base + LoRA) — its dedicated
+        // downloader already handles both pins and the disk-space check.
+        return try await downloadGECModelIfNeeded()
     }
+    if model == .yandexGPT {
+        return try await downloadYandexModelIfNeeded()
+    }
+    try assertSufficientDiskSpaceForBundledModel(model)
+    let pin = bundledLLMModelPin(model)
+    return try await downloadGECFileIfNeeded(
+        existingDescription: model.displayName,
+        destination: bundledLLMModelPath(model),
+        remoteURL: pin.url,
+        expectedSize: pin.sizeBytes,
+        expectedSHA256: pin.sha256
+    )
 }
+
 
 private func resolvedParakeetSupportDirectory(_ override: URL?) -> URL? {
     override

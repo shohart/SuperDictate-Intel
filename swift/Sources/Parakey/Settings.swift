@@ -46,6 +46,7 @@ final class Settings: @unchecked Sendable {
     private static let keyShowRecordingWaveform = "show_recording_waveform"
     private static let keyRecordingHUDRecordingColor = "recording_hud_recording_color"
     private static let keyRecordingHUDTranscribingColor = "recording_hud_transcribing_color"
+    private static let keyRecordingHUDCorrectingColor = "recording_hud_correcting_color"
     private static let keyRecordingHUDBackgroundStyle = "recording_hud_background_style"
     private static let keyRecordingHUDSize = "recording_hud_size"
     private static let keyRecordingHUDDisplayMode = "recording_hud_display_mode"
@@ -100,9 +101,15 @@ final class Settings: @unchecked Sendable {
     // two separately-toggleable functions, each able to point at its own
     // OpenAI-compatible endpoint.
     private static let keyCorrectionModelTier = "correction_model_tier_v1"
+    private static let keyCorrectionBundledModel = "correction_bundled_model_v2"
     private static let keyRewriteEnabled = "rewrite_enabled_v1"
     private static let keyRewriteStyle = "rewrite_style_v1"
     private static let keyRewriteBundledModel = "rewrite_bundled_model_v1"
+    private static let keyRewriteBundledModelV2 = "rewrite_bundled_model_v2"
+    private static let keyCorrectionSystemPrompt = "correction_system_prompt_v1"
+    private static func keyRewriteSystemPrompt(_ style: RewriteStyle) -> String {
+        "rewrite_system_prompt_\(style.rawValue)_v1"
+    }
     private static let keyRewriteEngineBackend = "rewrite_engine_backend_v1"
     private static let keyRewriteCustomBaseURL = "rewrite_custom_base_url_v1"
     private static let keyRewriteCustomAPIKey = "rewrite_custom_api_key_v1"
@@ -534,6 +541,24 @@ final class Settings: @unchecked Sendable {
         }
     }
 
+    /// Second accent of the `.correcting` (LLM improvement) HUD animation: the
+    /// bars form a left->right gradient from `recordingHUDTranscribingColor`
+    /// to this color, so the AI pass reads as the transcription wave being
+    /// "re-written" into a new color.
+    var recordingHUDCorrectingColor: RecordingHUDAccentColor {
+        get {
+            guard let raw = defaults.string(forKey: Self.keyRecordingHUDCorrectingColor),
+                  let color = RecordingHUDAccentColor(rawValue: raw) else {
+                return .purple
+            }
+            return color
+        }
+        set {
+            defaults.set(newValue.rawValue, forKey: Self.keyRecordingHUDCorrectingColor)
+            defaults.synchronize()
+        }
+    }
+
     var recordingHUDBackgroundStyle: RecordingHUDBackgroundStyle {
         get {
             guard let raw = defaults.string(forKey: Self.keyRecordingHUDBackgroundStyle),
@@ -946,14 +971,19 @@ final class Settings: @unchecked Sendable {
         set { defaults.set(newValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Self.keyLLMCustomModelName) }
     }
 
-    /// Which bundled correction model the correction pass uses when its
-    /// backend is `.bundledLocal` — `.fast` (VoiceScribe, default; this
-    /// branch's fixed choice for fast correction) or `.quality`
-    /// (YandexGPT-5-Lite-8B, on-demand ~4.9 GB download). Stored
-    /// independently of the rewrite keys below.
-    var correctionModelTier: CorrectionModelTier {
-        get { normalizedCorrectionModelTier(rawValue: defaults.string(forKey: Self.keyCorrectionModelTier)) }
-        set { defaults.set(newValue.rawValue, forKey: Self.keyCorrectionModelTier) }
+    /// Which bundled model the correction pass loads when its backend is
+    /// `.bundledLocal` — one of BundledLLMModel.correctionModels (the
+    /// benchmark's small-model class; benchmark/REPORT.md). Defaults to
+    /// VoiceScribe. Reads migrate the retired tier key
+    /// (`correction_model_tier_v1`: "fast" → VoiceScribe, "quality" →
+    /// Qwen3.5-4B, the best small model by EM).
+    var correctionBundledModel: BundledLLMModel {
+        get {
+            normalizedCorrectionBundledModel(
+                rawValue: defaults.string(forKey: Self.keyCorrectionBundledModel),
+                legacyTier: defaults.string(forKey: Self.keyCorrectionModelTier))
+        }
+        set { defaults.set(newValue.rawValue, forKey: Self.keyCorrectionBundledModel) }
     }
 
     /// Rewrite on/off — deliberately a SEPARATE toggle from
@@ -965,19 +995,48 @@ final class Settings: @unchecked Sendable {
         set { defaults.set(newValue, forKey: Self.keyRewriteEnabled) }
     }
 
+    /// User-edited SYSTEM prompt for the correction pass. Empty string =
+    /// use the built-in benchmark default for the selected model (the
+    /// Settings UI pre-fills the editor with that default, so an override
+    /// is stored only after an actual edit). NEVER applied for models with
+    /// a mandatory system prompt (BundledLLMModel.allowsCustomSystemPrompt
+    /// == false, i.e. Loqira) — the pipeline enforces that, not the store.
+    var correctionSystemPromptOverride: String {
+        get { defaults.string(forKey: Self.keyCorrectionSystemPrompt) ?? "" }
+        set { defaults.set(newValue, forKey: Self.keyCorrectionSystemPrompt) }
+    }
+
+    /// User-edited SYSTEM prompt for ONE rewrite style. Empty string = use
+    /// the built-in benchmark default for that style. Three independent
+    /// prompts — polish / structured task / official — per the product
+    /// decision that each rewrite mode keeps its own editable prompt.
+    func rewriteSystemPromptOverride(for style: RewriteStyle) -> String {
+        defaults.string(forKey: Self.keyRewriteSystemPrompt(style)) ?? ""
+    }
+
+    func setRewriteSystemPromptOverride(_ value: String, for style: RewriteStyle) {
+        defaults.set(value, forKey: Self.keyRewriteSystemPrompt(style))
+    }
+
     var rewriteStyle: RewriteStyle {
         get { normalizedRewriteStyle(rawValue: defaults.string(forKey: Self.keyRewriteStyle)) }
         set { defaults.set(newValue.rawValue, forKey: Self.keyRewriteStyle) }
     }
 
     /// Which bundled model the rewrite pass loads when
-    /// rewriteEngineBackend is `.bundledLocal` — the Settings dropdown
-    /// next to the style picker. `.yandexGPT` (default, benchmark winner)
-    /// or `.voiceScribe` (reuses the fast correction pair — faster but
-    /// compresses text, experimental).
-    var rewriteBundledModel: RewriteBundledModel {
-        get { normalizedRewriteBundledModel(rawValue: defaults.string(forKey: Self.keyRewriteBundledModel)) }
-        set { defaults.set(newValue.rawValue, forKey: Self.keyRewriteBundledModel) }
+    /// rewriteEngineBackend is `.bundledLocal` — one of
+    /// BundledLLMModel.rewriteModels (the benchmark's big-model class;
+    /// benchmark/REPORT.md). Defaults to YandexGPT (benchmark winner).
+    /// Reads migrate the retired v1 picker (`voicescribe` → YandexGPT:
+    /// the report shows VoiceScribe compresses rewrite output to 0.6×, so
+    /// it is no longer offered for this pass).
+    var rewriteBundledModel: BundledLLMModel {
+        get {
+            normalizedRewriteBundledModel(
+                rawValue: defaults.string(forKey: Self.keyRewriteBundledModelV2),
+                legacyModel: defaults.string(forKey: Self.keyRewriteBundledModel))
+        }
+        set { defaults.set(newValue.rawValue, forKey: Self.keyRewriteBundledModelV2) }
     }
 
     /// Backend for the rewrite pass — its own selector, independent from

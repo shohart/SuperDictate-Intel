@@ -48,38 +48,31 @@ actor LLMPostprocessingCoordinator {
     private var hostProcesses: [String: LLMHostProcess] = [:]
     private var pendingUnloadTask: Task<Void, Never>?
 
-    /// Host identity for the bundled correction model of `tier` — the
-    /// cache-key under which its LLMHostProcess lives. Tiers without a
-    /// LoRA (quality/YandexGPT) contribute an empty trailing component,
-    /// which — deliberately — makes their identity IDENTICAL to
-    /// rewriteHostIdentity(): both resolve to the same YandexGPT file, so
-    /// both functions share one host process. (NB: never build this from
+    /// Host identity for the bundled correction model — the cache-key under
+    /// which its LLMHostProcess lives. Models without a LoRA contribute an
+    /// empty trailing component (NB: never build this from
     /// `URL(fileURLWithPath: "").path` — that resolves to the process's
-    /// current working directory, not the empty string.)
-    static func correctionHostIdentity(tier: CorrectionModelTier) -> String {
-        correctionBundledModelPath(tier: tier).path + "|" + correctionBundledLoraPath(tier: tier)
+    /// current working directory, not the empty string).
+    static func correctionHostIdentity(model: BundledLLMModel) -> String {
+        bundledLLMModelPath(model).path + "|" + bundledLLMLoraPath(model)
     }
 
-    /// Host identity for the bundled rewrite model — deliberately
-    /// IDENTICAL to the equivalent correction tier's identity (see
-    /// RewriteBundledModel.correctionTierEquivalent): one YandexGPT host
-    /// serves both the quality correction tier and yandexGPT rewrite, and
-    /// one 0.8B host serves both fast correction and voiceScribe rewrite.
-    /// Sharing is safe — the host serializes requests internally, and the
-    /// correction/rewrite stages are sequential anyway.
-    static func rewriteHostIdentity(model: RewriteBundledModel) -> String {
-        correctionHostIdentity(tier: model.correctionTierEquivalent)
+    /// Host identity for the bundled rewrite model — same path-based rule
+    /// as correction, so picking the SAME bundled model for both passes
+    /// would share one host (the pickers offer disjoint model lists, so in
+    /// practice each pass runs its own host).
+    static func rewriteHostIdentity(model: BundledLLMModel) -> String {
+        bundledLLMModelPath(model).path + "|" + bundledLLMLoraPath(model)
     }
 
     /// The set of host identities the still-enabled functions need under
     /// `settings` right now — the keep-set the delayed-unload logic trims
-    /// against (a host nobody needs gets stopped; a shared YandexGPT host
-    /// survives a correction-only toggle-off while rewrite still uses it).
+    /// against (a host nobody needs gets stopped).
     static func neededHostIdentities(settings: Settings) -> Set<String> {
         var needed = Set<String>()
         if settings.textPostprocessingMode == .correction,
            settings.llmEngineBackend == .bundledLocal {
-            needed.insert(correctionHostIdentity(tier: settings.correctionModelTier))
+            needed.insert(correctionHostIdentity(model: settings.correctionBundledModel))
         }
         if settings.rewriteEnabled,
            settings.rewriteEngineBackend == .bundledLocal {
@@ -225,23 +218,17 @@ actor LLMPostprocessingCoordinator {
     }
 
     private func correctedViaBundledHost(_ text: String, settings: Settings) async -> String {
-        let tier = settings.correctionModelTier
-        guard correctionBundledModelExists(tier: tier) else {
-            log("LLM postprocessing: correction model (tier \(tier.rawValue)) not downloaded yet; passing text through unchanged")
+        let model = settings.correctionBundledModel
+        guard bundledLLMModelExists(model) else {
+            log("LLM postprocessing: correction model (\(model.rawValue)) not downloaded yet; passing text through unchanged")
             return text
         }
-        let identity = Self.correctionHostIdentity(tier: tier)
+        let identity = Self.correctionHostIdentity(model: model)
         let hostProcess = hostProcess(forIdentity: identity)
-        let startResult = await hostProcess.start(modelPath: correctionBundledModelPath(tier: tier).path,
-                                                  loraPath: correctionBundledLoraPath(tier: tier),
-                                                  loraScale: tier == .fast ? GEC_LORA_SCALE : 1.0,
-                                                  // The 8B YandexGPT host gets a
-                                                  // larger context: rewrite-style
-                                                  // outputs on long dictations
-                                                  // need prompt + up to ~3072
-                                                  // completion tokens inside one
-                                                  // window.
-                                                  ctxSize: tier == .quality ? 8192 : 4096,
+        let startResult = await hostProcess.start(modelPath: bundledLLMModelPath(model).path,
+                                                  loraPath: bundledLLMLoraPath(model),
+                                                  loraScale: bundledLLMLoraScale(model),
+                                                  ctxSize: model.hostContextSize,
                                                   useGPU: settings.useGPU)
         switch startResult {
         case .failure(let error):
@@ -256,8 +243,8 @@ actor LLMPostprocessingCoordinator {
         }
         return await requestCorrection(baseURL: baseURL,
                                        apiKey: nil,
-                                       model: "gec-\(tier.rawValue)",
-                                       tier: tier,
+                                       model: "gec-\(model.rawValue)",
+                                       bundledModel: model,
                                        text: text,
                                        settings: settings)
     }
@@ -275,12 +262,12 @@ actor LLMPostprocessingCoordinator {
                                        model: model,
                                        // A custom endpoint serves whichever
                                        // model the user named there; the
-                                       // tier only picks OUR bundled file,
+                                       // bundled picker only picks OUR file,
                                        // so its prompt flavor is moot — but
-                                       // the quality-tier (zero-shot)
-                                       // prompt is the safer default for an
-                                       // arbitrary instruct model.
-                                       tier: .quality,
+                                       // the zero-shot instruct prompt is
+                                       // the safer default for an arbitrary
+                                       // instruct model.
+                                       bundledModel: .qwen35_4b,
                                        text: text,
                                        settings: settings)
     }
@@ -288,13 +275,21 @@ actor LLMPostprocessingCoordinator {
     private func requestCorrection(baseURL: URL,
                                    apiKey: String?,
                                    model: String,
-                                   tier: CorrectionModelTier,
+                                   bundledModel: BundledLLMModel,
                                    text: String,
                                    settings: Settings) async -> String {
-        let systemPrompt = LLMCorrectionPrompt.systemPrompt(vocabulary: settings.transcriptCorrections,
-                                                            tier: tier)
+        // A user-edited system prompt replaces the built-in default —
+        // EXCEPT for models with a mandatory prompt (Loqira): the lock is
+        // enforced here, at the single point where prompts are built.
+        let override = bundledModel.allowsCustomSystemPrompt
+            ? settings.correctionSystemPromptOverride
+            : ""
+        let systemPrompt = override.isEmpty
+            ? LLMCorrectionPrompt.systemPrompt(vocabulary: settings.transcriptCorrections,
+                                               model: bundledModel)
+            : override
         let exampleTurns = LLMCorrectionPrompt.exampleTurns(vocabulary: settings.transcriptCorrections,
-                                                            tier: tier)
+                                                            model: bundledModel)
         // Correction output is roughly the same length as the input, never
         // longer in any meaningful way -- a generous multiple of the raw
         // UTF-8 byte count is a safe token-budget heuristic without needing
@@ -342,23 +337,16 @@ actor LLMPostprocessingCoordinator {
 
     private func rewrittenViaBundledHost(_ text: String, settings: Settings) async -> String {
         let model = settings.rewriteBundledModel
-        let tier = model.correctionTierEquivalent
-        guard correctionBundledModelExists(tier: tier) else {
+        guard bundledLLMModelExists(model) else {
             log("LLM postprocessing: bundled rewrite model (\(model.rawValue)) not downloaded yet; passing text through unchanged")
             return text
         }
         let identity = Self.rewriteHostIdentity(model: model)
         let hostProcess = hostProcess(forIdentity: identity)
-        let startResult = await hostProcess.start(modelPath: correctionBundledModelPath(tier: tier).path,
-                                                  loraPath: correctionBundledLoraPath(tier: tier),
-                                                  loraScale: tier == .fast ? GEC_LORA_SCALE : 1.0,
-                                                  // The 8B YandexGPT host
-                                                  // gets a larger context:
-                                                  // rewrite outputs on long
-                                                  // dictations need prompt
-                                                  // + up to ~3072 completion
-                                                  // tokens inside one window.
-                                                  ctxSize: tier == .quality ? 8192 : 4096,
+        let startResult = await hostProcess.start(modelPath: bundledLLMModelPath(model).path,
+                                                  loraPath: bundledLLMLoraPath(model),
+                                                  loraScale: bundledLLMLoraScale(model),
+                                                  ctxSize: model.hostContextSize,
                                                   useGPU: settings.useGPU)
         switch startResult {
         case .failure(let error):
@@ -399,11 +387,15 @@ actor LLMPostprocessingCoordinator {
                                 text: String,
                                 settings: Settings) async -> String {
         let style = settings.rewriteStyle
+        // Per-style user-edited system prompt; empty = the built-in
+        // benchmark default for that style. The «Режим:» user-turn suffix
+        // below is NOT editable — it is part of the benchmark contract.
+        let override = settings.rewriteSystemPromptOverride(for: style)
         let result = await OpenAICompatibleClient.chatCompletion(
             baseURL: baseURL,
             apiKey: apiKey,
             model: model,
-            systemPrompt: LLMRewritePrompt.systemPrompt(style: style),
+            systemPrompt: override.isEmpty ? LLMRewritePrompt.systemPrompt(style: style) : override,
             exampleTurns: LLMRewritePrompt.exampleTurns(style: style),
             userText: LLMRewritePrompt.userText(for: text, style: style),
             enableThinking: false,

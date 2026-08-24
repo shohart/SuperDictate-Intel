@@ -1607,6 +1607,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let isLight = view.shouldUseLightBackground()
         view.recordingColor = settings.recordingHUDRecordingColor.resolvedColor(lightBackground: isLight)
         view.transcribingColor = settings.recordingHUDTranscribingColor.resolvedColor(lightBackground: isLight)
+        view.correctingColor = settings.recordingHUDCorrectingColor.resolvedColor(lightBackground: isLight)
         view.displayMode = settings.recordingHUDDisplayMode
     }
 

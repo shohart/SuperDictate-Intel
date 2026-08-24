@@ -28,9 +28,10 @@ enum RecordingHUDMode {
     case transcribing
     /// Shown while the LLM correction pass (LLMPostprocessingCoordinator)
     /// is running on already-transcribed text -- a visually distinct
-    /// "improving" animation (a row of twinkling four-ray night-sky
-    /// sparkles, see RecordingHUDView.drawCorrectingStars) so it doesn't
-    /// read as a continuation of transcription. Only entered when
+    /// "transmutation" animation (the transcription wave re-formed by a
+    /// sweeping luminous front into a left->right gradient, see
+    /// RecordingHUDView.drawCorrectingWave) so it reads as the text being
+    /// improved, not as a continuation of transcription. Only entered when
     /// correction or rewrite is actually enabled (ParakeyApp.
     /// showCorrectingHUD gates the call), so nothing changes for users
     /// who never turned either feature on.
@@ -430,25 +431,169 @@ enum LLMEngineBackend: String, CaseIterable, Codable {
     case customEndpoint
 }
 
-/// Which bundled correction model tier the correction pass uses
-/// (docs/specs/rewrite-tiered-correction-spec.md §2). `.fast` is the
-/// already-shipped VoiceScribe V15 R-3 pair (Qwen3.5-0.8B Q6_K + the
-/// dictation-corrector LoRA, benchmark/REPORT.md: p50 189 ms, Identity
-/// 1.000, 0.7 GB) and is deliberately the default — this branch fixes it
-/// as THE fast correction model. `.quality` is YandexGPT-5-Lite-8B
-/// Q4_K_M (same report: EM 0.892, Levenshtein 0.985, ~4.9 GB, on-demand
-/// download), which also doubles as the bundled rewrite model — see
-/// LLMPostprocessingPrompts/ModelDownload for the shared file pin.
-enum CorrectionModelTier: String, CaseIterable, Codable {
-    case fast
-    case quality
+/// A bundled LLM model the user can pick for the correction or rewrite
+/// pass. Every entry ran in the 2026-08-21 benchmark
+/// (benchmark/REPORT.md, this machine: AMD RX 6600, llama.cpp/Vulkan,
+/// temperature 0); the download pins live next to the file-resolution
+/// helpers in ModelDownload.swift and were verified against the exact
+/// bytes that benchmark ran on.
+///
+/// The pickers mirror the benchmark's test roles: CORRECTION offers every
+/// small model the benchmark tested for correction plus YandexGPT (the
+/// correction winner); REWRITE offers the models the benchmark tested for
+/// rewrite (curated per the product decision — no Qwen3-8B, no T-Lite).
+enum BundledLLMModel: String, CaseIterable, Codable {
+    // MARK: Correction pass models (small class + the quality 8B option)
+    /// VoiceScribe V15 R-3: Qwen3.5-0.8B Q6_K + dictation-corrector LoRA.
+    /// Benchmark: EM 0.600, Identity 1.000, p50 189 ms, 0.7 GB.
+    case voiceScribe = "voicescribe"
+    /// Benchmark correction: EM 0.723 (best of the small models), p50 549 ms.
+    case qwen35_4b = "qwen35_4b"
+    /// Benchmark correction: EM 0.677, p50 375 ms.
+    case ruAdapt4b = "ruadapt4b"
+    /// Benchmark correction: EM 0.600, p50 484 ms.
+    case qvikhr4b = "qvikhr4b"
+    /// Benchmark correction: EM 0.585, p50 375 ms.
+    case ministral3b = "ministral3b"
+    /// Benchmark correction: EM 0.538, p50 343 ms.
+    case phi4mini = "phi4mini"
+    /// Benchmark correction: EM 0.462, p50 179 ms. Pure GEC fine-tune:
+    /// perfect identity but ZERO script normalization (ScriptF1 0.000),
+    /// and its system prompt is mandatory (see allowsCustomSystemPrompt).
+    case loqira = "loqira"
+    /// Vanilla Qwen3.5-0.8B Q6_K — the VoiceScribe base WITHOUT the LoRA.
+    /// Benchmark correction: EM 0.369, p50 209 ms. Same file as the
+    /// VoiceScribe base pin.
+    case vanilla08b = "vanilla08b"
+    /// Benchmark correction: EM 0.246, p50 10.8 s — the report calls it
+    /// unfit for correction; kept because the correction picker offers
+    /// EVERY small model the benchmark tested.
+    case lfm25 = "lfm25"
+    /// Benchmark correction winner: EM 0.892, Levenshtein 0.985, p50 433 ms.
+    /// Also the rewrite winner — offered in BOTH passes.
+    case yandexGPT = "yandexgpt"
+
+    // MARK: Big models — rewrite pass
+    /// Benchmark rewrite: FactRec 0.489, LenRatio 1.185, p50 3232 ms.
+    case qwen35_9b = "qwen35_9b"
+    /// Benchmark rewrite: FactRec 0.483, LenRatio 1.444, p50 2252 ms.
+    case gemma4e4b = "gemma4e4b"
+
+    /// Models offered by the correction-pass picker: every small model the
+    /// benchmark tested for correction, plus YandexGPT (the correction
+    /// winner, also in the rewrite list).
+    static let correctionModels: [BundledLLMModel] = [
+        .voiceScribe, .qwen35_4b, .ruAdapt4b, .qvikhr4b, .ministral3b,
+        .phi4mini, .loqira, .vanilla08b, .lfm25, .yandexGPT,
+    ]
+    /// Models offered by the rewrite-pass picker (the benchmark's rewrite
+    /// table, curated: YandexGPT is the measured winner; Qwen3-8B and
+    /// T-Lite are deliberately absent per the product decision). LFM2.5 is
+    /// an EXPERIMENTAL addition — the benchmark never tested it for
+    /// rewrite; it is offered to try now that its thinking mode is forced
+    /// off server-side.
+    static let rewriteModels: [BundledLLMModel] = [
+        .yandexGPT, .qwen35_9b, .gemma4e4b, .phi4mini, .ministral3b, .ruAdapt4b,
+        .lfm25,
+    ]
 
     var displayName: String {
         switch self {
-        case .fast: return "Fast"
-        case .quality: return "Quality"
+        case .voiceScribe: return "VoiceScribe V15 R-3"
+        case .qwen35_4b: return "Qwen3.5-4B Q6_K"
+        case .ruAdapt4b: return "RuAdapt Qwen3-4B Q6_K"
+        case .qvikhr4b: return "QVikhr-3-4B Q6_K"
+        case .ministral3b: return "Ministral-3-3B Q6_K"
+        case .phi4mini: return "Phi-4-mini Q6_K"
+        case .loqira: return "Loqira Q4_0"
+        case .vanilla08b: return "Qwen3.5-0.8B Q6_K (vanilla)"
+        case .lfm25: return "LFM2.5-2.6B Q6_K"
+        case .yandexGPT: return "YandexGPT 5 Lite 8B Q4_K_M"
+        case .qwen35_9b: return "Qwen3.5-9B Q4_K_M"
+        case .gemma4e4b: return "Gemma 4 E4B Q4_0"
         }
     }
+
+    /// One-line benchmark digest for the settings UI (locale-neutral
+    /// numbers; the surrounding text is localized in ControlPanel).
+    var benchmarkSummary: String {
+        switch self {
+        case .voiceScribe: return "EM 0.600 · ~0,2 s · 0.7 GB"
+        case .qwen35_4b: return "EM 0.723 · ~0,55 s · 3.8 GB"
+        case .ruAdapt4b: return "EM 0.677 · ~0,38 s · 3.3 GB"
+        case .qvikhr4b: return "EM 0.600 · ~0,48 s · 3.3 GB"
+        case .ministral3b: return "EM 0.585 · ~0,38 s · 2.8 GB"
+        case .phi4mini: return "EM 0.538 · ~0,34 s · 3.2 GB"
+        case .loqira: return "EM 0.462 · ~0,18 s · 0.6 GB"
+        case .vanilla08b: return "EM 0.369 · ~0,21 s · 0.7 GB"
+        case .lfm25: return "EM 0.246 · ~10,8 s · 2.2 GB"
+        case .yandexGPT: return "EM 0.892 · FactRec 0.527 · 4.9 GB"
+        case .qwen35_9b: return "FactRec 0.489 · ~3,2 s · 5.7 GB"
+        case .gemma4e4b: return "FactRec 0.483 · ~2,3 s · 5.2 GB"
+        }
+    }
+
+    /// Only VoiceScribe is the base-weights + LoRA pair (see ModelDownload's
+    /// GEC_LORA_* pins); every other model is a single standalone GGUF.
+    var usesLoRAAdapter: Bool { self == .voiceScribe }
+
+    /// Only VoiceScribe was benchmark-validated with the few-shot
+    /// VoiceScribe-tuned prompt; every other (instruct) model gets the
+    /// benchmark's zero-shot correction prompt.
+    var usesFewShotCorrectionPrompt: Bool { self == .voiceScribe }
+
+    /// Loqira is a GEC fine-tune with a MANDATORY system prompt — its
+    /// training format must not be overridden by the user (the settings UI
+    /// shows the prompt read-only for this model).
+    var allowsCustomSystemPrompt: Bool { self != .loqira }
+
+    // NB on thinking mode: NO model needs launch flags to suppress it.
+    // The bundled SuperDictateLLMHost helper hardcodes
+    // COMMON_REASONING_FORMAT_NONE and reads enable_thinking from the
+    // request's chat_template_kwargs — which our client always sends as
+    // false (see llama_cpp_host/bridge/superdictate_llm_host_main.cpp).
+    // The benchmark's `--reasoning-format none` was a llama-SERVER flag;
+    // passing it to the helper makes the host exit at startup ("unknown
+    // argument") and every dictation passes through uncorrected.
+
+    /// llama.cpp context window for this model's host. Models that serve
+    /// the rewrite pass: 8192 — rewrite-style outputs on long dictations
+    /// need prompt + up to ~3072 completion tokens inside one window.
+    /// Correction-only small models: 4096 (as benchmarked).
+    var hostContextSize: Int32 {
+        BundledLLMModel.rewriteModels.contains(self) ? 8192 : 4096
+    }
+}
+
+/// Correction pass model setting. Defaults to `.voiceScribe` (the
+/// benchmark's best fast correction model). Migration from the retired
+/// tier setting (`correction_model_tier_v1`): "fast" → .voiceScribe,
+/// "quality" → .yandexGPT (the benchmark correction winner, offered in
+/// the correction picker).
+func normalizedCorrectionBundledModel(rawValue: String?, legacyTier: String?) -> BundledLLMModel {
+    if let rawValue, let model = BundledLLMModel(rawValue: rawValue),
+       BundledLLMModel.correctionModels.contains(model) {
+        return model
+    }
+    switch legacyTier {
+    case "quality": return .yandexGPT
+    default: return .voiceScribe
+    }
+}
+
+/// Rewrite pass model setting. Defaults to `.yandexGPT` (benchmark
+/// winner). Migration from the retired picker (`rewrite_bundled_model_v1`):
+/// "voicescribe" is no longer offered for rewrite (small class; the report
+/// shows it compresses output to 0.6×) → the recommended .yandexGPT.
+func normalizedRewriteBundledModel(rawValue: String?, legacyModel: String?) -> BundledLLMModel {
+    if let rawValue, let model = BundledLLMModel(rawValue: rawValue),
+       BundledLLMModel.rewriteModels.contains(model) {
+        return model
+    }
+    if legacyModel == BundledLLMModel.yandexGPT.rawValue {
+        return .yandexGPT
+    }
+    return .yandexGPT
 }
 
 /// Rewrite style — the second, independent post-processing function
@@ -489,46 +634,11 @@ func normalizedLLMEngineBackend(rawValue: String?) -> LLMEngineBackend {
     return backend
 }
 
-func normalizedCorrectionModelTier(rawValue: String?) -> CorrectionModelTier {
-    guard let rawValue, let tier = CorrectionModelTier(rawValue: rawValue) else {
-        return .fast
-    }
-    return tier
-}
-
 func normalizedRewriteStyle(rawValue: String?) -> RewriteStyle {
     guard let rawValue, let style = RewriteStyle(rawValue: rawValue) else {
         return .polish
     }
     return style
-}
-
-/// Which bundled model file the rewrite pass loads when its backend is
-/// `.bundledLocal` — the Settings dropdown next to the style picker
-/// (docs/specs/rewrite-tiered-correction-spec.md §9). `.yandexGPT` is
-/// the benchmark winner and the default (FactRec 0.527, LenRatio 0.966 —
-/// benchmark/REPORT.md); `.voiceScribe` reuses the fast correction pair
-/// (rewrite LenRatio 0.599: much faster but compresses text — kept as an
-/// experimental choice because it is the only other bundled file and
-/// needs no extra download for fast-tier correction users).
-enum RewriteBundledModel: String, CaseIterable, Codable {
-    case yandexGPT = "yandexgpt"
-    case voiceScribe = "voicescribe"
-
-    /// The correction tier whose bundled files this choice maps to — used
-    /// to resolve model/LoRA paths and to SHARE a host process with that
-    /// tier: one 0.8B host serves fast correction AND voiceScribe rewrite;
-    /// one YandexGPT host serves quality correction AND yandexGPT rewrite.
-    var correctionTierEquivalent: CorrectionModelTier {
-        self == .yandexGPT ? .quality : .fast
-    }
-}
-
-func normalizedRewriteBundledModel(rawValue: String?) -> RewriteBundledModel {
-    guard let rawValue, let model = RewriteBundledModel(rawValue: rawValue) else {
-        return .yandexGPT
-    }
-    return model
 }
 
 enum RecentTranscriptLimit: String, CaseIterable {
