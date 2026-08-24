@@ -33,6 +33,10 @@ final class Settings: @unchecked Sendable {
     private static let keyHistoryHotkeyModifiers = "history_hotkey_modifiers"
     private static let keyCorrectionHotkeyKeycode = "correction_hotkey_keycode"
     private static let keyCorrectionHotkeyModifiers = "correction_hotkey_modifiers"
+    private static let keyRewriteToggleHotkeyKeycode = "rewrite_toggle_hotkey_keycode"
+    private static let keyRewriteToggleHotkeyModifiers = "rewrite_toggle_hotkey_modifiers"
+    private static let keyRewriteStyleHotkeyKeycode = "rewrite_style_hotkey_keycode"
+    private static let keyRewriteStyleHotkeyModifiers = "rewrite_style_hotkey_modifiers"
     private static let keyPrimaryCompletionBehavior = "primary_completion_behavior_v1"
     private static let keyAlternateCompletionEnabled = "alternate_completion_enabled_v1"
     private static let keyInterfaceLanguage = "interface_language"
@@ -358,6 +362,74 @@ final class Settings: @unchecked Sendable {
     func setConfiguredCorrectionHotkey(_ choice: HotkeyChoice) {
         correctionHotkeyKeycode = choice.keycode
         correctionHotkeyModifiers = choice.requiredModifiers
+    }
+
+    var rewriteToggleHotkeyKeycode: CGKeyCode {
+        get {
+            normalizedHotkeyKeycode(storedValue: defaults.object(forKey: Self.keyRewriteToggleHotkeyKeycode))
+                ?? 105 // F13
+        }
+        set {
+            let normalized = normalizedHotkeyKeycode(storedValue: NSNumber(value: Int(newValue)))
+                ?? 105 // F13
+            defaults.set(Int(normalized), forKey: Self.keyRewriteToggleHotkeyKeycode)
+        }
+    }
+
+    var rewriteToggleHotkeyModifiers: CGEventFlags {
+        get {
+            let raw = defaults.object(forKey: Self.keyRewriteToggleHotkeyModifiers) as? NSNumber
+            if raw == nil { return [] }
+            return CGEventFlags(rawValue: raw?.uint64Value ?? 0)
+                .intersection(HOTKEY_SHORTCUT_MODIFIER_MASK)
+        }
+        set {
+            defaults.set(NSNumber(value: newValue.intersection(HOTKEY_SHORTCUT_MODIFIER_MASK).rawValue),
+                         forKey: Self.keyRewriteToggleHotkeyModifiers)
+        }
+    }
+
+    var rewriteStyleHotkeyKeycode: CGKeyCode {
+        get {
+            normalizedHotkeyKeycode(storedValue: defaults.object(forKey: Self.keyRewriteStyleHotkeyKeycode))
+                ?? 107 // F14
+        }
+        set {
+            let normalized = normalizedHotkeyKeycode(storedValue: NSNumber(value: Int(newValue)))
+                ?? 107 // F14
+            defaults.set(Int(normalized), forKey: Self.keyRewriteStyleHotkeyKeycode)
+        }
+    }
+
+    var rewriteStyleHotkeyModifiers: CGEventFlags {
+        get {
+            let raw = defaults.object(forKey: Self.keyRewriteStyleHotkeyModifiers) as? NSNumber
+            if raw == nil { return [] }
+            return CGEventFlags(rawValue: raw?.uint64Value ?? 0)
+                .intersection(HOTKEY_SHORTCUT_MODIFIER_MASK)
+        }
+        set {
+            defaults.set(NSNumber(value: newValue.intersection(HOTKEY_SHORTCUT_MODIFIER_MASK).rawValue),
+                         forKey: Self.keyRewriteStyleHotkeyModifiers)
+        }
+    }
+
+    var configuredRewriteToggleHotkey: HotkeyChoice {
+        hotkeyChoice(forKeycode: rewriteToggleHotkeyKeycode, modifiers: rewriteToggleHotkeyModifiers)
+    }
+
+    func setConfiguredRewriteToggleHotkey(_ choice: HotkeyChoice) {
+        rewriteToggleHotkeyKeycode = choice.keycode
+        rewriteToggleHotkeyModifiers = choice.requiredModifiers
+    }
+
+    var configuredRewriteStyleHotkey: HotkeyChoice {
+        hotkeyChoice(forKeycode: rewriteStyleHotkeyKeycode, modifiers: rewriteStyleHotkeyModifiers)
+    }
+
+    func setConfiguredRewriteStyleHotkey(_ choice: HotkeyChoice) {
+        rewriteStyleHotkeyKeycode = choice.keycode
+        rewriteStyleHotkeyModifiers = choice.requiredModifiers
     }
 
     var interfaceLanguage: InterfaceLanguage {

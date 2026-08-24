@@ -167,6 +167,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     )
     private let vocabularyLearnedToastController = VocabularyLearnedToastController()
+    private let stateToastController = StateToastController()
     private var globalMouseDownMonitor: Any?
     private var lastExternalClick: LastExternalClick?
     private var errorFlashWorkItem: DispatchWorkItem?
@@ -272,6 +273,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.onCancel = { [weak self] in self?.cancelActiveRecording(reason: "escape") }
         hotkey.onShowHistory = { [weak self] in self?.toggleHistoryOverlay() }
         hotkey.onToggleCorrection = { [weak self] in self?.toggleTextCorrectionMode() }
+        hotkey.onToggleRewrite = { [weak self] in self?.toggleRewriteModeViaHotkey() }
+        hotkey.onCycleRewriteStyle = { [weak self] in self?.cycleRewriteStyleViaHotkey() }
         hotkey.onRejectedBusyPress = { [weak self] in
             guard let self, self.isBusy, self.settings.playFeedbackSounds else { return }
             Sounds.playError()
@@ -376,6 +379,8 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.setAlternateCompletionEnabled(settings.alternateCompletionEnabled)
         hotkey.setHistoryHotkey(settings.configuredHistoryHotkey)
         hotkey.setCorrectionHotkey(settings.configuredCorrectionHotkey)
+        hotkey.setRewriteHotkey(settings.configuredRewriteToggleHotkey)
+        hotkey.setRewriteStyleHotkey(settings.configuredRewriteStyleHotkey)
         hotkey.setTriggerMode(settings.triggerMode)
         startStartup(reason: "launch")
     }
@@ -3010,6 +3015,12 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let next: TextPostprocessingMode = settings.textPostprocessingMode == .correction ? .off : .correction
         settings.textPostprocessingMode = next
         log("text correction: \(next == .correction ? "enabled" : "disabled") via hotkey")
+        stateToastController.show(
+            text: next == .correction
+                ? t("Коррекция · вкл", "Correction · on")
+                : t("Коррекция · выкл", "Correction · off"),
+            tone: next == .correction ? .on : .off
+        )
         if settings.playFeedbackSounds {
             if next == .correction {
                 Sounds.playStart()
@@ -3023,6 +3034,73 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             } else {
                 await llmPostprocessing.scheduleDelayedUnload(settings: settings)
             }
+        }
+    }
+
+    /// Rewrite on/off from the global hotkey — same restart-free contract
+    /// as toggleTextCorrectionMode: writes the setting directly, manages
+    /// the delayed host unload, shows the state toast.
+    private func toggleRewriteModeViaHotkey() {
+        let next = !settings.rewriteEnabled
+        settings.rewriteEnabled = next
+        log("text rewrite: \(next ? "enabled" : "disabled") via hotkey")
+        if next {
+            stateToastController.show(
+                text: t("Рерайт · вкл · \(rewriteStyleShortName(settings.rewriteStyle))",
+                        "Rewrite · on · \(rewriteStyleShortName(settings.rewriteStyle))"),
+                tone: .on
+            )
+        } else {
+            stateToastController.show(
+                text: t("Рерайт · выкл", "Rewrite · off"),
+                tone: .off
+            )
+        }
+        if settings.playFeedbackSounds {
+            if next { Sounds.playStart() } else { Sounds.playDone() }
+        }
+        Task { [llmPostprocessing, settings] in
+            if next {
+                await llmPostprocessing.cancelScheduledUnload()
+            } else {
+                await llmPostprocessing.scheduleDelayedUnload(settings: settings)
+            }
+        }
+    }
+
+    /// Rewrite style cycle from the global hotkey: next style in
+    /// RewriteStyle.allCases; enables rewrite first if it is off.
+    private func cycleRewriteStyleViaHotkey() {
+        let all = RewriteStyle.allCases
+        let currentIndex = all.firstIndex(of: settings.rewriteStyle) ?? 0
+        let next = all[(currentIndex + 1) % all.count]
+        settings.rewriteStyle = next
+        if !settings.rewriteEnabled {
+            settings.rewriteEnabled = true
+            Task { [llmPostprocessing] in
+                await llmPostprocessing.cancelScheduledUnload()
+            }
+        }
+        log("text rewrite style: \(next.rawValue) via hotkey (rewrite \(settings.rewriteEnabled ? "on" : "off"))")
+        stateToastController.show(
+            text: t("Режим · \(rewriteStyleShortName(next))",
+                    "Style · \(rewriteStyleShortName(next))"),
+            tone: .neutral
+        )
+        if settings.playFeedbackSounds {
+            Sounds.playStart()
+        }
+    }
+
+    private func t(_ russian: String, _ english: String) -> String {
+        localizedText(russian, english, language: settings.interfaceLanguage)
+    }
+
+    private func rewriteStyleShortName(_ style: RewriteStyle) -> String {
+        switch style {
+        case .polish: return t("Причесать", "Polish")
+        case .structuredTask: return t("Задача", "Task")
+        case .official: return t("Официальный", "Official")
         }
     }
 

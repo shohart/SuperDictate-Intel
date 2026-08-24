@@ -50,6 +50,8 @@ enum ControlPanelShortcutKind: Int {
     case alternateCompletion = 1
     case history = 2
     case correction = 3
+    case rewriteToggle = 4
+    case rewriteStyle = 5
 }
 
 struct ControlPanelSettingsDraft: Equatable {
@@ -57,6 +59,8 @@ struct ControlPanelSettingsDraft: Equatable {
     var alternateCompletionHotkey: HotkeyChoice
     var historyHotkey: HotkeyChoice
     var correctionHotkey: HotkeyChoice
+    var rewriteToggleHotkey: HotkeyChoice
+    var rewriteStyleHotkey: HotkeyChoice
     var primaryCompletionBehavior: DictationCompletionBehavior
     var alternateCompletionEnabled: Bool
     var enterDelayMilliseconds: Int
@@ -106,6 +110,8 @@ struct ControlPanelSettingsDraft: Equatable {
         alternateCompletionHotkey = settings.configuredEnterHotkey
         historyHotkey = settings.configuredHistoryHotkey
         correctionHotkey = settings.configuredCorrectionHotkey
+        rewriteToggleHotkey = settings.configuredRewriteToggleHotkey
+        rewriteStyleHotkey = settings.configuredRewriteStyleHotkey
         primaryCompletionBehavior = settings.primaryCompletionBehavior
         alternateCompletionEnabled = settings.alternateCompletionEnabled
         enterDelayMilliseconds = settings.enterDelayMilliseconds
@@ -719,6 +725,20 @@ case .text:
                 kind: .correction,
                 toolTip: t("Включить или выключить коррекцию без открытия настроек.",
                            "Turn correction on or off without opening Settings.")
+            ))
+            content.addArrangedSubview(hotkeyRow(
+                title: t("Переключить рерайт", "Toggle rewrite"),
+                shortcut: draft.rewriteToggleHotkey,
+                kind: .rewriteToggle,
+                toolTip: t("Включить или выключить рерайт без открытия настроек.",
+                           "Turn rewrite on or off without opening Settings.")
+            ))
+            content.addArrangedSubview(hotkeyRow(
+                title: t("Режим рерайта", "Rewrite style"),
+                shortcut: draft.rewriteStyleHotkey,
+                kind: .rewriteStyle,
+                toolTip: t("Переключить режим рерайта по кругу; выключенный рерайт включается.",
+                           "Cycle the rewrite style; disabled rewrite is turned on first.")
             ))
             if draft.textPostprocessingMode == .correction {
                 content.addArrangedSubview(correctionModelRow(draft))
@@ -3393,6 +3413,10 @@ header.addArrangedSubview(panelLabel(
             recorderTitle = t("Новое сочетание для истории", "New History Shortcut")
         case .correction:
             recorderTitle = t("Новое сочетание для коррекции", "New Correction Shortcut")
+        case .rewriteToggle:
+            recorderTitle = t("Новое сочетание для рерайта", "New Rewrite Shortcut")
+        case .rewriteStyle:
+            recorderTitle = t("Новое сочетание режима рерайта", "New Rewrite Style Shortcut")
         }
         let recorder = HotkeyRecorderController(language: language,
                                                 titleOverride: recorderTitle) { [weak self] selected in
@@ -3411,6 +3435,8 @@ header.addArrangedSubview(panelLabel(
             case .alternateCompletion: draft.alternateCompletionHotkey = selected
             case .history: draft.historyHotkey = selected
             case .correction: draft.correctionHotkey = selected
+            case .rewriteToggle: draft.rewriteToggleHotkey = selected
+            case .rewriteStyle: draft.rewriteStyleHotkey = selected
             }
             self.settingsDraft = draft
             self.refreshSettingsWindow()
@@ -3705,6 +3731,8 @@ header.addArrangedSubview(panelLabel(
         settings.setConfiguredEnterHotkey(draft.alternateCompletionHotkey)
         settings.setConfiguredHistoryHotkey(draft.historyHotkey)
         settings.setConfiguredCorrectionHotkey(draft.correctionHotkey)
+        settings.setConfiguredRewriteToggleHotkey(draft.rewriteToggleHotkey)
+        settings.setConfiguredRewriteStyleHotkey(draft.rewriteStyleHotkey)
         settings.primaryCompletionBehavior = draft.primaryCompletionBehavior
         settings.alternateCompletionEnabled = draft.alternateCompletionEnabled
         settings.enterDelayMilliseconds = draft.enterDelayMilliseconds

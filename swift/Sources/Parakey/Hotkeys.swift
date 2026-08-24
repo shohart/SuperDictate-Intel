@@ -461,6 +461,13 @@ enum HotkeyTransitionAction: Equatable, Sendable {
     /// see LLMPostprocessingCoordinator.scheduleDelayedUnload's own doc
     /// comment for why this hotkey exists as a separate, restart-free path).
     case toggleCorrection
+    /// Global shortcut to flip text rewriting on/off — same restart-free
+    /// rationale as toggleCorrection.
+    case toggleRewrite
+    /// Global shortcut to cycle the rewrite style (polish → structured
+    /// task → official → polish). Implies rewrite is on; the app-side
+    /// handler enables it if needed.
+    case cycleRewriteStyle
 }
 
 struct HotkeyTransitionResult: Equatable, Sendable {
@@ -620,6 +627,8 @@ struct HotkeyTransitionState {
     private var enterShortcutState = HotkeyShortcutState()
     private var historyShortcutState = HotkeyShortcutState()
     private var correctionShortcutState = HotkeyShortcutState()
+    private var rewriteShortcutState = HotkeyShortcutState()
+    private var rewriteStyleShortcutState = HotkeyShortcutState()
     private var toggleActive = false
     private var suppressEscapeKeyUp = false
     /// Previous `isRecording` value seen by `transition(for:...)`, used
@@ -632,6 +641,8 @@ struct HotkeyTransitionState {
         enterShortcutState.reset()
         historyShortcutState.reset()
         correctionShortcutState.reset()
+        rewriteShortcutState.reset()
+        rewriteStyleShortcutState.reset()
         toggleActive = false
         suppressEscapeKeyUp = false
         wasRecording = false
@@ -667,6 +678,16 @@ struct HotkeyTransitionState {
         // Control combination during development). A distinct physical
         // base key sidesteps that whole class of collision.
         correctionHotkey: HotkeyChoice = hotkeyChoice(forKeycode: LEFT_COMMAND_KEYCODE),
+        // NB: deliberately NOT built on a modifier base. Left Command is
+        // claimed by the correction hotkey (BARE LCmd fires on the
+        // LCmd-down event, so any LCmd+X chord would double-fire
+        // correction first); Right Command is claimed by dictation (BARE
+        // RCmd starts a recording on RCmd-down, and releasing the extra
+        // modifier mid-chord would fire a dictation press). F13/F14 are
+        // not typed, not system-bound, and the user is expected to rebind
+        // them (Settings → Коррекция) to whatever chord they prefer.
+        rewriteHotkey: HotkeyChoice = hotkeyChoice(forKeycode: 105),          // F13
+        rewriteStyleHotkey: HotkeyChoice = hotkeyChoice(forKeycode: 107),     // F14
         triggerMode: TriggerMode,
         isRecording: Bool,
         canStartRecording: Bool = true
@@ -698,12 +719,25 @@ struct HotkeyTransitionState {
             return correction
         }
 
+        // NB: rewrite checks run AFTER the enter-chord check — a rewrite
+        // hotkey sharing a modifier with the user's enter chord must not
+        // steal that chord mid-recording (the enter state machine only
+        // engages while recording or already engaged, so outside a
+        // recording the rewrite hotkeys still see every event).
         if alternateCompletionEnabled {
             if let completion = transitionEnterShortcut(for: event,
                                                          isRecording: isRecording,
                                                          enterHotkey: enterHotkey) {
                 return completion
             }
+        }
+
+        if let rewrite = transitionRewriteShortcut(for: event, rewriteHotkey: rewriteHotkey) {
+            return rewrite
+        }
+
+        if let rewriteStyle = transitionRewriteStyleShortcut(for: event, rewriteStyleHotkey: rewriteStyleHotkey) {
+            return rewriteStyle
         }
 
         let shortcutResult = standardShortcutState.consume(event, shortcut: hotkey)
@@ -788,6 +822,39 @@ struct HotkeyTransitionState {
         }
     }
 
+    /// Same no-reset rationale as transitionCorrectionShortcut: toggling
+    /// rewrite or cycling its style is unrelated to an in-progress
+    /// dictation gesture and must not cancel or interfere with one.
+    private mutating func transitionRewriteShortcut(
+        for event: HotkeyEventSnapshot,
+        rewriteHotkey: HotkeyChoice
+    ) -> HotkeyTransitionResult? {
+        let shortcutResult = rewriteShortcutState.consume(event, shortcut: rewriteHotkey)
+        switch shortcutResult.edge {
+        case .press:
+            return HotkeyTransitionResult(suppress: shortcutResult.suppress, actions: [.toggleRewrite])
+        case .release, .suppress:
+            return shortcutResult.suppress ? .suppressOnly : nil
+        case .pass:
+            return nil
+        }
+    }
+
+    private mutating func transitionRewriteStyleShortcut(
+        for event: HotkeyEventSnapshot,
+        rewriteStyleHotkey: HotkeyChoice
+    ) -> HotkeyTransitionResult? {
+        let shortcutResult = rewriteStyleShortcutState.consume(event, shortcut: rewriteStyleHotkey)
+        switch shortcutResult.edge {
+        case .press:
+            return HotkeyTransitionResult(suppress: shortcutResult.suppress, actions: [.cycleRewriteStyle])
+        case .release, .suppress:
+            return shortcutResult.suppress ? .suppressOnly : nil
+        case .pass:
+            return nil
+        }
+    }
+
     private mutating func transitionEnterShortcut(
         for event: HotkeyEventSnapshot,
         isRecording: Bool,
@@ -847,6 +914,8 @@ final class HotkeyListener {
     var historyHotkey: HotkeyChoice = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE,
                                                    modifiers: .maskShift)
     var correctionHotkey: HotkeyChoice = hotkeyChoice(forKeycode: LEFT_COMMAND_KEYCODE)
+    var rewriteHotkey: HotkeyChoice = hotkeyChoice(forKeycode: 105)          // F13
+    var rewriteStyleHotkey: HotkeyChoice = hotkeyChoice(forKeycode: 107)     // F14
     var triggerMode: TriggerMode = .hold
 
     /// onPress fires when a recording should start (press in hold mode,
@@ -859,6 +928,8 @@ final class HotkeyListener {
     var onCancel: (() -> Void)?
     var onShowHistory: (() -> Void)?
     var onToggleCorrection: (() -> Void)?
+    var onToggleRewrite: (() -> Void)?
+    var onCycleRewriteStyle: (() -> Void)?
     /// Toggle mode: a press arrived while the app is busy (transcription
     /// in flight). The toggle did NOT flip. Play feedback so the user
     /// knows the press was received but rejected.
@@ -962,6 +1033,18 @@ final class HotkeyListener {
         log("HotkeyListener: correction toggle hotkey changed → \(choice.name)")
     }
 
+    func setRewriteHotkey(_ choice: HotkeyChoice) {
+        rewriteHotkey = choice
+        transitionState.resetAll()
+        log("HotkeyListener: rewrite toggle hotkey changed → \(choice.name)")
+    }
+
+    func setRewriteStyleHotkey(_ choice: HotkeyChoice) {
+        rewriteStyleHotkey = choice
+        transitionState.resetAll()
+        log("HotkeyListener: rewrite style hotkey changed → \(choice.name)")
+    }
+
     func setTriggerMode(_ mode: TriggerMode) {
         // Reset toggle state when switching modes so we don't get
         // stuck in mid-toggle from a previous session.
@@ -986,6 +1069,8 @@ final class HotkeyListener {
                                                 alternateCompletionEnabled: alternateCompletionEnabled,
                                                 historyHotkey: historyHotkey,
                                                 correctionHotkey: correctionHotkey,
+                                                rewriteHotkey: rewriteHotkey,
+                                                rewriteStyleHotkey: rewriteStyleHotkey,
                                                 triggerMode: triggerMode,
                                                 isRecording: isRecordingActive?() ?? false,
                                                 canStartRecording: canStartRecording?() ?? true)
@@ -1011,6 +1096,8 @@ final class HotkeyListener {
             case .cancel: onCancel?()
             case .showHistory: onShowHistory?()
             case .toggleCorrection: onToggleCorrection?()
+            case .toggleRewrite: onToggleRewrite?()
+            case .cycleRewriteStyle: onCycleRewriteStyle?()
             case .rejectedBusyPress: onRejectedBusyPress?()
             }
         }

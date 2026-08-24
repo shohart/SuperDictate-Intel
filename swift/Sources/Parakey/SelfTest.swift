@@ -845,6 +845,7 @@ enum ParakeySelfTest {
         try testHistoryChordShowsOverlay()
         try testConfigurableHistoryShortcut()
         try testConfigurableCorrectionShortcut()
+        try testConfigurableRewriteShortcuts()
         try testOptionCommandEnterChordStopsWithEnter()
         try testEnterShortcutModeSelection()
         try testTogglePressFlipsOnceAndReleaseIsNoOp()
@@ -8032,6 +8033,8 @@ enum ParakeySelfTest {
                 // so it doesn't fire here and mask what this test actually
                 // checks.
                 correctionHotkey: hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE, modifiers: [.maskControl]),
+                rewriteHotkey: hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE, modifiers: [.maskShift]),
+                rewriteStyleHotkey: hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE, modifiers: [.maskAlternate]),
                 triggerMode: .toggle,
                 isRecording: false
             ),
@@ -8044,6 +8047,8 @@ enum ParakeySelfTest {
                            keycode: RIGHT_SHIFT_KEYCODE,
                            flags: commandShift),
                 hotkey: rightCommand,
+                rewriteHotkey: hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE, modifiers: [.maskShift]),
+                rewriteStyleHotkey: hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE, modifiers: [.maskAlternate]),
                 triggerMode: .toggle,
                 isRecording: false
             ),
@@ -8180,6 +8185,99 @@ enum ParakeySelfTest {
             equals: HotkeyTransitionResult(suppress: true, actions: [.toggleCorrection]),
             "a user-configured correction shortcut should fire"
         )
+    }
+
+    /// Covers the rewrite toggle + rewrite style cycle hotkeys added with
+    /// the state-toast feature
+    /// (docs/specs/state-toasts-rewrite-hotkeys-spec.md). Defaults are
+    /// built on Left Command like the correction hotkey but with distinct
+    /// modifiers (Shift / Option) so the three never collide.
+    private static func testConfigurableRewriteShortcuts() throws {
+        let standard = hotkeyChoice(forKeycode: RIGHT_COMMAND_KEYCODE)
+        // NB modifier-base chords (LCmd+X, RCmd+X) were rejected as
+        // defaults: correction claims BARE Left Command (fires on
+        // LCmd-down, so any LCmd+X chord double-fires correction) and
+        // dictation claims BARE Right Command (starts a recording on
+        // RCmd-down, and releasing the extra modifier fires a dictation
+        // press). F13/F14 are non-typed, unclaimed, and expected to be
+        // rebound by the user.
+        let defaultRewriteToggle = hotkeyChoice(forKeycode: 105) // F13
+        let defaultRewriteStyle = hotkeyChoice(forKeycode: 107)  // F14
+
+        // Default rewrite toggle (F13): keyDown fires .toggleRewrite and
+        // is fully intercepted; keyUp is suppressed too.
+        var state = HotkeyTransitionState()
+        try expect(
+            state.transition(for: event(.keyDown, keycode: 105),
+                             hotkey: standard,
+                             rewriteHotkey: defaultRewriteToggle,
+                             rewriteStyleHotkey: defaultRewriteStyle,
+                             triggerMode: .hold,
+                             isRecording: false),
+            equals: HotkeyTransitionResult(suppress: true, actions: [.toggleRewrite]),
+            "the default rewrite toggle hotkey (F13) should fire .toggleRewrite, intercepted"
+        )
+        try expect(
+            state.transition(for: event(.keyUp, keycode: 105),
+                             hotkey: standard,
+                             rewriteHotkey: defaultRewriteToggle,
+                             rewriteStyleHotkey: defaultRewriteStyle,
+                             triggerMode: .hold,
+                             isRecording: false),
+            equals: .suppressOnly,
+            "the rewrite toggle hotkey's release should be suppressed"
+        )
+
+        // Default style cycle (F14): keyDown fires .cycleRewriteStyle.
+        var styleState = HotkeyTransitionState()
+        try expect(
+            styleState.transition(for: event(.keyDown, keycode: 107),
+                                  hotkey: standard,
+                                  rewriteHotkey: defaultRewriteToggle,
+                                  rewriteStyleHotkey: defaultRewriteStyle,
+                                  triggerMode: .hold,
+                                  isRecording: false),
+            equals: HotkeyTransitionResult(suppress: true, actions: [.cycleRewriteStyle]),
+            "the default rewrite style hotkey (F14) should fire .cycleRewriteStyle"
+        )
+
+        // User-configured (non-modifier) shortcuts fire too, independent of
+        // the dictation hotkey.
+        var customState = HotkeyTransitionState()
+        let customToggle = hotkeyChoice(forKeycode: 97)
+        let customStyle = hotkeyChoice(forKeycode: 98)
+        try expect(
+            customState.transition(for: event(.keyDown, keycode: 97),
+                                   hotkey: standard,
+                                   rewriteHotkey: customToggle,
+                                   rewriteStyleHotkey: customStyle,
+                                   triggerMode: .hold,
+                                   isRecording: false),
+            equals: HotkeyTransitionResult(suppress: true, actions: [.toggleRewrite]),
+            "a user-configured rewrite toggle shortcut should fire"
+        )
+        try expect(
+            customState.transition(for: event(.keyDown, keycode: 98),
+                                   hotkey: standard,
+                                   rewriteHotkey: customToggle,
+                                   rewriteStyleHotkey: customStyle,
+                                   triggerMode: .hold,
+                                   isRecording: false),
+            equals: HotkeyTransitionResult(suppress: true, actions: [.cycleRewriteStyle]),
+            "a user-configured rewrite style shortcut should fire"
+        )
+
+        // Settings roundtrip for both new hotkey configs.
+        let defaults = UserDefaults(suiteName: "com.local.superdictate.selftest.rewrite-hotkeys-\(UUID().uuidString)")!
+        let settings = Settings(defaults: defaults, vocabularyStore: .inMemoryFallback())
+        let toggleChoice = hotkeyChoice(forKeycode: 110, modifiers: [.maskControl]) // K
+        let styleChoice = hotkeyChoice(forKeycode: 111, modifiers: [.maskShift])
+        settings.setConfiguredRewriteToggleHotkey(toggleChoice)
+        settings.setConfiguredRewriteStyleHotkey(styleChoice)
+        try expect(settings.configuredRewriteToggleHotkey, equals: toggleChoice,
+                   "rewrite toggle hotkey must round-trip through settings")
+        try expect(settings.configuredRewriteStyleHotkey, equals: styleChoice,
+                   "rewrite style hotkey must round-trip through settings")
     }
 
     private static func testOptionCommandEnterChordStopsWithEnter() throws {
