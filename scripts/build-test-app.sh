@@ -28,10 +28,30 @@ APP_NAME="SuperDictate-${APP_LABEL}"
 BUNDLE_ID="${TEST_BUNDLE_ID:-com.local.superdictate.${APP_LABEL}}"
 BUILD_CONFIG="${TEST_BUILD_CONFIG:-release}"        # debug is ~20-30x slower for CPU-bound inference; default release
 OUTPUT_APP="${1:-$ROOT_DIR/dist/${APP_NAME}.app}"
-SIGN_IDENTITY="${SIGN_IDENTITY:--}"
 
 say() { printf 'build-test-app: %s\n' "$*"; }
 fail() { printf 'build-test-app: %s\n' "$*" >&2; exit 1; }
+
+# Signing identity. An AD-HOC signature ("-") changes CDHash on every
+# build, so macOS TCC treats each rebuild as a DIFFERENT app and resets
+# its microphone/accessibility permissions. To keep permissions stable
+# across rebuilds the test app is signed with the same stable Apple
+# Development identity the production install uses (same resolution chain
+# as install-local.sh): certificate-anchored designated requirement stays
+# identical while the bundle id keeps the test app a separate TCC
+# identity. Override with SIGN_IDENTITY env; pass SIGN_IDENTITY=- to
+# force ad-hoc deliberately (permissions WILL reset on every rebuild).
+if [[ -z "${SIGN_IDENTITY+x}" ]]; then
+    # First identity valid FOR CODESIGNING (skip "(Invalid ...)" entries);
+    # name-agnostic — this Mac's identity is custom-named ("PolterType Dev").
+    SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
+        | grep -v '(' \
+        | sed -n 's/.*"\(.*\)".*/\1/p' \
+        | head -n 1)"
+fi
+if [[ -z "$SIGN_IDENTITY" ]]; then
+    fail "No Apple Development signing identity found. Set SIGN_IDENTITY explicitly (or SIGN_IDENTITY=- for ad-hoc, which resets TCC permissions on every rebuild)."
+fi
 
 [[ "$(/usr/bin/uname -s)" == "Darwin" ]] || fail "macOS is required."
 [[ "$OUTPUT_APP" == *.app ]] || fail "Output app path must end with .app."
@@ -74,6 +94,11 @@ cp "$ROOT_DIR/swift/Info.plist" "$STAGE_APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable $APP_NAME" "$STAGE_APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleName $APP_NAME" "$STAGE_APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $APP_NAME" "$STAGE_APP/Contents/Info.plist"
+# Dev version suffix: the Settings window title shows the running version,
+# so "-dev" makes a test build unmistakable at a glance (and keeps update
+# checks from treating a dev build as a production install).
+BASE_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$STAGE_APP/Contents/Info.plist")"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${BASE_VERSION}-dev" "$STAGE_APP/Contents/Info.plist"
 
 SIGN_ARGS=(--force --deep --sign "$SIGN_IDENTITY" --options runtime
            --entitlements "$ROOT_DIR/entitlements.plist")
