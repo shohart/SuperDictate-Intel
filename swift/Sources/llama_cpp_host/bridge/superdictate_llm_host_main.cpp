@@ -39,12 +39,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 // Not "json" -- common/chat.h already defines that alias (to
@@ -382,6 +384,26 @@ int main(int argc, char ** argv) {
     }
     std::fprintf(stderr, "superdictate-llm-host: model loaded, listening on %s:%d\n",
                  cfg.host.c_str(), cfg.port);
+
+    // Parent-death watchdog. When the SuperDictate process that spawned
+    // this helper dies — crash, SIGKILL, a rebuild replacing the bundle —
+    // this helper would otherwise be re-parented to launchd and linger
+    // forever holding gigabytes of model memory (observed in the wild:
+    // ten orphaned helpers up to 34 hours old). The original PPID is
+    // captured ONCE at startup; any change means the parent exited, and
+    // the whole process shuts down within one poll interval. _Exit (not
+    // exit) so an in-flight generation's destructors cannot hang the
+    // shutdown — nobody is left waiting for that response anyway.
+    const pid_t original_ppid = getppid();
+    std::thread([original_ppid]() {
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            if (getppid() != original_ppid) {
+                std::fprintf(stderr, "superdictate-llm-host: parent exited, shutting down\n");
+                std::_Exit(0);
+            }
+        }
+    }).detach();
 
     httplib::Server svr;
 
