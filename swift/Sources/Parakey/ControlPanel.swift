@@ -234,6 +234,13 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
     private weak var settingsStatusLabel: NSTextField?
     private var llmModelDownloadState: LLMModelDownloadState = .idle
     private var llmModelDownloadTask: Task<Void, Never>?
+    /// Live byte progress of the in-flight model download, relayed from
+    /// the URLSession delegate straight into the status row's views (no
+    /// window rebuild — rebuilding at progress frequency would reset the
+    /// settings window's scroll state).
+    private var llmModelDownloadProgress: (received: Int64, total: Int64)?
+    private weak var llmDownloadStatusLabel: NSTextField?
+    private weak var llmDownloadProgressBar: NSProgressIndicator?
     /// Which bundled LLM model an in-flight download is for (the Settings
     /// UI offers every benchmark-listed model as an independent download).
     private var llmModelDownloadModel: BundledLLMModel = .voiceScribe
@@ -2138,8 +2145,15 @@ header.addArrangedSubview(panelLabel(
         // A download in flight is only shown by the row for THAT model;
         // other models' rows keep their plain ready/missing status.
         let downloadInFlight = llmModelDownloadTask != nil && llmModelDownloadModel == model
+        let liveProgress = downloadInFlight ? llmModelDownloadProgress : nil
         if downloadInFlight, case .downloading = llmModelDownloadState {
-            statusText = t("Скачивание…", "Downloading…")
+            if let liveProgress, liveProgress.total > 0 {
+                let fraction = Double(liveProgress.received) / Double(liveProgress.total)
+                statusText = t("Скачивание… " + String(Int(fraction * 100)) + "% (" + formattedByteCount(UInt64(liveProgress.received)) + " из " + formattedByteCount(UInt64(liveProgress.total)) + ")",
+                               "Downloading… " + String(Int(fraction * 100)) + "% (" + formattedByteCount(UInt64(liveProgress.received)) + " of " + formattedByteCount(UInt64(liveProgress.total)) + ")")
+            } else {
+                statusText = t("Скачивание…", "Downloading…")
+            }
             statusColor = .systemBlue
         } else if downloadInFlight, case .failed(let message) = llmModelDownloadState {
             statusText = message
@@ -2150,6 +2164,9 @@ header.addArrangedSubview(panelLabel(
         }
         let statusLabel = panelLabel(statusText, size: 12, color: statusColor)
         text.addArrangedSubview(statusLabel)
+        if downloadInFlight {
+            llmDownloadStatusLabel = statusLabel
+        }
 
         let button: NSButton
         if downloadInFlight, case .downloading = llmModelDownloadState {
@@ -2173,12 +2190,20 @@ header.addArrangedSubview(panelLabel(
             let progressBar = NSProgressIndicator()
             progressBar.style = .bar
             progressBar.controlSize = .small
-            progressBar.isIndeterminate = true
-            progressBar.startAnimation(nil)
+            if let liveProgress, liveProgress.total > 0 {
+                progressBar.isIndeterminate = false
+                progressBar.minValue = 0
+                progressBar.maxValue = 1
+                progressBar.doubleValue = Double(liveProgress.received) / Double(liveProgress.total)
+            } else {
+                progressBar.isIndeterminate = true
+                progressBar.startAnimation(nil)
+            }
             progressBar.translatesAutoresizingMaskIntoConstraints = false
             progressBar.heightAnchor.constraint(equalToConstant: 6).isActive = true
             container.addArrangedSubview(progressBar)
             progressBar.widthAnchor.constraint(equalTo: container.widthAnchor).isActive = true
+            llmDownloadProgressBar = progressBar
         }
 
         return container
@@ -2766,6 +2791,7 @@ header.addArrangedSubview(panelLabel(
             self.refreshSettingsWindow()
         }
         hotkeyRecorder = recorder
+        recorder.present(relativeTo: settingsWindow)
     }
 
     private static func hexString(from color: NSColor) -> String {
@@ -3086,9 +3112,25 @@ header.addArrangedSubview(panelLabel(
         refreshSettingsWindow()
         llmModelDownloadTask = Task { [weak self, model] in
             do {
-                _ = try await downloadBundledLLMModelIfNeeded(model)
+                _ = try await downloadBundledLLMModelIfNeeded(model, progress: { [weak self] received, total in
+                    Task { @MainActor in
+                        guard let self = self else { return }
+                        self.llmModelDownloadProgress = (received, total)
+                        // Direct view updates — a full window rebuild at
+                        // progress frequency would reset the settings
+                        // window's scroll state.
+                        let fraction = total > 0 ? Double(received) / Double(total) : 0
+                        self.llmDownloadStatusLabel?.stringValue = self.t(
+                            "Скачивание… " + String(Int(fraction * 100)) + "% (" + formattedByteCount(UInt64(received)) + " из " + formattedByteCount(UInt64(total)) + ")",
+                            "Downloading… " + String(Int(fraction * 100)) + "% (" + formattedByteCount(UInt64(received)) + " of " + formattedByteCount(UInt64(total)) + ")")
+                        if let bar = self.llmDownloadProgressBar, !bar.isIndeterminate {
+                            bar.doubleValue = fraction
+                        }
+                    }
+                })
                 guard let self, !Task.isCancelled else { return }
                 self.llmModelDownloadState = .idle
+                self.llmModelDownloadProgress = nil
             } catch is CancellationError {
             } catch {
                 guard let self else { return }
@@ -3336,6 +3378,34 @@ header.addArrangedSubview(panelLabel(
         """)
     }
 
+    /// Whether saving `draft` requires the background-service restart.
+    /// Most settings are read LIVE by the agent on every dictation
+    /// (models, prompts, styles, custom modes, endpoints, text
+    /// post-processing) — restarting for those would just interrupt the
+    /// user for nothing. Restart is needed only for what the agent reads
+    /// ONCE at launch (hotkeys, HUD appearance) or configures at audio
+    /// capture time (device, auto-stop, mute).
+    private func settingsRestartRequired(_ draft: ControlPanelSettingsDraft) -> Bool {
+        let persisted = ControlPanelSettingsDraft(settings: settings)
+        return draft.dictationHotkey != persisted.dictationHotkey
+            || draft.alternateCompletionHotkey != persisted.alternateCompletionHotkey
+            || draft.historyHotkey != persisted.historyHotkey
+            || draft.correctionHotkey != persisted.correctionHotkey
+            || draft.rewriteToggleHotkey != persisted.rewriteToggleHotkey
+            || draft.rewriteStyleHotkey != persisted.rewriteStyleHotkey
+            || draft.customRewriteStyles != persisted.customRewriteStyles
+            || draft.inputDevicePreference != persisted.inputDevicePreference
+            || draft.muteWhileRecording != persisted.muteWhileRecording
+            || draft.autoStopOnSilenceEnabled != persisted.autoStopOnSilenceEnabled
+            || draft.autoStopSilenceSeconds != persisted.autoStopSilenceSeconds
+            || draft.recordingColor != persisted.recordingColor
+            || draft.transcribingColor != persisted.transcribingColor
+            || draft.correctingColor != persisted.correctingColor
+            || draft.backgroundStyle != persisted.backgroundStyle
+            || draft.hudSize != persisted.hudSize
+            || draft.hudDisplayMode != persisted.hudDisplayMode
+    }
+
     private func settingsActionsRow(draft: ControlPanelSettingsDraft) -> NSView {
         let persisted = ControlPanelSettingsDraft(settings: settings)
         let hasChanges = draft != persisted
@@ -3364,12 +3434,18 @@ header.addArrangedSubview(panelLabel(
             toolTip: t("Отменить несохранённые изменения.", "Discard unsaved changes.")
         )
         row.addArrangedSubview(discard)
+        let restartRequired = settingsRestartRequired(draft)
         let save = panelButton(
-            t("Сохранить и перезапустить", "Save & Restart"),
+            restartRequired
+                ? t("Сохранить и перезапустить", "Save & Restart")
+                : t("Сохранить", "Save"),
             action: #selector(saveSettingsClicked(_:)),
             enabled: hasChanges && validation == nil && serviceOperation == nil,
-            toolTip: t("Сохранить настройки и перезапустить фоновую службу.",
-                       "Save settings and restart the background service.")
+            toolTip: restartRequired
+                ? t("Сохранить настройки и перезапустить фоновую службу.",
+                    "Save settings and restart the background service.")
+                : t("Сохранить настройки — перезапуск не требуется.",
+                    "Save settings — no restart needed.")
         )
         save.keyEquivalent = "\r"
         row.addArrangedSubview(save)
@@ -4223,8 +4299,16 @@ header.addArrangedSubview(panelLabel(
         settings.rewriteCustomModelName = draft.rewriteCustomModelName
         settings.agentEnabled = true
         _ = settings.refreshFromDisk()
+        let restartRequired = settingsRestartRequired(draft)
         settingsDraft = ControlPanelSettingsDraft(settings: settings)
-        beginServiceOperation(.applyingSettings)
+        if restartRequired {
+            beginServiceOperation(.applyingSettings)
+        } else {
+            // Nothing the agent reads at launch changed — persisting is
+            // enough; the agent picks the values up live on the next
+            // dictation. No service restart, no HUD interruption.
+            refreshSettingsWindow()
+        }
     }
 
     private func refreshSettingsWindow() {

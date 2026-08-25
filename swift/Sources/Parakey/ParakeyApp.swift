@@ -276,6 +276,13 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.onToggleRewrite = { [weak self] in self?.toggleRewriteModeViaHotkey() }
         hotkey.onCycleRewriteStyle = { [weak self] in self?.cycleRewriteStyleViaHotkey() }
         hotkey.onActivateRewriteStyle = { [weak self] id in self?.activateRewriteStyleViaHotkey(id) }
+        Task { [llmPostprocessing] in
+            await llmPostprocessing.setHostLoadUI(stage: { [weak self] text in
+                self?.stateToastController.showLoading(text: text)
+            }, finished: { [weak self] in
+                self?.stateToastController.dismissLoading()
+            })
+        }
         hotkey.onRejectedBusyPress = { [weak self] in
             guard let self, self.isBusy, self.settings.playFeedbackSounds else { return }
             Sounds.playError()

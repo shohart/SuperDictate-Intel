@@ -54,6 +54,7 @@ final class StateToastController {
 
     private var panel: NSPanel?
     private var dismissTask: Task<Void, Never>?
+    private var loadingSpinner: NSProgressIndicator?
 
     func show(text: String, tone: StateToastTone, targetFrame: NSRect? = nil) {
         dismissTask?.cancel()
@@ -163,11 +164,77 @@ final class StateToastController {
         }
     }
 
+    /// Persistent "working…" toast for multi-second operations (cold
+    /// model load): no auto-dismiss — the caller dismisses via
+    /// dismissLoading() when the operation finishes.
+    func showLoading(text: String) {
+        dismissTask?.cancel()
+        panel?.orderOut(nil)
+
+        let panel = Self.makePanel()
+        let lightBackground = Self.shouldUseLightBackground()
+        let baseColor: NSColor = lightBackground
+            ? NSColor(calibratedWhite: 0.0, alpha: 0.85)
+            : NSColor(calibratedWhite: 1.0, alpha: 0.92)
+        let label = NSTextField(labelWithString: text)
+        label.font = .systemFont(ofSize: 14, weight: .semibold)
+        label.textColor = baseColor
+        label.translatesAutoresizingMaskIntoConstraints = false
+
+        let spinner = NSProgressIndicator()
+        spinner.style = .spinning
+        spinner.controlSize = .small
+        spinner.startAnimation(nil)
+        spinner.translatesAutoresizingMaskIntoConstraints = false
+
+        let row = NSStackView(views: [spinner, label])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 10
+        row.translatesAutoresizingMaskIntoConstraints = false
+
+        let measuredWidth = label.attributedStringValue.size().width + 80
+        let pillWidth = min(max(measuredWidth, 220), 480)
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: pillWidth, height: Self.pillHeight))
+        container.wantsLayer = true
+        let palette = Self.backgroundPalette(lightBackground: lightBackground)
+        container.layer?.backgroundColor = palette.fill.cgColor
+        container.layer?.cornerRadius = Self.pillHeight / 2
+        container.layer?.borderWidth = 1.5
+        container.layer?.borderColor = palette.stroke.cgColor
+
+        container.addSubview(row)
+        NSLayoutConstraint.activate([
+            row.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            row.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+        ])
+
+        panel.setContentSize(container.frame.size)
+        panel.contentView = container
+        Self.positionBottomRight(panel, width: pillWidth)
+        panel.alphaValue = 0
+        panel.orderFrontRegardless()
+        self.panel = panel
+        self.loadingSpinner = spinner
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = RECORDING_HUD_ANIMATE_IN_SECONDS
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            panel.animator().alphaValue = 1
+        }
+    }
+
+    func dismissLoading() {
+        loadingSpinner?.stopAnimation(nil)
+        loadingSpinner = nil
+        dismiss()
+    }
+
     private func dismiss() {
         guard let panel else { return }
         dismissTask?.cancel()
         dismissTask = nil
         self.panel = nil
+        self.loadingSpinner = nil
         let content = panel.contentView
         panel.invalidateShadow()
         NSAnimationContext.runAnimationGroup({ context in

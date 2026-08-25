@@ -48,6 +48,15 @@ actor LLMPostprocessingCoordinator {
     private var hostProcesses: [String: LLMHostProcess] = [:]
     private var pendingUnloadTask: Task<Void, Never>?
 
+    /// UI feedback for COLD host starts: loading a multi-GB model takes
+    /// tens of seconds on first use, and without this the user stares at
+    /// the correcting HUD with no idea anything is happening. Set by
+    /// ParakeyApp at launch (state toast "Загружается модель …").
+    /// @Sendable @MainActor: the closures hop to the main actor and touch
+    /// UI only.
+    var onHostLoadStage: (@Sendable @MainActor (String) -> Void)?
+    var onHostLoadFinished: (@Sendable @MainActor () -> Void)?
+
     /// Host identity for the bundled correction model — the cache-key under
     /// which its LLMHostProcess lives. Models without a LoRA contribute an
     /// empty trailing component (NB: never build this from
@@ -113,6 +122,12 @@ actor LLMPostprocessingCoordinator {
             result = await rewrittenText(result, settings: settings)
         }
         return result
+    }
+
+    func setHostLoadUI(stage: @escaping @Sendable @MainActor (String) -> Void,
+                       finished: @escaping @Sendable @MainActor () -> Void) {
+        onHostLoadStage = stage
+        onHostLoadFinished = finished
     }
 
     /// Stops every bundled host subprocess immediately, if running, and
@@ -225,11 +240,18 @@ actor LLMPostprocessingCoordinator {
         }
         let identity = Self.correctionHostIdentity(model: model)
         let hostProcess = hostProcess(forIdentity: identity)
+        let coldStart = !(await hostProcess.isRunning)
+        if coldStart {
+            await onHostLoadStage?("Загружается модель \(model.displayName)…")
+        }
         let startResult = await hostProcess.start(modelPath: bundledLLMModelPath(model).path,
                                                   loraPath: bundledLLMLoraPath(model),
                                                   loraScale: bundledLLMLoraScale(model),
                                                   ctxSize: model.hostContextSize,
                                                   useGPU: settings.useGPU)
+        if coldStart {
+            await onHostLoadFinished?()
+        }
         switch startResult {
         case .failure(let error):
             log("LLM postprocessing: bundled host failed to start (\(error)); passing text through unchanged")
@@ -343,11 +365,18 @@ actor LLMPostprocessingCoordinator {
         }
         let identity = Self.rewriteHostIdentity(model: model)
         let hostProcess = hostProcess(forIdentity: identity)
+        let coldStart = !(await hostProcess.isRunning)
+        if coldStart {
+            await onHostLoadStage?("Загружается модель \(model.displayName)…")
+        }
         let startResult = await hostProcess.start(modelPath: bundledLLMModelPath(model).path,
                                                   loraPath: bundledLLMLoraPath(model),
                                                   loraScale: bundledLLMLoraScale(model),
                                                   ctxSize: model.hostContextSize,
                                                   useGPU: settings.useGPU)
+        if coldStart {
+            await onHostLoadFinished?()
+        }
         switch startResult {
         case .failure(let error):
             log("LLM postprocessing: rewrite host failed to start (\(error)); passing text through unchanged")

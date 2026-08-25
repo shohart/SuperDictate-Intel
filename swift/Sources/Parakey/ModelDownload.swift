@@ -325,12 +325,59 @@ func assertSufficientDiskSpaceForGECModelDownload() throws {
 /// Shared download/verify/atomic-rename body for both correction-model
 /// files — the exact shape the old single-file downloadGECModelIfNeeded
 /// used, parameterized.
+/// Delegate-backed model download with byte progress: the classic
+/// URLSessionDownloadDelegate flow wrapped in a continuation, because the
+/// async download(from:) convenience gives no progress callbacks — and
+/// for multi-GB models the user needs to see movement.
+private final class ModelDownloadDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+    let progress: @Sendable (Int64, Int64) -> Void
+    private var continuation: CheckedContinuation<URL, Error>?
+    private var finishedLocation: URL?
+
+    init(progress: @escaping @Sendable (Int64, Int64) -> Void) { self.progress = progress }
+
+    func setContinuation(_ continuation: CheckedContinuation<URL, Error>) {
+        self.continuation = continuation
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                    didWriteData bytesWritten: Int64,
+                    totalBytesWritten: Int64,
+                    totalBytesExpectedToWrite: Int64) {
+        progress(totalBytesWritten, totalBytesExpectedToWrite)
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                    didFinishDownloadingTo location: URL) {
+        finishedLocation = location
+        if let http = downloadTask.response as? HTTPURLResponse, http.statusCode != 200 {
+            error = GECModelDownloadError.httpError(statusCode: http.statusCode)
+        }
+    }
+
+    private var error: Error?
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let error { self.error = error }
+        guard let continuation else { return }
+        self.continuation = nil
+        if let error {
+            continuation.resume(throwing: error)
+        } else if let finishedLocation {
+            continuation.resume(returning: finishedLocation)
+        } else {
+            continuation.resume(throwing: GECModelDownloadError.httpError(statusCode: -1))
+        }
+    }
+}
+
 @discardableResult
 private func downloadGECFileIfNeeded(existingDescription: String,
                                      destination: URL,
                                      remoteURL: URL,
                                      expectedSize: Int64,
-                                     expectedSHA256: String) async throws -> URL {
+                                     expectedSHA256: String,
+                                     progress: (@Sendable (Int64, Int64) -> Void)? = nil) async throws -> URL {
     if FileManager.default.fileExists(atPath: destination.path) {
         guard isPlainRegularFile(destination.path) else {
             throw GECModelDownloadError.unsafeDestination(
@@ -352,11 +399,15 @@ private func downloadGECFileIfNeeded(existingDescription: String,
     let destinationDirectory = destination.deletingLastPathComponent()
     try FileManager.default.createDirectory(at: destinationDirectory, withIntermediateDirectories: true)
 
-    let (systemTempURL, response) = try await URLSession.shared.download(from: remoteURL)
-    guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-        try? FileManager.default.removeItem(at: systemTempURL)
-        let code = (response as? HTTPURLResponse)?.statusCode ?? -1
-        throw GECModelDownloadError.httpError(statusCode: code)
+    // Delegate-backed download task: byte progress for the UI + the
+    // finished temp file via continuation.
+    let delegate = ModelDownloadDelegate(progress: progress ?? { _, _ in })
+    let progressSession = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
+    defer { progressSession.finishTasksAndInvalidate() }
+
+    let systemTempURL = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL, Error>) in
+        delegate.setContinuation(continuation)
+        progressSession.downloadTask(with: remoteURL).resume()
     }
 
     let sameVolumeTempURL = destinationDirectory.appendingPathComponent(
@@ -649,7 +700,8 @@ func assertSufficientDiskSpaceForBundledModel(_ model: BundledLLMModel) throws {
 /// On-demand download for whichever files `model`'s bundled pass needs
 /// (no-op returning the cached file when already verified).
 @discardableResult
-func downloadBundledLLMModelIfNeeded(_ model: BundledLLMModel) async throws -> URL {
+func downloadBundledLLMModelIfNeeded(_ model: BundledLLMModel,
+                                     progress: (@Sendable (Int64, Int64) -> Void)? = nil) async throws -> URL {
     if model == .voiceScribe {
         // VoiceScribe is the two-file pair (base + LoRA) — its dedicated
         // downloader already handles both pins and the disk-space check.
@@ -665,7 +717,8 @@ func downloadBundledLLMModelIfNeeded(_ model: BundledLLMModel) async throws -> U
         destination: bundledLLMModelPath(model),
         remoteURL: pin.url,
         expectedSize: pin.sizeBytes,
-        expectedSHA256: pin.sha256
+        expectedSHA256: pin.sha256,
+        progress: progress
     )
 }
 
