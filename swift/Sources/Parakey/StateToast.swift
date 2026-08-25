@@ -13,11 +13,25 @@ import Foundation
 
 /// Color coding of the state toast (docs/specs/state-toasts-rewrite-hotkeys-spec.md §1):
 /// `.on` — green (feature enabled), `.off` — neutral gray (feature
-/// disabled), `.neutral` — HUD accent color (mode/informational).
+/// disabled), `.style` — the rewrite style's OWN color, so the active
+/// mode is recognizable at a glance (polish=teal, task=orange,
+/// official=indigo).
 enum StateToastTone {
     case on
     case off
-    case neutral
+    case style(RewriteStyle)
+}
+
+/// Per-style identity colors — the whole point is that the user learns
+/// «teal = Причесать, orange = Задача, indigo = Официальный» and never
+/// has to read the toast to know the mode.
+@MainActor
+func stateToastColor(for style: RewriteStyle) -> NSColor {
+    switch style {
+    case .polish: return .systemTeal
+    case .structuredTask: return .systemOrange
+    case .official: return .systemIndigo
+    }
 }
 
 @MainActor
@@ -31,18 +45,17 @@ final class StateToastController {
     private var panel: NSPanel?
     private var dismissTask: Task<Void, Never>?
 
-    func show(text: String, tone: StateToastTone) {
+    func show(text: String, tone: StateToastTone, targetFrame: NSRect? = nil) {
         dismissTask?.cancel()
         panel?.orderOut(nil)
 
         let panel = Self.makePanel()
         let lightBackground = Self.shouldUseLightBackground()
-        let accentColor = Settings.shared.recordingHUDRecordingColor.resolvedColor(lightBackground: lightBackground)
         let statusColor: NSColor
         switch tone {
         case .on: statusColor = .systemGreen
         case .off: statusColor = NSColor.systemGray
-        case .neutral: statusColor = accentColor
+        case .style(let style): statusColor = stateToastColor(for: style)
         }
 
         // Text: the status word carries the tone color, the rest stays in
@@ -97,7 +110,11 @@ final class StateToastController {
 
         panel.setContentSize(container.frame.size)
         panel.contentView = container
-        Self.positionBottomRight(panel, width: pillWidth)
+        if let targetFrame, let screen = Self.screenFor(point: NSPoint(x: targetFrame.midX, y: targetFrame.midY)) {
+            Self.positionAboveTarget(panel, targetFrame: targetFrame, screen: screen)
+        } else {
+            Self.positionBottomRight(panel, width: pillWidth)
+        }
 
         if let layer = container.layer {
             let bounds = layer.bounds
@@ -197,6 +214,29 @@ final class StateToastController {
             y: screenFrame.minY + 24
         )
         panel.setFrameOrigin(origin)
+    }
+
+    /// Positions the panel just above `targetFrame` (the field the user is
+    /// typing in), falling back to below it if there isn't room above,
+    /// clamped to the target's screen's visible frame — same mechanism as
+    /// VocabularyLearnedToastController.positionAboveTarget.
+    private static func positionAboveTarget(_ panel: NSPanel, targetFrame: NSRect, screen: NSScreen) {
+        let visible = screen.visibleFrame
+        let gap: CGFloat = 12
+        let size = panel.frame.size
+        let preferredX = targetFrame.minX
+        let preferredY = targetFrame.maxY + gap
+        let fallbackY = targetFrame.minY - gap - size.height
+        let y = preferredY + size.height <= visible.maxY - 8 ? preferredY : fallbackY
+        let x = min(max(preferredX, visible.minX + 12), visible.maxX - size.width - 12)
+        let clampedY = min(max(y, visible.minY + 12), visible.maxY - size.height - 12)
+        panel.setFrameOrigin(NSPoint(x: x, y: clampedY))
+    }
+
+    private static func screenFor(point: NSPoint) -> NSScreen? {
+        NSScreen.screens.first(where: { NSMouseInRect(point, $0.frame, false) })
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
     }
 
     private static func shouldUseLightBackground() -> Bool {

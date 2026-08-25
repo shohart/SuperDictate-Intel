@@ -3015,7 +3015,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let next: TextPostprocessingMode = settings.textPostprocessingMode == .correction ? .off : .correction
         settings.textPostprocessingMode = next
         log("text correction: \(next == .correction ? "enabled" : "disabled") via hotkey")
-        stateToastController.show(
+        showStateToast(
             text: next == .correction
                 ? t("Коррекция · вкл", "Correction · on")
                 : t("Коррекция · выкл", "Correction · off"),
@@ -3045,13 +3045,13 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         settings.rewriteEnabled = next
         log("text rewrite: \(next ? "enabled" : "disabled") via hotkey")
         if next {
-            stateToastController.show(
+            showStateToast(
                 text: t("Рерайт · вкл · \(rewriteStyleShortName(settings.rewriteStyle))",
                         "Rewrite · on · \(rewriteStyleShortName(settings.rewriteStyle))"),
-                tone: .on
+                tone: .style(settings.rewriteStyle)
             )
         } else {
-            stateToastController.show(
+            showStateToast(
                 text: t("Рерайт · выкл", "Rewrite · off"),
                 tone: .off
             )
@@ -3082,10 +3082,10 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
         }
         log("text rewrite style: \(next.rawValue) via hotkey (rewrite \(settings.rewriteEnabled ? "on" : "off"))")
-        stateToastController.show(
+        showStateToast(
             text: t("Режим · \(rewriteStyleShortName(next))",
                     "Style · \(rewriteStyleShortName(next))"),
-            tone: .neutral
+            tone: .style(next)
         )
         if settings.playFeedbackSounds {
             Sounds.playStart()
@@ -3094,6 +3094,26 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func t(_ russian: String, _ english: String) -> String {
         localizedText(russian, english, language: settings.interfaceLanguage)
+    }
+
+    /// Shows a state toast anchored to the currently focused text field —
+    /// the same read-only AX capture + frame resolution the vocabulary
+    /// toast uses — falling back to the bottom-right corner when no text
+    /// field has focus.
+    private func showStateToast(text: String, tone: StateToastTone) {
+        Task { [weak self] in
+            let targetFrame: NSRect?
+            do {
+                let target = try await Task.detached(priority: .userInitiated) {
+                    try FocusedTextTargetResolver().captureTarget()
+                }.value
+                targetFrame = resolveElementFrame(target.element)
+            } catch {
+                targetFrame = nil
+            }
+            guard let self else { return }
+            self.stateToastController.show(text: text, tone: tone, targetFrame: targetFrame)
+        }
     }
 
     private func rewriteStyleShortName(_ style: RewriteStyle) -> String {
