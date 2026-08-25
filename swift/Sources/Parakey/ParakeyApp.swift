@@ -275,6 +275,7 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.onToggleCorrection = { [weak self] in self?.toggleTextCorrectionMode() }
         hotkey.onToggleRewrite = { [weak self] in self?.toggleRewriteModeViaHotkey() }
         hotkey.onCycleRewriteStyle = { [weak self] in self?.cycleRewriteStyleViaHotkey() }
+        hotkey.onActivateRewriteStyle = { [weak self] id in self?.activateRewriteStyleViaHotkey(id) }
         hotkey.onRejectedBusyPress = { [weak self] in
             guard let self, self.isBusy, self.settings.playFeedbackSounds else { return }
             Sounds.playError()
@@ -381,6 +382,12 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotkey.setCorrectionHotkey(settings.configuredCorrectionHotkey)
         hotkey.setRewriteHotkey(settings.configuredRewriteToggleHotkey)
         hotkey.setRewriteStyleHotkey(settings.configuredRewriteStyleHotkey)
+        hotkey.setCustomStyleHotkeys(settings.customRewriteStyles.compactMap { custom in
+            guard custom.hotkeyKeycode != 0 else { return nil }
+            return CustomStyleHotkey(id: custom.id,
+                                     choice: hotkeyChoice(forKeycode: CGKeyCode(custom.hotkeyKeycode),
+                                                          modifiers: CGEventFlags(rawValue: custom.hotkeyModifiers)))
+        })
         hotkey.setTriggerMode(settings.triggerMode)
         startStartup(reason: "launch")
     }
@@ -3045,10 +3052,11 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         settings.rewriteEnabled = next
         log("text rewrite: \(next ? "enabled" : "disabled") via hotkey")
         if next {
+            let selection = settings.rewriteStyleSelection()
             showStateToast(
-                text: t("Рерайт · вкл · \(rewriteStyleShortName(settings.rewriteStyle))",
-                        "Rewrite · on · \(rewriteStyleShortName(settings.rewriteStyle))"),
-                tone: .style(settings.rewriteStyle)
+                text: t("Рерайт · вкл · \(selection.displayName)",
+                        "Rewrite · on · \(selection.displayName)"),
+                tone: .selection(selection)
             )
         } else {
             showStateToast(
@@ -3071,21 +3079,55 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// Rewrite style cycle from the global hotkey: next style in
     /// RewriteStyle.allCases; enables rewrite first if it is off.
     private func cycleRewriteStyleViaHotkey() {
-        let all = RewriteStyle.allCases
-        let currentIndex = all.firstIndex(of: settings.rewriteStyle) ?? 0
+        // Built-ins first, then the user's custom modes in creation order.
+        let all: [RewriteStyleSelection] = RewriteStyle.allCases.map { .builtin($0) }
+            + settings.customRewriteStyles.map { .custom($0) }
+        guard !all.isEmpty else { return }
+        let currentID = settings.rewriteStyleID
+        let currentIndex = all.firstIndex(where: { $0.id == currentID }) ?? all.count - 1
         let next = all[(currentIndex + 1) % all.count]
-        settings.rewriteStyle = next
+        settings.setRewriteStyleSelection(next)
         if !settings.rewriteEnabled {
             settings.rewriteEnabled = true
             Task { [llmPostprocessing] in
                 await llmPostprocessing.cancelScheduledUnload()
             }
         }
-        log("text rewrite style: \(next.rawValue) via hotkey (rewrite \(settings.rewriteEnabled ? "on" : "off"))")
+        log("text rewrite style: \(next.id) via hotkey (rewrite on)")
         showStateToast(
-            text: t("Режим · \(rewriteStyleShortName(next))",
-                    "Style · \(rewriteStyleShortName(next))"),
-            tone: .style(next)
+            text: t("Режим · \(next.displayName)",
+                    "Style · \(next.displayName)"),
+            tone: .selection(next)
+        )
+        if settings.playFeedbackSounds {
+            Sounds.playStart()
+        }
+    }
+
+    /// A custom mode's activation hotkey: switch to that mode (and enable
+    /// rewrite first if it is off).
+    private func activateRewriteStyleViaHotkey(_ id: String) {
+        let selection: RewriteStyleSelection
+        if let builtin = RewriteStyle(rawValue: id) {
+            selection = .builtin(builtin)
+        } else if let custom = settings.customRewriteStyles.first(where: { $0.id == id }) {
+            selection = .custom(custom)
+        } else {
+            log("rewrite style hotkey: unknown style id \(id); ignoring")
+            return
+        }
+        settings.setRewriteStyleSelection(selection)
+        if !settings.rewriteEnabled {
+            settings.rewriteEnabled = true
+            Task { [llmPostprocessing] in
+                await llmPostprocessing.cancelScheduledUnload()
+            }
+        }
+        log("text rewrite style: \(id) via its own hotkey (rewrite on)")
+        showStateToast(
+            text: t("Режим · \(selection.displayName)",
+                    "Style · \(selection.displayName)"),
+            tone: .selection(selection)
         )
         if settings.playFeedbackSounds {
             Sounds.playStart()
@@ -3113,14 +3155,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
             guard let self else { return }
             self.stateToastController.show(text: text, tone: tone, targetFrame: targetFrame)
-        }
-    }
-
-    private func rewriteStyleShortName(_ style: RewriteStyle) -> String {
-        switch style {
-        case .polish: return t("Причесать", "Polish")
-        case .structuredTask: return t("Задача", "Task")
-        case .official: return t("Официальный", "Official")
         }
     }
 

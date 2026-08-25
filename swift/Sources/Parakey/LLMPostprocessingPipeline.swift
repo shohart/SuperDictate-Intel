@@ -386,18 +386,32 @@ actor LLMPostprocessingCoordinator {
                                 model: String,
                                 text: String,
                                 settings: Settings) async -> String {
-        let style = settings.rewriteStyle
-        // Per-style user-edited system prompt; empty = the built-in
-        // benchmark default for that style. The «Режим:» user-turn suffix
-        // below is NOT editable — it is part of the benchmark contract.
-        let override = settings.rewriteSystemPromptOverride(for: style)
+        // Active style: built-in or user-created
+        // (docs/specs/custom-rewrite-styles-spec.md). Per-style user-edited
+        // system prompt; empty = the built-in default. The «Режим:»
+        // user-turn suffix is NOT editable for built-ins (benchmark
+        // contract); user-created modes use their uppercased name.
+        let selection = settings.rewriteStyleSelection()
+        let override: String
+        let systemPrompt: String
+        let modeToken: String
+        switch selection {
+        case .builtin(let style):
+            override = settings.rewriteSystemPromptOverride(for: style)
+            systemPrompt = override.isEmpty ? LLMRewritePrompt.systemPrompt(style: style) : override
+            modeToken = LLMRewritePrompt.modeToken(style)
+        case .custom(let custom):
+            override = settings.rewriteSystemPromptOverride(forStyleID: custom.id)
+            systemPrompt = override.isEmpty ? LLMRewritePrompt.systemPrompt(custom: custom) : override
+            modeToken = custom.name.uppercased()
+        }
         let result = await OpenAICompatibleClient.chatCompletion(
             baseURL: baseURL,
             apiKey: apiKey,
             model: model,
-            systemPrompt: override.isEmpty ? LLMRewritePrompt.systemPrompt(style: style) : override,
-            exampleTurns: LLMRewritePrompt.exampleTurns(style: style),
-            userText: LLMRewritePrompt.userText(for: text, style: style),
+            systemPrompt: systemPrompt,
+            exampleTurns: LLMRewritePrompt.exampleTurns(style: .polish),
+            userText: LLMRewritePrompt.userText(for: text, token: modeToken),
             enableThinking: false,
             temperature: 0,
             // Rewrite may legitimately EXPAND text (task structuring adds
@@ -417,7 +431,7 @@ actor LLMPostprocessingCoordinator {
                 log("LLM postprocessing: rewrite returned empty output; passing text through unchanged")
                 return text
             }
-            log("LLM postprocessing: applied rewrite [\(style.rawValue)] (\(text.count) → \(trimmed.count) chars)")
+            log("LLM postprocessing: applied rewrite [\(selection.id)] (\(text.count) → \(trimmed.count) chars)")
             return trimmed
         case .failure(let error):
             log("LLM postprocessing: rewrite request failed (\(error)); passing text through unchanged")

@@ -846,6 +846,7 @@ enum ParakeySelfTest {
         try testConfigurableHistoryShortcut()
         try testConfigurableCorrectionShortcut()
         try testConfigurableRewriteShortcuts()
+        try testCustomRewriteStyles()
         try testOptionCommandEnterChordStopsWithEnter()
         try testEnterShortcutModeSelection()
         try testTogglePressFlipsOnceAndReleaseIsNoOp()
@@ -3309,7 +3310,7 @@ enum ParakeySelfTest {
                        "fresh install must default to the VoiceScribe correction model")
             try expect(settings.rewriteEnabled, equals: false,
                        "rewrite must be off by default")
-            try expect(settings.rewriteStyle, equals: .polish,
+            try expect(settings.rewriteStyleID, equals: RewriteStyle.polish.rawValue,
                        "polish must be the default rewrite style")
             try expect(settings.rewriteEngineBackend, equals: .bundledLocal,
                        "bundled local must be the default rewrite backend")
@@ -3329,7 +3330,8 @@ enum ParakeySelfTest {
             defaults.set("weird", forKey: "rewrite_bundled_model_v2")
             let settings = Settings(defaults: defaults, vocabularyStore: .inMemoryFallback())
             try expect(settings.correctionBundledModel, equals: .voiceScribe, "unknown correction model raw value must normalize to .voiceScribe")
-            try expect(settings.rewriteStyle, equals: .polish, "unknown style raw value must normalize to .polish")
+            try expect(settings.rewriteStyleSelection(), equals: RewriteStyleSelection.builtin(.polish),
+                       "unknown style raw value must normalize to .polish")
             try expect(settings.rewriteEngineBackend, equals: .bundledLocal, "unknown backend raw value must normalize to .bundledLocal")
             try expect(settings.rewriteBundledModel, equals: .yandexGPT, "unknown rewrite model raw value must normalize to .yandexGPT")
         }
@@ -3587,7 +3589,7 @@ enum ParakeySelfTest {
 
         let totalStarted = ProcessInfo.processInfo.systemUptime
         for testCase in cases {
-            settings.rewriteStyle = testCase.style
+            settings.setRewriteStyleSelection(.builtin(testCase.style))
             let started = ProcessInfo.processInfo.systemUptime
             let result = try runParakeetEngineSynchronously {
                 await coordinator.finalizedText(testCase.input, settings: settings)
@@ -8278,6 +8280,69 @@ enum ParakeySelfTest {
                    "rewrite toggle hotkey must round-trip through settings")
         try expect(settings.configuredRewriteStyleHotkey, equals: styleChoice,
                    "rewrite style hotkey must round-trip through settings")
+    }
+
+    /// User-created rewrite modes: storage roundtrip, unified selection
+    /// resolution (built-in / custom / unknown→polish), the custom system
+    /// prompt (base + instruction block), the «Режим: <ИМЯ>» suffix token,
+    /// and the per-custom-mode hotkey action dispatch
+    /// (docs/specs/custom-rewrite-styles-spec.md).
+    private static func testCustomRewriteStyles() throws {
+        let defaults = UserDefaults(suiteName: "com.local.superdictate.selftest.custom-styles-\(UUID().uuidString)")!
+        let settings = Settings(defaults: defaults, vocabularyStore: .inMemoryFallback())
+
+        // Empty by default; unknown active id falls back to polish.
+        try expect(settings.customRewriteStyles.isEmpty, equals: true,
+                   "no custom rewrite styles by default")
+        try expect(settings.rewriteStyleSelection(), equals: RewriteStyleSelection.builtin(.polish),
+                   "unknown active style id must fall back to polish")
+
+        // Create + activate a custom mode.
+        let custom = CustomRewriteStyle(
+            id: "c-test-1",
+            name: "Ассистент",
+            colorHex: "#FF8800",
+            instruction: "- перепиши текст как задачу для ассистента;",
+            hotkeyKeycode: 111,
+            hotkeyModifiers: CGEventFlags.maskShift.rawValue
+        )
+        settings.customRewriteStyles = [custom]
+        settings.setRewriteStyleSelection(.custom(custom))
+        try expect(settings.customRewriteStyles, equals: [custom],
+                   "custom rewrite styles must round-trip through storage")
+        try expect(settings.rewriteStyleSelection(),
+                   equals: RewriteStyleSelection.custom(custom),
+                   "the active custom style must resolve back")
+
+        // Custom system prompt: shared base + the mode's instruction block.
+        let customPrompt = LLMRewritePrompt.systemPrompt(custom: custom)
+        try expect(customPrompt.contains("Не добавляй новых фактов"), equals: true,
+                   "the custom prompt must keep the fact-preservation base")
+        try expect(customPrompt.contains("Режим Ассистент:"), equals: true,
+                   "the custom prompt must carry the mode's instruction block")
+        try expect(customPrompt.contains("перепиши текст как задачу"), equals: true,
+                   "the custom prompt must carry the mode's own instruction")
+
+        // Suffix token: the custom mode's uppercased name.
+        let userText = LLMRewritePrompt.userText(for: "текст", token: custom.name.uppercased())
+        try expect(userText.hasSuffix("\n\nРежим: АССИСТЕНТ"), equals: true,
+                   "custom modes must use their uppercased name as the mode token")
+
+        // Switching back to a built-in keeps the custom stored.
+        settings.setRewriteStyleSelection(.builtin(.official))
+        try expect(settings.rewriteStyleSelection(), equals: RewriteStyleSelection.builtin(.official),
+                   "built-in selection must work alongside stored customs")
+        try expect(settings.customRewriteStyles.count, equals: 1,
+                   "switching to a built-in must not delete custom modes")
+
+        // Per-custom-mode hotkey action dispatch.
+        var dispatched: [HotkeyTransitionAction] = []
+        dispatched = [HotkeyTransitionAction.activateRewriteStyle(custom.id)]
+        guard case .activateRewriteStyle(let dispatchedID) = dispatched[0] else {
+            throw VocabularyLearningTestFailure("activateRewriteStyle action must carry the style id")
+        }
+        try expect(dispatchedID, equals: custom.id,
+                   "the activation action must carry the custom style's id")
     }
 
     private static func testOptionCommandEnterChordStopsWithEnter() throws {

@@ -93,13 +93,14 @@ struct ControlPanelSettingsDraft: Equatable {
     /// instead of writing a replacement from scratch.
     var correctionSystemPrompt: String
     var rewriteEnabled: Bool
-    var rewriteStyle: RewriteStyle
+    var rewriteStyleID: String
+    var customRewriteStyles: [CustomRewriteStyle]
     var rewriteBundledModel: BundledLLMModel
     /// Per-style rewrite system prompts AS SHOWN IN THE EDITOR — one
-    /// independent editable prompt per rewrite mode (polish / task /
-    /// official), each pre-filled with its built-in default when no
-    /// override is stored.
-    var rewriteSystemPrompts: [RewriteStyle: String]
+    /// independent editable prompt per rewrite mode (built-ins by raw
+    /// value, customs by `c-<uuid>` id), each pre-filled with its
+    /// built-in default when no override is stored.
+    var rewriteSystemPrompts: [String: String]
     var rewriteEngineBackend: LLMEngineBackend
     var rewriteCustomBaseURL: String
     var rewriteCustomAPIKey: String
@@ -146,14 +147,21 @@ struct ControlPanelSettingsDraft: Equatable {
                 : override
         }()
         rewriteEnabled = settings.rewriteEnabled
-        rewriteStyle = settings.rewriteStyle
+        rewriteStyleID = settings.rewriteStyleID
+        customRewriteStyles = settings.customRewriteStyles
         rewriteBundledModel = settings.rewriteBundledModel
         rewriteSystemPrompts = {
-            var map: [RewriteStyle: String] = [:]
+            var map: [String: String] = [:]
             for style in RewriteStyle.allCases {
                 let override = settings.rewriteSystemPromptOverride(for: style)
-                map[style] = override.isEmpty
+                map[style.rawValue] = override.isEmpty
                     ? LLMRewritePrompt.systemPrompt(style: style)
+                    : override
+            }
+            for custom in settings.customRewriteStyles {
+                let override = settings.rewriteSystemPromptOverride(forStyleID: custom.id)
+                map[custom.id] = override.isEmpty
+                    ? LLMRewritePrompt.systemPrompt(custom: custom)
                     : override
             }
             return map
@@ -232,7 +240,12 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
     /// Which rewrite style's system prompt the editor is currently showing
     /// (UI state only — never persisted; the persisted setting is the
     /// ACTIVE rewrite style).
-    private var rewritePromptEditorStyle: RewriteStyle = .polish
+    /// Which style's prompt the rewrite prompt editor is showing — by
+    /// unified style id (built-in raw value or custom `c-<uuid>`).
+    private var rewritePromptEditorStyleID: String = RewriteStyle.polish.rawValue
+    /// Hotkey being assigned in the custom-mode editor sheet (nil = none
+    /// assigned yet / recording finished without a choice).
+    private var customStyleEditorHotkey: HotkeyChoice?
     static let llmCustomBaseURLFieldTag = 9001
     static let llmCustomAPIKeyFieldTag = 9002
     static let llmCustomModelNameFieldTag = 9003
@@ -250,6 +263,19 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
 
     private func defaultRewriteSystemPrompt(for style: RewriteStyle) -> String {
         LLMRewritePrompt.systemPrompt(style: style)
+    }
+
+    /// Resolves the built-in default system prompt by unified style id:
+    /// built-in raw values map to their benchmark prompts, custom ids to
+    /// base + the mode's own instruction block.
+    private func defaultRewriteSystemPrompt(forStyleID id: String, draft: ControlPanelSettingsDraft) -> String {
+        if let builtin = RewriteStyle(rawValue: id) {
+            return LLMRewritePrompt.systemPrompt(style: builtin)
+        }
+        if let custom = draft.customRewriteStyles.first(where: { $0.id == id }) {
+            return LLMRewritePrompt.systemPrompt(custom: custom)
+        }
+        return LLMRewritePrompt.systemPrompt(style: .polish)
     }
     static let rewriteCustomAPIKeyFieldTag = 9005
     static let rewriteCustomModelNameFieldTag = 9006
@@ -756,6 +782,7 @@ case .text:
             content.addArrangedSubview(rewriteModeRow(draft))
             if draft.rewriteEnabled {
                 content.addArrangedSubview(rewriteStyleRow(draft))
+            content.addArrangedSubview(customRewriteStylesBlock(draft))
                 content.addArrangedSubview(rewriteModelRow(draft))
                 content.addArrangedSubview(rewriteEngineBackendRow(draft))
                 switch draft.rewriteEngineBackend {
@@ -2336,15 +2363,295 @@ header.addArrangedSubview(panelLabel(
             title: t("Режим реврайта", "Rewrite style"),
             detail: t("Причесать — убрать повторы и несогласования. Задача — структурировать вольный текст в чёткую задачу. Официальный — сухой формальный стиль.",
                       "Polish — remove repeats and mismatches. Task — structure free-form text into a clear task. Official — dry formal style."),
-            selectedValue: draft.rewriteStyle.rawValue,
+            selectedValue: draft.rewriteStyleID,
             options: [
                 (t("Причесать текст", "Polish text"), RewriteStyle.polish.rawValue),
                 (t("Структурировать в задачу", "Structure into a task"), RewriteStyle.structuredTask.rawValue),
                 (t("Официальный стиль", "Official style"), RewriteStyle.official.rawValue),
-            ],
+            ] + draft.customRewriteStyles.map { ($0.name, $0.id) },
             action: #selector(selectRewriteStyle(_:)),
             toolTip: t("Выбрать способ переработки текста.", "Choose how the text is rewritten.")
         )
+    }
+
+    /// User-created rewrite modes: one row per mode (color swatch, name,
+    /// activation hotkey, edit/delete) plus the «Новый режим» button.
+    /// Creation/editing opens a modal sheet (name, color, instruction,
+    /// hotkey); persistence happens on Save like every other setting.
+    private func customRewriteStylesBlock(_ draft: ControlPanelSettingsDraft) -> NSView {
+        let container = NSStackView()
+        container.orientation = .vertical
+        container.alignment = .leading
+        container.spacing = 6
+
+        let header = NSStackView()
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 10
+        header.addArrangedSubview(panelLabel(
+            t("Свои режимы реврайта", "Custom rewrite modes"),
+            size: 13,
+            weight: .semibold
+        ))
+        header.addArrangedSubview(NSView())
+        let addButton = panelButton(
+            t("＋ Новый режим", "＋ New mode"),
+            action: #selector(addCustomRewriteStyleClicked(_:))
+        )
+        addButton.toolTip = t("Создать свой режим реврайта: имя, цвет, инструкция, хоткей.",
+                              "Create a custom rewrite mode: name, color, instruction, hotkey.")
+        header.addArrangedSubview(addButton)
+        container.addArrangedSubview(header)
+
+        if draft.customRewriteStyles.isEmpty {
+            let empty = panelLabel(
+                t("Своих режимов пока нет — создай режим со своей инструкцией для модели, цветом и хоткеем.",
+                  "No custom modes yet — create one with its own model instruction, color and hotkey."),
+                size: 11,
+                color: .secondaryLabelColor
+            )
+            empty.preferredMaxLayoutWidth = 440
+            container.addArrangedSubview(empty)
+        }
+
+        for (index, custom) in draft.customRewriteStyles.enumerated() {
+            let row = NSStackView()
+            row.orientation = .horizontal
+            row.alignment = .centerY
+            row.spacing = 8
+
+            let swatch = NSView(frame: NSRect(x: 0, y: 0, width: 12, height: 12))
+            swatch.wantsLayer = true
+            swatch.layer?.cornerRadius = 6
+            swatch.layer?.backgroundColor = StateToastController.color(forColorHex: custom.colorHex).cgColor
+            swatch.translatesAutoresizingMaskIntoConstraints = false
+            swatch.widthAnchor.constraint(equalToConstant: 12).isActive = true
+            swatch.heightAnchor.constraint(equalToConstant: 12).isActive = true
+            row.addArrangedSubview(swatch)
+
+            row.addArrangedSubview(panelLabel(custom.name, size: 12, weight: .medium))
+
+            let hotkeyButton = panelButton(
+                localizedHotkeyName(hotkeyChoice(forKeycode: CGKeyCode(custom.hotkeyKeycode),
+                                                    modifiers: CGEventFlags(rawValue: custom.hotkeyModifiers)),
+                                    language: language),
+                action: #selector(customStyleHotkeyClicked(_:)),
+                enabled: serviceOperation == nil
+            )
+            hotkeyButton.tag = index
+            hotkeyButton.toolTip = t("Хоткей активации этого режима (0 = не назначен).",
+                                     "This mode's activation hotkey (0 = none).")
+            row.addArrangedSubview(hotkeyButton)
+
+            row.addArrangedSubview(NSView())
+
+            let editButton = panelButton(t("Изменить", "Edit"),
+                                         action: #selector(editCustomRewriteStyleClicked(_:)))
+            editButton.tag = index
+            row.addArrangedSubview(editButton)
+
+            let deleteButton = panelButton(t("Удалить", "Delete"),
+                                           action: #selector(deleteCustomRewriteStyleClicked(_:)))
+            deleteButton.tag = index
+            row.addArrangedSubview(deleteButton)
+
+            container.addArrangedSubview(row)
+        }
+
+        NSLayoutConstraint.activate(container.arrangedSubviews.map {
+            $0.widthAnchor.constraint(equalTo: container.widthAnchor)
+        })
+        return container
+    }
+
+    /// Modal create/edit sheet for a custom rewrite mode: name, color,
+    /// LLM instruction and activation hotkey.
+    private func presentCustomStyleEditor(_ draft: ControlPanelSettingsDraft, existing: CustomRewriteStyle?) {
+        let nameField = NSTextField(string: existing?.name ?? "")
+        nameField.placeholderString = t("Например: Задача для ассистента", "e.g. Task for my assistant")
+        nameField.translatesAutoresizingMaskIntoConstraints = false
+
+        let colorWell = NSColorWell()
+        colorWell.supportsAlpha = false
+        colorWell.color = StateToastController.color(forColorHex: existing?.colorHex ?? "")
+        colorWell.translatesAutoresizingMaskIntoConstraints = false
+        colorWell.widthAnchor.constraint(equalToConstant: 60).isActive = true
+        colorWell.heightAnchor.constraint(equalToConstant: 24).isActive = true
+
+        let instruction = NSTextView()
+        instruction.isRichText = false
+        instruction.font = NSFont.systemFont(ofSize: 12)
+        instruction.string = existing?.instruction ?? ""
+        instruction.isEditable = true
+        instruction.isVerticallyResizable = true
+        instruction.textContainer?.widthTracksTextView = true
+        instruction.autoresizingMask = [.width]
+        let instructionScroll = NSScrollView()
+        instructionScroll.hasVerticalScroller = true
+        instructionScroll.borderType = .bezelBorder
+        instructionScroll.documentView = instruction
+        instructionScroll.translatesAutoresizingMaskIntoConstraints = false
+        instructionScroll.heightAnchor.constraint(equalToConstant: 88).isActive = true
+
+        customStyleEditorHotkey = existing.map { custom in
+            hotkeyChoice(forKeycode: CGKeyCode(custom.hotkeyKeycode),
+                         modifiers: CGEventFlags(rawValue: custom.hotkeyModifiers))
+        }
+        let hotkeyButton = panelButton(
+            localizedHotkeyName(customStyleEditorHotkey ?? hotkeyChoice(forKeycode: 0), language: language),
+            action: #selector(customStyleEditorHotkeyClicked(_:))
+        )
+        hotkeyButton.identifier = NSUserInterfaceItemIdentifier("custom-style-hotkey")
+
+        let accessory = NSStackView()
+        accessory.orientation = .vertical
+        accessory.alignment = .leading
+        accessory.spacing = 8
+        accessory.addArrangedSubview(panelLabel(t("Имя режима", "Mode name"), size: 12, weight: .medium, color: .secondaryLabelColor))
+        accessory.addArrangedSubview(nameField)
+        accessory.addArrangedSubview(panelLabel(t("Инструкция для модели (что делать с текстом)", "Model instruction (what to do with the text)"), size: 12, weight: .medium, color: .secondaryLabelColor))
+        accessory.addArrangedSubview(instructionScroll)
+        accessory.addArrangedSubview(panelLabel(t("Цвет уведомления и хоткей активации", "Notification color and activation hotkey"), size: 12, weight: .medium, color: .secondaryLabelColor))
+        let colorHotkeyRow = NSStackView()
+        colorHotkeyRow.orientation = .horizontal
+        colorHotkeyRow.spacing = 10
+        colorHotkeyRow.addArrangedSubview(colorWell)
+        colorHotkeyRow.addArrangedSubview(hotkeyButton)
+        accessory.addArrangedSubview(colorHotkeyRow)
+
+        NSLayoutConstraint.activate([
+            nameField.widthAnchor.constraint(equalTo: accessory.widthAnchor),
+            instructionScroll.widthAnchor.constraint(equalTo: accessory.widthAnchor),
+        ])
+        accessory.widthAnchor.constraint(equalToConstant: 360).isActive = true
+
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = existing == nil
+            ? t("Новый режим реврайта", "New rewrite mode")
+            : t("Изменить режим реврайта", "Edit rewrite mode")
+        alert.accessoryView = accessory
+        alert.addButton(withTitle: t("Сохранить", "Save"))
+        alert.addButton(withTitle: t("Отмена", "Cancel"))
+        alert.window.initialFirstResponder = nameField
+
+        let response = alert.runModal()
+        guard response == .alertFirstButtonReturn else {
+            customStyleEditorHotkey = nil
+            return
+        }
+
+        let name = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+        let colorHex = Self.hexString(from: colorWell.color)
+        let instructionText = instruction.string
+        let hotkey = customStyleEditorHotkey ?? hotkeyChoice(forKeycode: 0)
+
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        var styles = draft.customRewriteStyles
+        if let existing {
+            guard let index = styles.firstIndex(where: { $0.id == existing.id }) else { return }
+            styles[index].name = name
+            styles[index].colorHex = colorHex
+            styles[index].instruction = instructionText
+            styles[index].hotkeyKeycode = Int(hotkey.keycode)
+            styles[index].hotkeyModifiers = hotkey.requiredModifiers.rawValue
+        } else {
+            styles.append(CustomRewriteStyle(
+                id: "c-\(UUID().uuidString)",
+                name: name,
+                colorHex: colorHex,
+                instruction: instructionText,
+                hotkeyKeycode: Int(hotkey.keycode),
+                hotkeyModifiers: hotkey.requiredModifiers.rawValue
+            ))
+        }
+        draft.customRewriteStyles = styles
+        customStyleEditorHotkey = nil
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
+    @objc private func addCustomRewriteStyleClicked(_ sender: NSButton) {
+        let draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        presentCustomStyleEditor(draft, existing: nil)
+    }
+
+    @objc private func editCustomRewriteStyleClicked(_ sender: NSButton) {
+        let draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        guard draft.customRewriteStyles.indices.contains(sender.tag) else { return }
+        presentCustomStyleEditor(draft, existing: draft.customRewriteStyles[sender.tag])
+    }
+
+    @objc private func deleteCustomRewriteStyleClicked(_ sender: NSButton) {
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        guard draft.customRewriteStyles.indices.contains(sender.tag) else { return }
+        let removed = draft.customRewriteStyles.remove(at: sender.tag)
+        // Deleting the ACTIVE style must not strand the setting on a
+        // dangling id — the resolver would silently fall back to polish.
+        if draft.rewriteStyleID == removed.id {
+            draft.rewriteStyleID = RewriteStyle.polish.rawValue
+        }
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
+    @objc private func customStyleHotkeyClicked(_ sender: NSButton) {
+        // Per-row hotkey recording for EXISTING modes (the sheet uses
+        // customStyleEditorHotkeyClicked instead).
+        let draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        guard draft.customRewriteStyles.indices.contains(sender.tag) else { return }
+        let index = sender.tag
+        startCustomStyleHotkeyRecording(index: index) { [weak self] selected in
+            guard let self, self.settingsDraft?.customRewriteStyles.indices.contains(index) == true else { return }
+            self.settingsDraft?.customRewriteStyles[index].hotkeyKeycode = Int(selected.keycode)
+            self.settingsDraft?.customRewriteStyles[index].hotkeyModifiers = selected.requiredModifiers.rawValue
+            self.refreshSettingsWindow()
+        }
+    }
+
+    @objc private func customStyleEditorHotkeyClicked(_ sender: NSButton) {
+        startCustomStyleHotkeyRecording(index: -1) { [weak self] selected in
+            self?.customStyleEditorHotkey = selected
+            if let button = sender as? NSButton {
+                button.title = localizedHotkeyName(selected, language: self?.language ?? .russian)
+            }
+        }
+    }
+
+    /// Starts a global hotkey recording session for a custom mode's
+    /// activation key (index -1 = the editor sheet's button).
+    private func startCustomStyleHotkeyRecording(index: Int,
+                                                 completion: @escaping (HotkeyChoice) -> Void) {
+        DistributedNotificationCenter.default().postNotificationName(
+            HOTKEY_CAPTURE_BEGIN_NOTIFICATION,
+            object: nil,
+            userInfo: nil,
+            deliverImmediately: true
+        )
+        let recorder = HotkeyRecorderController(language: language,
+                                                titleOverride: t("Нажмите сочетание для режима", "Press the shortcut for this mode")) { [weak self] selected in
+            DistributedNotificationCenter.default().postNotificationName(
+                HOTKEY_CAPTURE_END_NOTIFICATION,
+                object: nil,
+                userInfo: nil,
+                deliverImmediately: true
+            )
+            guard let self else { return }
+            self.hotkeyRecorder = nil
+            guard let selected else { return }
+            completion(selected)
+            self.refreshSettingsWindow()
+        }
+        hotkeyRecorder = recorder
+    }
+
+    private static func hexString(from color: NSColor) -> String {
+        let converted = color.usingColorSpace(.sRGB) ?? color
+        return String(format: "#%02X%02X%02X",
+                      Int(round(converted.redComponent * 255)),
+                      Int(round(converted.greenComponent * 255)),
+                      Int(round(converted.blueComponent * 255)))
     }
 
     /// Bundled rewrite model picker — the benchmark's big-model class
@@ -2463,16 +2770,23 @@ header.addArrangedSubview(panelLabel(
         for style in RewriteStyle.allCases {
             styleSwitcher.addItem(withTitle: localizedRewriteStyleShortName(style))
         }
-        styleSwitcher.selectItem(at: RewriteStyle.allCases.firstIndex(of: rewritePromptEditorStyle) ?? 0)
+        let allEditorStyles: [(id: String, name: String)] =
+            RewriteStyle.allCases.map { ($0.rawValue, localizedRewriteStyleShortName($0)) }
+            + draft.customRewriteStyles.map { ($0.id, $0.name) }
+        for styleEntry in allEditorStyles {
+            styleSwitcher.addItem(withTitle: styleEntry.name)
+        }
+        let editorIndex = allEditorStyles.firstIndex(where: { $0.id == rewritePromptEditorStyleID }) ?? 0
+        styleSwitcher.selectItem(at: editorIndex)
         styleSwitcher.target = self
         styleSwitcher.action = #selector(selectRewritePromptStyle(_:))
         styleSwitcher.setContentHuggingPriority(.required, for: .horizontal)
         header.addArrangedSubview(styleSwitcher)
 
-        let editingStyle = rewritePromptEditorStyle
-        let currentText = draft.rewriteSystemPrompts[editingStyle]
-            ?? defaultRewriteSystemPrompt(for: editingStyle)
-        let isDefault = currentText == defaultRewriteSystemPrompt(for: editingStyle)
+        let editingStyleID = rewritePromptEditorStyleID
+        let currentText = draft.rewriteSystemPrompts[editingStyleID]
+            ?? defaultRewriteSystemPrompt(forStyleID: editingStyleID, draft: draft)
+        let isDefault = currentText == defaultRewriteSystemPrompt(forStyleID: editingStyleID, draft: draft)
         let reset = panelButton(
             t("Вернуть стандартный", "Reset to default"),
             action: #selector(resetRewritePromptClicked(_:)),
@@ -2544,8 +2858,10 @@ header.addArrangedSubview(panelLabel(
 
     @objc private func selectRewritePromptStyle(_ sender: NSPopUpButton) {
         let index = sender.indexOfSelectedItem
-        guard RewriteStyle.allCases.indices.contains(index) else { return }
-        rewritePromptEditorStyle = RewriteStyle.allCases[index]
+        let allIDs = RewriteStyle.allCases.map(\.rawValue)
+            + (settingsDraft?.customRewriteStyles ?? []).map(\.id)
+        guard allIDs.indices.contains(index) else { return }
+        rewritePromptEditorStyleID = allIDs[index]
         refreshSettingsWindow()
     }
 
@@ -2558,7 +2874,7 @@ header.addArrangedSubview(panelLabel(
 
     @objc private func resetRewritePromptClicked(_ sender: NSButton) {
         var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
-        draft.rewriteSystemPrompts[rewritePromptEditorStyle] = defaultRewriteSystemPrompt(for: rewritePromptEditorStyle)
+        draft.rewriteSystemPrompts[rewritePromptEditorStyleID] = defaultRewriteSystemPrompt(forStyleID: rewritePromptEditorStyleID, draft: draft)
         settingsDraft = draft
         refreshSettingsWindow()
     }
@@ -2618,10 +2934,9 @@ header.addArrangedSubview(panelLabel(
     }
 
     @objc private func selectRewriteStyle(_ sender: NSPopUpButton) {
-        guard let raw = sender.selectedItem?.representedObject as? String,
-              let style = RewriteStyle(rawValue: raw) else { return }
+        guard let id = sender.selectedItem?.representedObject as? String else { return }
         var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
-        draft.rewriteStyle = style
+        draft.rewriteStyleID = id
         settingsDraft = draft
         refreshSettingsWindow()
     }
@@ -3693,7 +4008,7 @@ header.addArrangedSubview(panelLabel(
         case Self.correctionSystemPromptEditorID:
             draft.correctionSystemPrompt = textView.string
         case Self.rewriteSystemPromptEditorID:
-            draft.rewriteSystemPrompts[rewritePromptEditorStyle] = textView.string
+            draft.rewriteSystemPrompts[rewritePromptEditorStyleID] = textView.string
         default:
             return
         }
@@ -3765,17 +4080,20 @@ header.addArrangedSubview(panelLabel(
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let correctionPromptText = draft.correctionSystemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         settings.correctionSystemPromptOverride = correctionPromptText == correctionPromptDefault ? "" : draft.correctionSystemPrompt
-        for style in RewriteStyle.allCases {
-            let styleDefault = defaultRewriteSystemPrompt(for: style)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            let styleText = (draft.rewriteSystemPrompts[style] ?? styleDefault)
+        var allStyles: [(id: String, defaultPrompt: String)] =
+            RewriteStyle.allCases.map { ($0.rawValue, defaultRewriteSystemPrompt(for: $0)) }
+            + draft.customRewriteStyles.map { ($0.id, LLMRewritePrompt.systemPrompt(custom: $0)) }
+        for styleEntry in allStyles {
+            let styleDefault = styleEntry.defaultPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+            let styleText = (draft.rewriteSystemPrompts[styleEntry.id] ?? styleEntry.defaultPrompt)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             settings.setRewriteSystemPromptOverride(
-                styleText == styleDefault ? "" : (draft.rewriteSystemPrompts[style] ?? styleDefault),
-                for: style)
+                styleText == styleDefault ? "" : (draft.rewriteSystemPrompts[styleEntry.id] ?? styleDefault),
+                forStyleID: styleEntry.id)
         }
         settings.rewriteEnabled = draft.rewriteEnabled
-        settings.rewriteStyle = draft.rewriteStyle
+        settings.rewriteStyleID = draft.rewriteStyleID
+        settings.customRewriteStyles = draft.customRewriteStyles
         settings.rewriteBundledModel = draft.rewriteBundledModel
         settings.rewriteEngineBackend = draft.rewriteEngineBackend
         settings.rewriteCustomBaseURL = draft.rewriteCustomBaseURL

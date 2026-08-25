@@ -108,6 +108,7 @@ final class Settings: @unchecked Sendable {
     private static let keyCorrectionBundledModel = "correction_bundled_model_v2"
     private static let keyRewriteEnabled = "rewrite_enabled_v1"
     private static let keyRewriteStyle = "rewrite_style_v1"
+    private static let keyCustomRewriteStyles = "rewrite_custom_styles_v1"
     private static let keyRewriteBundledModel = "rewrite_bundled_model_v1"
     private static let keyRewriteBundledModelV2 = "rewrite_bundled_model_v2"
     private static let keyCorrectionSystemPrompt = "correction_system_prompt_v1"
@@ -1083,16 +1084,54 @@ final class Settings: @unchecked Sendable {
     /// prompts — polish / structured task / official — per the product
     /// decision that each rewrite mode keeps its own editable prompt.
     func rewriteSystemPromptOverride(for style: RewriteStyle) -> String {
-        defaults.string(forKey: Self.keyRewriteSystemPrompt(style)) ?? ""
+        rewriteSystemPromptOverride(forStyleID: style.rawValue)
     }
 
     func setRewriteSystemPromptOverride(_ value: String, for style: RewriteStyle) {
-        defaults.set(value, forKey: Self.keyRewriteSystemPrompt(style))
+        setRewriteSystemPromptOverride(value, forStyleID: style.rawValue)
     }
 
-    var rewriteStyle: RewriteStyle {
-        get { normalizedRewriteStyle(rawValue: defaults.string(forKey: Self.keyRewriteStyle)) }
-        set { defaults.set(newValue.rawValue, forKey: Self.keyRewriteStyle) }
+    /// User-created rewrite modes (docs/specs/custom-rewrite-styles-spec.md).
+    var customRewriteStyles: [CustomRewriteStyle] {
+        get {
+            guard let data = defaults.data(forKey: Self.keyCustomRewriteStyles) else { return [] }
+            return (try? JSONDecoder().decode([CustomRewriteStyle].self, from: data)) ?? []
+        }
+        set {
+            defaults.set(try? JSONEncoder().encode(newValue),
+                         forKey: Self.keyCustomRewriteStyles)
+        }
+    }
+
+    /// Active rewrite style as a unified string id: built-in raw values
+    /// (`polish`/`structured_task`/`official`) and custom ids (`c-<uuid>`)
+    /// share the EXISTING `rewrite_style_v1` key — no migration needed.
+    var rewriteStyleID: String {
+        get { defaults.string(forKey: Self.keyRewriteStyle) ?? RewriteStyle.polish.rawValue }
+        set { defaults.set(newValue, forKey: Self.keyRewriteStyle) }
+    }
+
+    /// Resolves the stored id against built-ins and the user's custom
+    /// styles; unknown ids fall back to `.builtin(.polish)`.
+    func rewriteStyleSelection() -> RewriteStyleSelection {
+        let id = rewriteStyleID
+        if let builtin = RewriteStyle(rawValue: id) { return .builtin(builtin) }
+        if let custom = customRewriteStyles.first(where: { $0.id == id }) { return .custom(custom) }
+        return .builtin(.polish)
+    }
+
+    func setRewriteStyleSelection(_ selection: RewriteStyleSelection) {
+        rewriteStyleID = selection.id
+    }
+
+    /// Per-style FULL system prompt override, keyed by style id (built-in
+    /// raw values and custom ids share the key pattern).
+    func rewriteSystemPromptOverride(forStyleID id: String) -> String {
+        defaults.string(forKey: "rewrite_system_prompt_\(id)_v1") ?? ""
+    }
+
+    func setRewriteSystemPromptOverride(_ value: String, forStyleID id: String) {
+        defaults.set(value, forKey: "rewrite_system_prompt_\(id)_v1")
     }
 
     /// Which bundled model the rewrite pass loads when

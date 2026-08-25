@@ -183,6 +183,19 @@ enum LLMRewritePrompt {
         text + "\n\nРежим: " + modeToken(style)
     }
 
+    /// Same, with an explicit token — user-created modes use their name
+    /// uppercased (docs/specs/custom-rewrite-styles-spec.md §1.4).
+    static func userText(for text: String, token: String) -> String {
+        text + "\n\nРежим: " + token
+    }
+
+    /// System prompt for a user-created mode: the shared benchmark
+    /// fact-preservation base + the mode's own instruction block
+    /// (captured at creation, editable in the mode editor).
+    static func systemPrompt(custom: CustomRewriteStyle) -> String {
+        base + "\n\nРежим " + custom.name + ":\n" + custom.instruction
+    }
+
     /// No few-shot turns for rewrite: the benchmark's validated runs were
     /// zero-shot, and unlike the 0.8B VoiceScribe adapter this is an
     /// 8B instruct model that follows prose instructions reliably.
@@ -214,7 +227,7 @@ enum LLMRewritePrompt {
     Верни только итоговый текст без пояснений.
     """
 
-    private static func modeToken(_ style: RewriteStyle) -> String {
+    static func modeToken(_ style: RewriteStyle) -> String {
         switch style {
         case .polish: return "POLISH"
         case .structuredTask: return "AGENT_TASK"

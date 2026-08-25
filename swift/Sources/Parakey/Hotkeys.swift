@@ -465,9 +465,20 @@ enum HotkeyTransitionAction: Equatable, Sendable {
     /// rationale as toggleCorrection.
     case toggleRewrite
     /// Global shortcut to cycle the rewrite style (polish → structured
-    /// task → official → polish). Implies rewrite is on; the app-side
-    /// handler enables it if needed.
+    /// task → official → polish → customs). Implies rewrite is on; the
+    /// app-side handler enables it if needed.
     case cycleRewriteStyle
+    /// Per-custom-mode activation hotkey: switches the active rewrite
+    /// style to the user-created mode with this id (and enables rewrite
+    /// if it is off) — docs/specs/custom-rewrite-styles-spec.md §1.5.
+    case activateRewriteStyle(String)
+}
+
+/// One user-created rewrite mode's activation hotkey. A small struct
+/// (not a tuple) so it flows through the transition parameters cleanly.
+struct CustomStyleHotkey: Equatable {
+    let id: String
+    let choice: HotkeyChoice
 }
 
 struct HotkeyTransitionResult: Equatable, Sendable {
@@ -629,6 +640,7 @@ struct HotkeyTransitionState {
     private var correctionShortcutState = HotkeyShortcutState()
     private var rewriteShortcutState = HotkeyShortcutState()
     private var rewriteStyleShortcutState = HotkeyShortcutState()
+    private var customStyleShortcutStates: [String: HotkeyShortcutState] = [:]
     private var toggleActive = false
     private var suppressEscapeKeyUp = false
     /// Previous `isRecording` value seen by `transition(for:...)`, used
@@ -688,6 +700,7 @@ struct HotkeyTransitionState {
         // them (Settings → Коррекция) to whatever chord they prefer.
         rewriteHotkey: HotkeyChoice = hotkeyChoice(forKeycode: 105),          // F13
         rewriteStyleHotkey: HotkeyChoice = hotkeyChoice(forKeycode: 107),     // F14
+        customStyleHotkeys: [CustomStyleHotkey] = [],
         triggerMode: TriggerMode,
         isRecording: Bool,
         canStartRecording: Bool = true
@@ -738,6 +751,10 @@ struct HotkeyTransitionState {
 
         if let rewriteStyle = transitionRewriteStyleShortcut(for: event, rewriteStyleHotkey: rewriteStyleHotkey) {
             return rewriteStyle
+        }
+
+        if let activation = transitionCustomStyleShortcuts(for: event, customStyleHotkeys: customStyleHotkeys) {
+            return activation
         }
 
         let shortcutResult = standardShortcutState.consume(event, shortcut: hotkey)
@@ -855,6 +872,32 @@ struct HotkeyTransitionState {
         }
     }
 
+    /// Per-custom-mode activation hotkeys: each is an independent
+    /// single-chord state machine (same shape as
+    /// transitionCorrectionShortcut). First matching chord wins.
+    private mutating func transitionCustomStyleShortcuts(
+        for event: HotkeyEventSnapshot,
+        customStyleHotkeys: [CustomStyleHotkey]
+    ) -> HotkeyTransitionResult? {
+        for entry in customStyleHotkeys {
+            var shortcutState = customStyleShortcutStates[entry.id] ?? HotkeyShortcutState()
+            let shortcutResult = shortcutState.consume(event, shortcut: entry.choice)
+            customStyleShortcutStates[entry.id] = shortcutState
+            switch shortcutResult.edge {
+            case .press:
+                return HotkeyTransitionResult(suppress: shortcutResult.suppress,
+                                              actions: [.activateRewriteStyle(entry.id)])
+            case .suppress:
+                return .suppressOnly
+            case .release:
+                if shortcutResult.suppress { return .suppressOnly }
+            case .pass:
+                continue
+            }
+        }
+        return nil
+    }
+
     private mutating func transitionEnterShortcut(
         for event: HotkeyEventSnapshot,
         isRecording: Bool,
@@ -916,6 +959,9 @@ final class HotkeyListener {
     var correctionHotkey: HotkeyChoice = hotkeyChoice(forKeycode: LEFT_COMMAND_KEYCODE)
     var rewriteHotkey: HotkeyChoice = hotkeyChoice(forKeycode: 105)          // F13
     var rewriteStyleHotkey: HotkeyChoice = hotkeyChoice(forKeycode: 107)     // F14
+    /// Activation hotkeys for user-created rewrite modes; re-set whenever
+    /// the user edits their custom modes in Settings.
+    var customStyleHotkeys: [CustomStyleHotkey] = []
     var triggerMode: TriggerMode = .hold
 
     /// onPress fires when a recording should start (press in hold mode,
@@ -930,6 +976,7 @@ final class HotkeyListener {
     var onToggleCorrection: (() -> Void)?
     var onToggleRewrite: (() -> Void)?
     var onCycleRewriteStyle: (() -> Void)?
+    var onActivateRewriteStyle: ((String) -> Void)?
     /// Toggle mode: a press arrived while the app is busy (transcription
     /// in flight). The toggle did NOT flip. Play feedback so the user
     /// knows the press was received but rejected.
@@ -1045,6 +1092,12 @@ final class HotkeyListener {
         log("HotkeyListener: rewrite style hotkey changed → \(choice.name)")
     }
 
+    func setCustomStyleHotkeys(_ hotkeys: [CustomStyleHotkey]) {
+        customStyleHotkeys = hotkeys
+        transitionState.resetAll()
+        log("HotkeyListener: custom rewrite style hotkeys changed (\(hotkeys.count))")
+    }
+
     func setTriggerMode(_ mode: TriggerMode) {
         // Reset toggle state when switching modes so we don't get
         // stuck in mid-toggle from a previous session.
@@ -1071,6 +1124,7 @@ final class HotkeyListener {
                                                 correctionHotkey: correctionHotkey,
                                                 rewriteHotkey: rewriteHotkey,
                                                 rewriteStyleHotkey: rewriteStyleHotkey,
+                                                customStyleHotkeys: customStyleHotkeys,
                                                 triggerMode: triggerMode,
                                                 isRecording: isRecordingActive?() ?? false,
                                                 canStartRecording: canStartRecording?() ?? true)
@@ -1098,6 +1152,7 @@ final class HotkeyListener {
             case .toggleCorrection: onToggleCorrection?()
             case .toggleRewrite: onToggleRewrite?()
             case .cycleRewriteStyle: onCycleRewriteStyle?()
+            case .activateRewriteStyle(let id): onActivateRewriteStyle?(id)
             case .rejectedBusyPress: onRejectedBusyPress?()
             }
         }

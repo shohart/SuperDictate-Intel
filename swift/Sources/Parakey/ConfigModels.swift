@@ -620,6 +620,44 @@ enum RewriteStyle: String, CaseIterable, Codable {
     }
 }
 
+/// A user-created rewrite mode: name, identity color, LLM instruction and
+/// an optional activation hotkey (docs/specs/custom-rewrite-styles-spec.md).
+/// Stored as a JSON array in `rewrite_custom_styles_v1`.
+struct CustomRewriteStyle: Identifiable, Codable, Equatable {
+    var id: String
+    var name: String
+    /// Identity color for the state toast, "#RRGGBB".
+    var colorHex: String
+    /// Mode-specific instruction appended after the shared
+    /// fact-preservation base in the system prompt.
+    var instruction: String
+    /// Activation hotkey; keycode 0 = not assigned.
+    var hotkeyKeycode: Int
+    var hotkeyModifiers: UInt64
+}
+
+/// The active rewrite style: either a built-in or a user-created one.
+/// Both share the `rewrite_style_v1` key's value space (built-in raw
+/// values + `c-<uuid>` for customs), so no migration is needed.
+enum RewriteStyleSelection: Equatable {
+    case builtin(RewriteStyle)
+    case custom(CustomRewriteStyle)
+
+    var id: String {
+        switch self {
+        case .builtin(let style): return style.rawValue
+        case .custom(let custom): return custom.id
+        }
+    }
+
+    var displayName: String {
+        switch self {
+        case .builtin(let style): return style.displayName
+        case .custom(let custom): return custom.name
+        }
+    }
+}
+
 func normalizedTextPostprocessingMode(rawValue: String?) -> TextPostprocessingMode {
     guard let rawValue, let mode = TextPostprocessingMode(rawValue: rawValue) else {
         return .off

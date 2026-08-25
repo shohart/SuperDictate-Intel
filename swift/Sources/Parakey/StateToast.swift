@@ -20,6 +20,16 @@ enum StateToastTone {
     case on
     case off
     case style(RewriteStyle)
+    /// User-created mode: carries its own identity color (hex).
+    case custom(hex: String)
+
+    /// Convenience: tone for a unified style selection.
+    static func selection(_ sel: RewriteStyleSelection) -> StateToastTone {
+        switch sel {
+        case .builtin(let style): return .style(style)
+        case .custom(let custom): return .custom(hex: custom.colorHex)
+        }
+    }
 }
 
 /// Per-style identity colors — the whole point is that the user learns
@@ -56,6 +66,9 @@ final class StateToastController {
         case .on: statusColor = .systemGreen
         case .off: statusColor = NSColor.systemGray
         case .style(let style): statusColor = stateToastColor(for: style)
+        case .custom(let hex):
+            statusColor = Self.nsColor(fromHex: hex)
+                ?? Settings.shared.recordingHUDRecordingColor.resolvedColor(lightBackground: lightBackground)
         }
 
         // Text: the status word carries the tone color, the rest stays in
@@ -174,6 +187,25 @@ final class StateToastController {
         scaleOut.isRemovedOnCompletion = false
         content?.layer?.add(scaleOut, forKey: "stateToastScaleOut")
         content?.layer?.setAffineTransform(CGAffineTransform(scaleX: Self.entryExitScale, y: Self.entryExitScale))
+    }
+
+    /// Static resolver for UI swatches outside this controller (the
+    /// custom-modes management rows).
+    static func color(forColorHex hex: String) -> NSColor {
+        nsColor(fromHex: hex) ?? .systemTeal
+    }
+
+    /// Parses "#RRGGBB" (the CustomRewriteStyle.colorHex format); returns
+    /// nil for malformed values so the caller can fall back to the accent.
+    private static func nsColor(fromHex hex: String) -> NSColor? {
+        var value: UInt64 = 0
+        let cleaned = hex.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "#", with: "")
+        guard Scanner(string: cleaned).scanHexInt64(&value), cleaned.count == 6 else { return nil }
+        return NSColor(calibratedRed: CGFloat((value >> 16) & 0xFF) / 255.0,
+                       green: CGFloat((value >> 8) & 0xFF) / 255.0,
+                       blue: CGFloat(value & 0xFF) / 255.0,
+                       alpha: 1)
     }
 
     private static func makePanel() -> NSPanel {
