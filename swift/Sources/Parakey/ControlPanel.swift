@@ -243,9 +243,6 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
     /// Which style's prompt the rewrite prompt editor is showing — by
     /// unified style id (built-in raw value or custom `c-<uuid>`).
     private var rewritePromptEditorStyleID: String = RewriteStyle.polish.rawValue
-    /// Hotkey being assigned in the custom-mode editor sheet (nil = none
-    /// assigned yet / recording finished without a choice).
-    private var customStyleEditorHotkey: HotkeyChoice?
     static let llmCustomBaseURLFieldTag = 9001
     static let llmCustomAPIKeyFieldTag = 9002
     static let llmCustomModelNameFieldTag = 9003
@@ -2464,19 +2461,51 @@ header.addArrangedSubview(panelLabel(
         return container
     }
 
-    /// Modal create/edit sheet for a custom rewrite mode: name, color,
-    /// LLM instruction and activation hotkey.
+    /// Preset identity colors for custom rewrite modes (hex). A clickable
+    /// swatch row instead of NSColorWell: the system color panel needs the
+    /// app active and is unreliable inside sheets of this menu-bar app.
+    private static let customStylePalette: [String] = [
+        "#0A84FF", // blue
+        "#34C759", // green
+        "#FF9F0A", // orange
+        "#FF375F", // pink
+        "#BF5AF2", // purple
+        "#00C7BE", // teal
+        "#FFD60A", // yellow
+        "#FF453A", // red
+        "#5E5CE6", // indigo
+        "#98989D", // gray
+    ]
+
+    /// Hotkey being assigned in the custom-mode editor sheet (nil = none
+    /// assigned yet / recording finished without a choice).
+    private var customStyleEditorHotkey: HotkeyChoice?
+    /// The swatch-selected identity color of the editor sheet (hex).
+    private var customStyleEditorColor: String = "#0A84FF"
+    private var customStyleSwatchButtons: [NSButton] = []
+
+    /// Modal create/edit SHEET for a custom rewrite mode, anchored to the
+    /// settings window. The app is activated first — this is a menu-bar
+    /// (accessory-style) app, and without activation the sheet's text
+    /// field and buttons receive no keyboard input at all (the exact bug
+    /// the runModal version had). Color is picked from a preset swatch
+    /// palette — no NSColorWell, no system color panel.
     private func presentCustomStyleEditor(_ draft: ControlPanelSettingsDraft, existing: CustomRewriteStyle?) {
+        NSApp.activate(ignoringOtherApps: true)
+        guard let settingsWindow else {
+            log("custom style editor: no settings window to anchor the sheet to")
+            return
+        }
+
+        customStyleEditorColor = existing?.colorHex ?? Self.customStylePalette[0]
+        customStyleEditorHotkey = existing.map { custom in
+            hotkeyChoice(forKeycode: CGKeyCode(custom.hotkeyKeycode),
+                         modifiers: CGEventFlags(rawValue: custom.hotkeyModifiers))
+        }
+
         let nameField = NSTextField(string: existing?.name ?? "")
         nameField.placeholderString = t("Например: Задача для ассистента", "e.g. Task for my assistant")
         nameField.translatesAutoresizingMaskIntoConstraints = false
-
-        let colorWell = NSColorWell()
-        colorWell.supportsAlpha = false
-        colorWell.color = StateToastController.color(forColorHex: existing?.colorHex ?? "")
-        colorWell.translatesAutoresizingMaskIntoConstraints = false
-        colorWell.widthAnchor.constraint(equalToConstant: 60).isActive = true
-        colorWell.heightAnchor.constraint(equalToConstant: 24).isActive = true
 
         let instruction = NSTextView()
         instruction.isRichText = false
@@ -2491,17 +2520,44 @@ header.addArrangedSubview(panelLabel(
         instructionScroll.borderType = .bezelBorder
         instructionScroll.documentView = instruction
         instructionScroll.translatesAutoresizingMaskIntoConstraints = false
-        instructionScroll.heightAnchor.constraint(equalToConstant: 88).isActive = true
 
-        customStyleEditorHotkey = existing.map { custom in
-            hotkeyChoice(forKeycode: CGKeyCode(custom.hotkeyKeycode),
-                         modifiers: CGEventFlags(rawValue: custom.hotkeyModifiers))
+        let swatchRow = NSStackView()
+        swatchRow.orientation = .horizontal
+        swatchRow.spacing = 6
+        var swatchButtons: [NSButton] = []
+        for (index, hex) in Self.customStylePalette.enumerated() {
+            let swatch = NSButton(title: "", target: nil, action: nil)
+            swatch.wantsLayer = true
+            swatch.layer?.backgroundColor = NSColor(hexString: hex).cgColor
+            swatch.layer?.cornerRadius = 6
+            swatch.bezelStyle = .texturedSquare
+            swatch.isBordered = false
+            swatch.title = ""
+            swatch.tag = index
+            swatch.translatesAutoresizingMaskIntoConstraints = false
+            swatch.widthAnchor.constraint(equalToConstant: 26).isActive = true
+            swatch.heightAnchor.constraint(equalToConstant: 26).isActive = true
+            swatchRow.addArrangedSubview(swatch)
+            swatchButtons.append(swatch)
         }
+        customStyleSwatchButtons = swatchButtons
+        refreshCustomStyleSwatchSelection()
+
+        let swatchAction = SwatchAction(handler: { [weak self] index in
+            guard let self, Self.customStylePalette.indices.contains(index) else { return }
+            self.customStyleEditorColor = Self.customStylePalette[index]
+            self.refreshCustomStyleSwatchSelection()
+        })
+        for swatch in swatchButtons {
+            swatch.target = swatchAction
+            swatch.action = #selector(SwatchAction.swatchClicked(_:))
+            objc_setAssociatedObject(swatch, &SwatchAction.associationKey, swatchAction, .OBJC_ASSOCIATION_RETAIN)
+        }
+
         let hotkeyButton = panelButton(
             localizedHotkeyName(customStyleEditorHotkey ?? hotkeyChoice(forKeycode: 0), language: language),
             action: #selector(customStyleEditorHotkeyClicked(_:))
         )
-        hotkeyButton.identifier = NSUserInterfaceItemIdentifier("custom-style-hotkey")
 
         let accessory = NSStackView()
         accessory.orientation = .vertical
@@ -2511,19 +2567,17 @@ header.addArrangedSubview(panelLabel(
         accessory.addArrangedSubview(nameField)
         accessory.addArrangedSubview(panelLabel(t("Инструкция для модели (что делать с текстом)", "Model instruction (what to do with the text)"), size: 12, weight: .medium, color: .secondaryLabelColor))
         accessory.addArrangedSubview(instructionScroll)
-        accessory.addArrangedSubview(panelLabel(t("Цвет уведомления и хоткей активации", "Notification color and activation hotkey"), size: 12, weight: .medium, color: .secondaryLabelColor))
-        let colorHotkeyRow = NSStackView()
-        colorHotkeyRow.orientation = .horizontal
-        colorHotkeyRow.spacing = 10
-        colorHotkeyRow.addArrangedSubview(colorWell)
-        colorHotkeyRow.addArrangedSubview(hotkeyButton)
-        accessory.addArrangedSubview(colorHotkeyRow)
+        accessory.addArrangedSubview(panelLabel(t("Цвет уведомления", "Notification color"), size: 12, weight: .medium, color: .secondaryLabelColor))
+        accessory.addArrangedSubview(swatchRow)
+        accessory.addArrangedSubview(panelLabel(t("Хоткей активации режима", "Mode activation hotkey"), size: 12, weight: .medium, color: .secondaryLabelColor))
+        accessory.addArrangedSubview(hotkeyButton)
 
         NSLayoutConstraint.activate([
             nameField.widthAnchor.constraint(equalTo: accessory.widthAnchor),
             instructionScroll.widthAnchor.constraint(equalTo: accessory.widthAnchor),
+            instructionScroll.heightAnchor.constraint(equalToConstant: 88),
+            swatchRow.widthAnchor.constraint(equalTo: accessory.widthAnchor),
         ])
-        accessory.widthAnchor.constraint(equalToConstant: 360).isActive = true
 
         let alert = NSAlert()
         alert.alertStyle = .informational
@@ -2533,43 +2587,58 @@ header.addArrangedSubview(panelLabel(
         alert.accessoryView = accessory
         alert.addButton(withTitle: t("Сохранить", "Save"))
         alert.addButton(withTitle: t("Отмена", "Cancel"))
-        alert.window.initialFirstResponder = nameField
 
-        let response = alert.runModal()
-        guard response == .alertFirstButtonReturn else {
-            customStyleEditorHotkey = nil
-            return
+        alert.beginSheetModal(for: settingsWindow) { [weak self] response in
+            guard let self else { return }
+            self.customStyleSwatchButtons = []
+            self.customStyleEditorHotkey = nil
+            guard response == .alertFirstButtonReturn else { return }
+
+            let name = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !name.isEmpty else { return }
+            let colorHex = self.customStyleEditorColor
+            let instructionText = instruction.string
+            let hotkey = self.customStyleEditorHotkey ?? hotkeyChoice(forKeycode: 0)
+
+            var draft = self.settingsDraft ?? ControlPanelSettingsDraft(settings: self.settings)
+            var styles = draft.customRewriteStyles
+            if let existing {
+                guard let index = styles.firstIndex(where: { $0.id == existing.id }) else { return }
+                styles[index].name = name
+                styles[index].colorHex = colorHex
+                styles[index].instruction = instructionText
+                styles[index].hotkeyKeycode = Int(hotkey.keycode)
+                styles[index].hotkeyModifiers = hotkey.requiredModifiers.rawValue
+            } else {
+                styles.append(CustomRewriteStyle(
+                    id: "c-\(UUID().uuidString)",
+                    name: name,
+                    colorHex: colorHex,
+                    instruction: instructionText,
+                    hotkeyKeycode: Int(hotkey.keycode),
+                    hotkeyModifiers: hotkey.requiredModifiers.rawValue
+                ))
+            }
+            draft.customRewriteStyles = styles
+            self.settingsDraft = draft
+            self.refreshSettingsWindow()
         }
+    }
 
-        let name = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty else { return }
-        let colorHex = Self.hexString(from: colorWell.color)
-        let instructionText = instruction.string
-        let hotkey = customStyleEditorHotkey ?? hotkeyChoice(forKeycode: 0)
-
-        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
-        var styles = draft.customRewriteStyles
-        if let existing {
-            guard let index = styles.firstIndex(where: { $0.id == existing.id }) else { return }
-            styles[index].name = name
-            styles[index].colorHex = colorHex
-            styles[index].instruction = instructionText
-            styles[index].hotkeyKeycode = Int(hotkey.keycode)
-            styles[index].hotkeyModifiers = hotkey.requiredModifiers.rawValue
-        } else {
-            styles.append(CustomRewriteStyle(
-                id: "c-\(UUID().uuidString)",
-                name: name,
-                colorHex: colorHex,
-                instruction: instructionText,
-                hotkeyKeycode: Int(hotkey.keycode),
-                hotkeyModifiers: hotkey.requiredModifiers.rawValue
-            ))
+    /// Re-renders the selection ring on the editor's color swatches.
+    private func refreshCustomStyleSwatchSelection() {
+        for (index, button) in customStyleSwatchButtons.enumerated() {
+            let selected = Self.customStylePalette.indices.contains(index)
+                && Self.customStylePalette[index] == customStyleEditorColor
+            button.layer?.borderWidth = selected ? 2.5 : 0
+            button.layer?.borderColor = NSColor.white.cgColor
         }
-        draft.customRewriteStyles = styles
-        customStyleEditorHotkey = nil
-        settingsDraft = draft
-        refreshSettingsWindow()
+    }
+
+    @objc private func swatchClicked(_ sender: NSButton) {
+        guard Self.customStylePalette.indices.contains(sender.tag) else { return }
+        customStyleEditorColor = Self.customStylePalette[sender.tag]
+        refreshCustomStyleSwatchSelection()
     }
 
     @objc private func addCustomRewriteStyleClicked(_ sender: NSButton) {
@@ -4150,5 +4219,32 @@ header.addArrangedSubview(panelLabel(
         alert.informativeText = detail
         alert.addButton(withTitle: t("ОК", "OK"))
         alert.runModal()
+    }
+}
+
+/// NSButton's target must be an NSObject; this wraps a Swift closure that
+/// receives the clicked button's tag (the palette index).
+@MainActor
+private final class SwatchAction: NSObject {
+    nonisolated(unsafe) static var associationKey: UInt8 = 0
+    let handler: (Int) -> Void
+    init(handler: @escaping (Int) -> Void) { self.handler = handler }
+    @objc func swatchClicked(_ sender: NSButton) { handler(sender.tag) }
+}
+
+extension NSColor {
+    /// "#RRGGBB" → NSColor (sRGB); falls back to gray on malformed input.
+    convenience init(hexString: String) {
+        var value: UInt64 = 0
+        let cleaned = hexString.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "#", with: "")
+        if Scanner(string: cleaned).scanHexInt64(&value), cleaned.count == 6 {
+            self.init(srgbRed: CGFloat((value >> 16) & 0xFF) / 255.0,
+                      green: CGFloat((value >> 8) & 0xFF) / 255.0,
+                      blue: CGFloat(value & 0xFF) / 255.0,
+                      alpha: 1)
+        } else {
+            self.init(srgbRed: 0.6, green: 0.6, blue: 0.6, alpha: 1)
+        }
     }
 }
