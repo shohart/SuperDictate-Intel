@@ -6883,7 +6883,6 @@ final class ParakeyApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         vocabularyLearnedToastController.showPending(
             candidate: candidate,
             targetFrame: targetFrame,
-            autoSaveSeconds: PostInsertionEditWatcher.confirmSeconds,
             onSave: { [weak self] in self?.postInsertionWatcher.confirmPendingCandidateNow() },
             onCancel: { [weak self] in self?.postInsertionWatcher.cancelPendingCandidate() }
         )

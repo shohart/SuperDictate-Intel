@@ -46,7 +46,6 @@ final class VocabularyLearnedToastController {
 
     func showPending(candidate: LearnCandidate,
                      targetFrame: NSRect?,
-                     autoSaveSeconds: TimeInterval,
                      onSave: @escaping () -> Void,
                      onCancel: @escaping () -> Void) {
         dismissTask?.cancel()
@@ -85,8 +84,6 @@ final class VocabularyLearnedToastController {
             replacement: candidate.replacement,
             lightBackground: lightBackground,
             accentColor: accentColor,
-            autoSaveSeconds: autoSaveSeconds,
-            onSave: save,
             onCancel: cancel
         )
         self.label = content.label
@@ -674,8 +671,6 @@ final class VocabularyLearnedToastController {
                                         replacement: String,
                                         lightBackground: Bool,
                                         accentColor: NSColor,
-                                        autoSaveSeconds: TimeInterval,
-                                        onSave: @escaping () -> Void,
                                         onCancel: @escaping () -> Void) -> ContentViewResult {
         // Mirrors RecordingHUDView.drawTimerOutlineFill's textColor formula
         // (HUDViews.swift) — NSColor.labelColor resolves against the
@@ -720,7 +715,7 @@ final class VocabularyLearnedToastController {
         container.wantsLayer = true
         let palette = backgroundPalette(lightBackground: lightBackground)
         container.layer?.backgroundColor = palette.fill.cgColor
-        container.layer?.cornerRadius = 18
+        container.layer?.cornerRadius = pillHeight / 2
         container.layer?.borderWidth = 1
         container.layer?.borderColor = palette.stroke.cgColor
 
@@ -732,62 +727,29 @@ final class VocabularyLearnedToastController {
             label.centerYAnchor.constraint(equalTo: container.centerYAnchor),
         ])
 
-        // Hint row: what Enter/Esc do, and that doing nothing auto-saves.
-        let hintFont = NSFont.systemFont(ofSize: 11, weight: .medium)
-        let hintColor = textColor.withAlphaComponent(textColor.alphaComponent * 0.55)
-        let hint = NSTextField(labelWithAttributedString: NSAttributedString(string: String(
-            format: NSLocalizedString(
-                "⏎ запомнить · ⎋ отменить · автосохранение через %d с",
-                comment: "Pending vocabulary-correction toast key hints"),
-            Int(autoSaveSeconds)
-        ), attributes: [
-            .font: hintFont,
-            .foregroundColor: hintColor,
-        ]))
-        hint.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(hint)
-
-        // The save element: accent-tinted, marked as the default (it owns
-        // the Return key equivalent — pressing Enter anywhere while the
-        // toast is visible resolves the toast as SAVE, via the global tap
-        // or this key equivalent as the local fallback).
-        let saveButton = NSButton(title: NSLocalizedString("Запомнить ⏎", comment: "Pending vocabulary-correction toast save button"), target: nil, action: nil)
-        saveButton.bezelStyle = .rounded
-        saveButton.controlSize = .small
-        saveButton.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
-        saveButton.keyEquivalent = "\r"
-        saveButton.contentTintColor = accentColor
-        let saveAction = UndoButtonAction(handler: onSave)
-        saveButton.target = saveAction
-        saveButton.action = #selector(UndoButtonAction.undoTapped)
-        objc_setAssociatedObject(saveButton, &UndoButtonAction.associationKey, saveAction, .OBJC_ASSOCIATION_RETAIN)
-        saveButton.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(saveButton)
-
-        let cancelButton = NSButton(title: NSLocalizedString("Отмена ⎋", comment: "Pending vocabulary-correction toast cancel button"), target: nil, action: nil)
-        cancelButton.bezelStyle = .rounded
-        cancelButton.controlSize = .small
-        cancelButton.font = NSFont.systemFont(ofSize: 12, weight: .regular)
+        // Cancel affordance: Escape (global tap or this invisible
+        // full-pill button's keyEquivalent fallback) cancels the pending
+        // save. Invisible chrome — the pill itself is the affordance,
+        // exactly like the original post-save toast. Enter (save now) is
+        // bound globally via the Return tap; no visible controls.
+        let cancelButton = NSButton(title: "", target: nil, action: nil)
+        cancelButton.isBordered = false
+        cancelButton.isTransparent = true
+        cancelButton.focusRingType = .none
+        cancelButton.refusesFirstResponder = true
         cancelButton.keyEquivalent = "\u{1b}"
-        let cancelAction = UndoButtonAction(handler: onCancel)
-        cancelButton.target = cancelAction
-        cancelButton.action = #selector(UndoButtonAction.undoTapped)
-        objc_setAssociatedObject(cancelButton, &UndoButtonAction.associationKey, cancelAction, .OBJC_ASSOCIATION_RETAIN)
         cancelButton.translatesAutoresizingMaskIntoConstraints = false
+        let action = UndoButtonAction(handler: onCancel)
+        cancelButton.target = action
+        cancelButton.action = #selector(UndoButtonAction.undoTapped)
+        objc_setAssociatedObject(cancelButton, &UndoButtonAction.associationKey, action, .OBJC_ASSOCIATION_RETAIN)
+
         container.addSubview(cancelButton)
-
         NSLayoutConstraint.activate([
-            hint.topAnchor.constraint(equalTo: label.bottomAnchor, constant: 6),
-            hint.centerXAnchor.constraint(equalTo: container.centerXAnchor),
-            hint.leadingAnchor.constraint(greaterThanOrEqualTo: container.leadingAnchor, constant: horizontalPadding),
-
-            saveButton.topAnchor.constraint(equalTo: hint.bottomAnchor, constant: 8),
-            saveButton.trailingAnchor.constraint(equalTo: container.centerXAnchor, constant: -6),
-            saveButton.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -12),
-
-            cancelButton.topAnchor.constraint(equalTo: saveButton.topAnchor),
-            cancelButton.leadingAnchor.constraint(equalTo: container.centerXAnchor, constant: 6),
-            cancelButton.centerYAnchor.constraint(equalTo: saveButton.centerYAnchor),
+            cancelButton.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            cancelButton.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            cancelButton.topAnchor.constraint(equalTo: container.topAnchor),
+            cancelButton.bottomAnchor.constraint(equalTo: container.bottomAnchor),
         ])
 
         return ContentViewResult(view: container, label: label, arrowRange: arrowRange, textColor: textColor)
