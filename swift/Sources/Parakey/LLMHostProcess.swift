@@ -82,11 +82,15 @@ actor LLMHostProcess {
     /// the base weights (see ModelDownload.swift's GEC_LORA_* pins and the
     /// rsLoRA scale derivation). An empty path passes no --lora flags,
     /// keeping the host on plain base weights.
+    /// `chatTemplateFile`: optional path to a Jinja chat-template override
+    /// passed to the host as --chat-template-file (e.g. the LFM2.5 no-think
+    /// template — see BundledLLMModel.chatTemplateOverride).
     func start(modelPath: String,
                loraPath: String = "",
                loraScale: Double = 1.0,
                ctxSize: Int32 = 4096,
                useGPU: Bool = false,
+               chatTemplateFile: String? = nil,
                healthCheckTimeout: TimeInterval = 60) async -> Result<Void, LLMHostProcessError> {
         if isRunning {
             return .success(())
@@ -111,6 +115,9 @@ actor LLMHostProcess {
         ]
         if !loraPath.isEmpty {
             proc.arguments! += ["--lora", loraPath, "--lora-scale", String(loraScale)]
+        }
+        if let chatTemplateFile {
+            proc.arguments! += ["--chat-template-file", chatTemplateFile]
         }
         proc.standardOutput = FileHandle.nullDevice
         let errorPipe = Pipe()

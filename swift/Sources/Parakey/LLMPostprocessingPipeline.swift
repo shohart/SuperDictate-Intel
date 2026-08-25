@@ -248,7 +248,8 @@ actor LLMPostprocessingCoordinator {
                                                   loraPath: bundledLLMLoraPath(model),
                                                   loraScale: bundledLLMLoraScale(model),
                                                   ctxSize: model.hostContextSize,
-                                                  useGPU: settings.useGPU)
+                                                  useGPU: settings.useGPU,
+                                                  chatTemplateFile: bundledLLMChatTemplateFile(model)?.path)
         if coldStart {
             await onHostLoadFinished?()
         }
@@ -373,7 +374,8 @@ actor LLMPostprocessingCoordinator {
                                                   loraPath: bundledLLMLoraPath(model),
                                                   loraScale: bundledLLMLoraScale(model),
                                                   ctxSize: model.hostContextSize,
-                                                  useGPU: settings.useGPU)
+                                                  useGPU: settings.useGPU,
+                                                  chatTemplateFile: bundledLLMChatTemplateFile(model)?.path)
         if coldStart {
             await onHostLoadFinished?()
         }

@@ -3364,8 +3364,8 @@ enum ParakeySelfTest {
                        "correction list must contain Loqira (small model tested for correction)")
             try expect(BundledLLMModel.correctionModels.contains(.vanilla08b), equals: true,
                        "correction list must contain vanilla 0.8B")
-            try expect(BundledLLMModel.correctionModels.contains(.lfm25), equals: true,
-                       "correction list must contain LFM2.5 (every small tested model)")
+            try expect(BundledLLMModel.correctionModels.contains(.lfm25), equals: false,
+                       "LFM2.5 must NOT be offered: it always emits <think> reasoning (template-forced AND model-trained), burning the token budget — verified in a live harness")
             try expect(BundledLLMModel.correctionModels.contains(.yandexGPT), equals: true,
                        "correction list must contain YandexGPT (correction winner)")
             try expect(BundledLLMModel.rewriteModels.contains(.yandexGPT), equals: true,

@@ -40,6 +40,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <fstream>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -80,6 +81,7 @@ struct HostConfig {
     // scale -- e.g. the bundled dictation-corrector adapter (rank 16,
     // alpha 80, rsLoRA) needs 4.0: 4.0 * 80/16 == 80/sqrt(16) == 20.0.
     float lora_scale = 1.0f;
+    std::string chat_template_override;
 };
 
 bool parse_args(int argc, char ** argv, HostConfig & cfg, std::string & error) {
@@ -124,6 +126,17 @@ bool parse_args(int argc, char ** argv, HostConfig & cfg, std::string & error) {
             const char * v = next("--lora-scale");
             if (!v) return false;
             cfg.lora_scale = std::atof(v);
+        } else if (arg == "--chat-template-file") {
+            const char * v = next("--chat-template-file");
+            if (!v) return false;
+            std::ifstream in(v, std::ios::binary);
+            if (!in) {
+                error = std::string("cannot read chat template file: ") + v;
+                return false;
+            }
+            std::ostringstream ss;
+            ss << in.rdbuf();
+            cfg.chat_template_override = ss.str();
         } else {
             error = "unknown argument: " + arg;
             return false;
@@ -249,7 +262,7 @@ public:
             return false;
         }
 
-        templates_ = common_chat_templates_init(model_, /*chat_template_override=*/"");
+        templates_ = common_chat_templates_init(model_, cfg.chat_template_override);
         if (!templates_) {
             error = "failed to initialize chat templates";
             return false;

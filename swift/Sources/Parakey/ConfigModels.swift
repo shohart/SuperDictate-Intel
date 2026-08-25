@@ -481,10 +481,15 @@ enum BundledLLMModel: String, CaseIterable, Codable {
 
     /// Models offered by the correction-pass picker: every small model the
     /// benchmark tested for correction, plus YandexGPT (the correction
-    /// winner, also in the rewrite list).
+    /// winner, also in the rewrite list). LFM2.5 is deliberately ABSENT:
+    /// it is a "pure reasoning model" whose template hard-codes `<think>`
+    /// and which emits `<think>` even when the template omits it (verified
+    /// in a live harness) — correction requests burn the entire token
+    /// budget on inline reasoning (17 s+, truncated, guardrail-rejected).
+    /// Its benchmark EM 0.246 was measured WITH that thinking.
     static let correctionModels: [BundledLLMModel] = [
         .voiceScribe, .qwen35_4b, .ruAdapt4b, .qvikhr4b, .ministral3b,
-        .phi4mini, .loqira, .vanilla08b, .lfm25, .yandexGPT,
+        .phi4mini, .loqira, .vanilla08b, .yandexGPT,
     ]
     /// Models offered by the rewrite-pass picker (the benchmark's rewrite
     /// table, curated: YandexGPT is the measured winner; Qwen3-8B and
@@ -563,7 +568,159 @@ enum BundledLLMModel: String, CaseIterable, Codable {
     var hostContextSize: Int32 {
         BundledLLMModel.rewriteModels.contains(self) ? 8192 : 4096
     }
+
+    /// Chat-template override passed to the host (--chat-template-file).
+    /// LFM2.5-2.6B is a "pure reasoning model" whose template hard-codes a
+    /// `<think>` tag into every generation prompt (its own model card:
+    /// "always thinks before it answers") — the benchmark's 10.8 s p50 was
+    /// exactly that thinking, and `enable_thinking: false` is ignored by
+    /// this template. The override is the SAME template with `<think>`
+    /// removed from the generation prompt, so the model answers directly.
+    /// nil = use the model's built-in template.
+    var chatTemplateOverride: String? {
+        switch self {
+        case .lfm25:
+            return LFM25NoThinkChatTemplate.template
+        default:
+            return nil
+        }
+    }
 }
+
+/// The LFM2.5-2.6B chat template with the forced `<think>` tag removed
+/// from the generation prompt (see BundledLLMModel.chatTemplateOverride).
+private enum LFM25NoThinkChatTemplate {
+    /// The LFM2.5-2.6B chat template with the forced `<think>` tag
+    /// removed from the generation prompt (see chatTemplateOverride).
+    static let template: String = #"""
+{{- bos_token -}}
+{%- set preserve_thinking = preserve_thinking | default(false) -%}
+
+{%- macro format_arg_value(arg_value) -%}
+    {%- if arg_value is string -%}
+        {{- "'" + (arg_value | replace("\\", "\\\\") | replace("'", "\\'") | replace("\n", "\\n") | replace("\r", "\\r")) + "'" -}}
+    {%- elif arg_value is mapping or arg_value is iterable -%}
+        {{- arg_value | tojson -}}
+    {%- else -%}
+        {{- arg_value | string -}}
+    {%- endif -%}
+{%- endmacro -%}
+
+{%- macro parse_content(content) -%}
+    {%- if content is string -%}
+        {{- content -}}
+    {%- elif content is mapping -%}
+        {{- content | tojson -}}
+    {%- elif content is iterable -%}
+        {%- set _ns = namespace(result="") -%}
+        {%- for item in content -%}
+            {%- if item is string -%}
+                {%- set _ns.result = _ns.result + item -%}
+            {%- elif item is mapping and item.get("type") == "image" -%}
+                {%- set _ns.result = _ns.result + "<image>" -%}
+            {%- elif item is mapping and item.get("type") == "text" -%}
+                {%- set _ns.result = _ns.result + ((item.get("text") or "") | string) -%}
+            {%- else -%}
+                {%- set _ns.result = _ns.result + (item | tojson) -%}
+            {%- endif -%}
+        {%- endfor -%}
+        {{- _ns.result -}}
+    {%- endif -%}
+{%- endmacro -%}
+
+{%- macro render_tool_calls(tool_calls) -%}
+    {%- set tool_calls_ns = namespace(tool_calls=[]) -%}
+    {%- for tool_call in tool_calls -%}
+        {%- set func = tool_call["function"] if "function" in tool_call else tool_call -%}
+        {%- set func_name = func["name"] -%}
+        {%- set func_args = func.get("arguments") -%}
+        {%- set args_ns = namespace(arg_strings=[]) -%}
+        {%- if func_args is mapping -%}
+            {%- for arg_name, arg_value in func_args.items() -%}
+                {%- set args_ns.arg_strings = args_ns.arg_strings + [arg_name + "=" + format_arg_value(arg_value)] -%}
+            {%- endfor -%}
+        {%- elif func_args is string and (func_args | trim) not in ["", "{}", "null"] -%}
+            {{- raise_exception("Tool call arguments must be a mapping, got a JSON-encoded string: parse arguments with json.loads() before applying the chat template") -}}
+        {%- endif -%}
+        {%- set tool_calls_ns.tool_calls = tool_calls_ns.tool_calls + [func_name + "(" + (args_ns.arg_strings | join(", ")) + ")"] -%}
+    {%- endfor -%}
+    {{- "<|tool_call_start|>[" + (tool_calls_ns.tool_calls | join(", ")) + "]<|tool_call_end|>" -}}
+{%- endmacro -%}
+
+{%- set ns = namespace(system_prompt="", last_user_index=-1) -%}
+{%- if messages and messages[0]["role"] == "system" -%}
+    {%- if messages[0].get("content") -%}
+        {%- set ns.system_prompt = parse_content(messages[0]["content"]) -%}
+    {%- endif -%}
+    {%- set messages = messages[1:] -%}
+{%- endif -%}
+{%- if tools -%}
+    {%- set ns.system_prompt = ns.system_prompt + ("\n" if ns.system_prompt else "") + "List of tools: [" -%}
+    {%- for tool in tools -%}
+        {%- if tool is not string -%}
+            {%- set tool = tool | tojson -%}
+        {%- endif -%}
+        {%- set ns.system_prompt = ns.system_prompt + tool -%}
+        {%- if not loop.last -%}
+            {%- set ns.system_prompt = ns.system_prompt + ", " -%}
+        {%- endif -%}
+    {%- endfor -%}
+    {%- set ns.system_prompt = ns.system_prompt + "]" -%}
+{%- endif -%}
+{%- if ns.system_prompt -%}
+    {{- "<|im_start|>system\n" + ns.system_prompt + "<|im_end|>\n" -}}
+{%- endif -%}
+{%- for message in messages -%}
+    {%- if message["role"] == "user" -%}
+        {%- set ns.last_user_index = loop.index0 -%}
+    {%- endif -%}
+{%- endfor -%}
+{%- for message in messages -%}
+    {{- "<|im_start|>" + message.role + "\n" -}}
+    {%- if message.role == "assistant" -%}
+        {%- generation -%}
+        {%- set keep_thinking = preserve_thinking or loop.index0 > ns.last_user_index -%}
+        {%- set thinking = message.thinking or message.reasoning or message.reasoning_content -%}
+        {%- set thinking = thinking if thinking is string else "" -%}
+        {%- if thinking and keep_thinking -%}
+            {{- "<think>" + thinking + "</think>" -}}
+        {%- endif -%}
+        {%- set _cfm_tag = "CONTINUE_FINAL_MESSAGE_TAG " -%}
+        {%- set _has_cfm = false -%}
+        {%- set content = "" -%}
+        {%- if message.get("content") -%}
+            {%- set content = parse_content(message.content) -%}
+        {%- endif -%}
+        {%- if not keep_thinking and "</think>" in content -%}
+            {%- set content = content.split("</think>")[-1] | trim -%}
+        {%- endif -%}
+        {%- if content.endswith(_cfm_tag) -%}
+            {%- set _has_cfm = true -%}
+            {%- set _trunc_len = (content | length) - (_cfm_tag | length) -%}
+            {%- set content = content[:_trunc_len] -%}
+        {%- endif -%}
+        {{- content -}}
+        {%- if message.tool_calls -%}
+            {{- render_tool_calls(message.tool_calls) -}}
+        {%- endif -%}
+        {%- if _has_cfm -%}
+            {{- _cfm_tag -}}
+        {%- endif -%}
+        {{- "<|im_end|>\n" -}}
+        {%- endgeneration -%}
+    {%- else %}
+        {%- if message.get("content") -%}
+            {{- parse_content(message["content"]) -}}
+        {%- endif -%}
+        {{- "<|im_end|>\n" -}}
+    {%- endif %}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- "<|im_start|>assistant\n" -}}
+{%- endif -%}
+"""#
+}
+
 
 /// Correction pass model setting. Defaults to `.voiceScribe` (the
 /// benchmark's best fast correction model). Migration from the retired

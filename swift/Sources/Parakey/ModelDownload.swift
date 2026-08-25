@@ -632,6 +632,20 @@ func bundledLLMModelPin(_ model: BundledLLMModel) -> BundledLLMModelPin {
     }
 }
 
+/// Writes the model's chat-template override (if any) into the LLM cache
+/// and returns its path. Idempotent: rewrites only when the content
+/// differs. nil = the model uses its built-in template.
+func bundledLLMChatTemplateFile(_ model: BundledLLMModel) -> URL? {
+    guard let template = model.chatTemplateOverride else { return nil }
+    let url = llmModelCacheDirectory()
+        .appendingPathComponent("chat-template-\(model.rawValue).jinja", isDirectory: false)
+    let existing = try? String(contentsOf: url, encoding: .utf8)
+    if existing != template {
+        try? template.write(to: url, atomically: true, encoding: .utf8)
+    }
+    return url
+}
+
 /// Local cache filename per model — usually the remote name; the bare-named
 /// RuAdapt repo file ("Q6_K.gguf") is stored under a model-qualified name so
 /// it can never collide with another bare-named download.
