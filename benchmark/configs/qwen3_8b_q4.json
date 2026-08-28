@@ -1,0 +1,11 @@
+{
+  "name": "qwen3_8b_q4",
+  "model": "benchmark/models/Qwen3-8B-Q4_K_M.gguf",
+  "port": 8422,
+  "ctx": 4096,
+  "gpu_layers": 999,
+  "thinking_off": true,
+  "prompt": "correction.txt",
+  "max_tokens": {"correction": 512, "rewrite": 1024, "stress": 2048},
+  "extra_args": []
+}

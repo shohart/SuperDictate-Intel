@@ -1,0 +1,11 @@
+{
+  "name": "lfm25_q8",
+  "model": "benchmark/models/LFM2.5-2.6B-Q8_0.gguf",
+  "port": 8410,
+  "ctx": 4096,
+  "gpu_layers": 999,
+  "thinking_off": false,
+  "prompt": "correction.txt",
+  "max_tokens": {"correction": 512, "rewrite": 1024, "stress": 2048},
+  "extra_args": []
+}

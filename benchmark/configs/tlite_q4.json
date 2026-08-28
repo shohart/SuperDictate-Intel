@@ -1,0 +1,15 @@
+{
+  "name": "tlite_q4",
+  "model": "benchmark/models/T-lite-it-1.0-Q4_K_M.gguf",
+  "port": 8419,
+  "ctx": 4096,
+  "gpu_layers": 999,
+  "thinking_off": true,
+  "prompt": "correction.txt",
+  "max_tokens": {
+    "correction": 512,
+    "rewrite": 1024,
+    "stress": 2048
+  },
+  "extra_args": []
+}

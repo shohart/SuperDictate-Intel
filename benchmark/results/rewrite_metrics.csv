@@ -1,0 +1,13 @@
+model,total_cases,fact_recall,forbidden_violation_rate,number_preservation,avg_length_ratio
+gemma4_e4b,60,0.483,0.033,0.0,1.444
+ministral_q6,60,0.388,0.017,0.0,2.837
+phi4_mini_q6,60,0.368,0.033,0.0,1.782
+qvikhr_q6,60,0.47,0.017,0.0,2.247
+qwen35_4b_mtp_q6,60,0.338,0.033,0.0,1.516
+qwen35_9b_q4,60,0.489,0.05,0.0,1.185
+qwen3_8b_q4,60,0.494,0.033,0.0,1.262
+ruadapt_q6,60,0.384,0.033,0.0,2.808
+tlite_q4,60,0.482,0.033,0.0,3.59
+vanilla_4b_q6,60,0.323,0.033,0.0,1.515
+voicescribe_q6,60,0.249,0.033,0.0,0.599
+yandexgpt_q4,60,0.527,0.033,0.0,0.966

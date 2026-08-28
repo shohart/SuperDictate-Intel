@@ -55,6 +55,7 @@ enum ControlPanelShortcutKind: Int {
 }
 
 struct ControlPanelSettingsDraft: Equatable {
+    var speechModelProfile: SpeechModelProfile
     var dictationHotkey: HotkeyChoice
     var alternateCompletionHotkey: HotkeyChoice
     var historyHotkey: HotkeyChoice
@@ -107,6 +108,7 @@ struct ControlPanelSettingsDraft: Equatable {
     var rewriteCustomModelName: String
 
     init(settings: Settings) {
+        speechModelProfile = settings.speechModelProfile
         dictationHotkey = settings.configuredHotkey
         alternateCompletionHotkey = settings.configuredEnterHotkey
         historyHotkey = settings.configuredHistoryHotkey
@@ -720,6 +722,7 @@ final class SuperDictateControlPanelApp: NSObject, NSApplicationDelegate, NSWind
 
         switch selectedSettingsTab {
         case .dictation:
+            content.addArrangedSubview(speechModelRow(draft))
             content.addArrangedSubview(hotkeyRow(
                 title: t("Диктовка", "Dictation"),
                 shortcut: draft.dictationHotkey,
@@ -3387,7 +3390,8 @@ header.addArrangedSubview(panelLabel(
     /// capture time (device, auto-stop, mute).
     private func settingsRestartRequired(_ draft: ControlPanelSettingsDraft) -> Bool {
         let persisted = ControlPanelSettingsDraft(settings: settings)
-        return draft.dictationHotkey != persisted.dictationHotkey
+        return draft.speechModelProfile != persisted.speechModelProfile
+            || draft.dictationHotkey != persisted.dictationHotkey
             || draft.alternateCompletionHotkey != persisted.alternateCompletionHotkey
             || draft.historyHotkey != persisted.historyHotkey
             || draft.correctionHotkey != persisted.correctionHotkey
@@ -3404,6 +3408,19 @@ header.addArrangedSubview(panelLabel(
             || draft.backgroundStyle != persisted.backgroundStyle
             || draft.hudSize != persisted.hudSize
             || draft.hudDisplayMode != persisted.hudDisplayMode
+    }
+
+    private func speechModelRow(_ draft: ControlPanelSettingsDraft) -> NSView {
+        popupRow(
+            title: t("Движок распознавания", "Speech engine"),
+            detail: t("Parakeet и Whisper работают через Vulkan (GGUF); при сбое GPU — CPU.",
+                       "Parakeet and Whisper both run via Vulkan (GGUF); CPU on GPU failure."),
+            selectedValue: draft.speechModelProfile.rawValue,
+            options: SpeechModelProfile.allCases.map { ($0.displayName, $0.rawValue) },
+            action: #selector(selectSpeechModelProfile(_:)),
+            toolTip: t("Выбор модели для следующей загрузки службы.",
+                       "Select the model used at the next service startup.")
+        )
     }
 
     private func settingsActionsRow(draft: ControlPanelSettingsDraft) -> NSView {
@@ -4166,6 +4183,15 @@ header.addArrangedSubview(panelLabel(
         refreshSettingsWindow()
     }
 
+    @objc private func selectSpeechModelProfile(_ sender: NSPopUpButton) {
+        guard let raw = sender.selectedItem?.representedObject as? String,
+              let profile = SpeechModelProfile(rawValue: raw) else { return }
+        var draft = settingsDraft ?? ControlPanelSettingsDraft(settings: settings)
+        draft.speechModelProfile = profile
+        settingsDraft = draft
+        refreshSettingsWindow()
+    }
+
     @objc private func selectRecordingHUDSize(_ sender: NSPopUpButton) {
         guard let raw = sender.selectedItem?.representedObject as? String,
               let size = RecordingHUDSize(rawValue: raw) else { return }
@@ -4249,6 +4275,7 @@ header.addArrangedSubview(panelLabel(
         settings.primaryCompletionBehavior = draft.primaryCompletionBehavior
         settings.alternateCompletionEnabled = draft.alternateCompletionEnabled
         settings.enterDelayMilliseconds = draft.enterDelayMilliseconds
+        settings.speechModelProfile = draft.speechModelProfile
         settings.inputDevice = draft.inputDevicePreference
         settings.recordingHUDRecordingColor = draft.recordingColor
         settings.recordingHUDTranscribingColor = draft.transcribingColor

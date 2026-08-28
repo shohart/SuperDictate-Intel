@@ -69,6 +69,27 @@ cp "$ROOT_DIR/swift/Info.plist" "$STAGE_APP/Contents/Info.plist"
 cp "$ROOT_DIR/swift/Resources/parakey-menubar.png" "$STAGE_APP/Contents/Resources/"
 cp "$ROOT_DIR/swift/Resources/parakey-menubar@2x.png" "$STAGE_APP/Contents/Resources/"
 cp "$ROOT_DIR/icon/Parakey.icns" "$STAGE_APP/Contents/Resources/Parakey.icns"
+# SuperDictateWhisperHost (whisper.cpp ASR helper, Vulkan) — same
+# Contents/Helpers/ layout as SuperDictateLLMHost above; found at runtime
+# by WhisperCppEngine.resolvedHelperBinaryURL().
+WHISPER_HOST_BIN="$BIN_DIR/SuperDictateWhisperHost"
+if [[ -x "$WHISPER_HOST_BIN" ]]; then
+    mkdir -p "$STAGE_APP/Contents/Helpers"
+    cp "$WHISPER_HOST_BIN" "$STAGE_APP/Contents/Helpers/SuperDictateWhisperHost"
+else
+    echo "build-app.sh: WARNING: $WHISPER_HOST_BIN not found -- shipping without the whisper.cpp ASR helper (Whisper profiles will be unavailable in this build)" >&2
+fi
+# whisper.cpp's OWN Vulkan shader corpus — a DIFFERENT ggml pin than
+# parakeet's, so it gets its own Resources subdirectory and is located via
+# the SUPERDICTATE_VULKAN_SHADER_DIR env var (tier 1 of the shader runtime
+# loader's 3-tier fallback). See the whisper_cpp target comment in
+# Package.swift.
+WHISPER_SHADER_SRC="$ROOT_DIR/swift/Sources/whisper_cpp/vulkan-shaders"
+if [[ -d "$WHISPER_SHADER_SRC" ]]; then
+    cp -R "$WHISPER_SHADER_SRC" "$STAGE_APP/Contents/Resources/whisper-vulkan-shaders"
+else
+    echo "build-app.sh: WARNING: $WHISPER_SHADER_SRC not found -- shipping without whisper Vulkan shaders (Whisper GPU mode will not be usable in this build)" >&2
+fi
 # Phase 5 (Vulkan): the loose, pre-compiled SPIR-V shader corpus (vendored by
 # scripts/vendor-parakeet-cpp.sh into swift/Sources/parakeet_cpp/upstream/
 # ggml-vulkan/vulkan-shaders/, excluded from SwiftPM compilation/resources —

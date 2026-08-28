@@ -1,0 +1,11 @@
+{
+  "name": "loqira_q4",
+  "model": "benchmark/models/Qwen3.5-0.8B-GEC-KAZ-RUS-ENG.Q4_0.gguf",
+  "port": 8403,
+  "ctx": 4096,
+  "gpu_layers": 999,
+  "thinking_off": true,
+  "prompt": "loqira.txt",
+  "max_tokens": {"correction": 512, "rewrite": 1024, "stress": 2048},
+  "extra_args": []
+}

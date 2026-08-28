@@ -346,22 +346,18 @@ let DICTATION_LANGUAGE_DISPLAY: [DictationLanguage: String] = [
     .serbian: "Serbian",
 ]
 
-// There is exactly one production speech model (spec §14: "There is one
-// speech model, so do not show a model picker"). This is still a
-// `CaseIterable` enum with a single real case — rather than deleting the
-// type outright — because `productionSpeechModelProfile(rawValue:)` below
-// doubles as the upgrade-migration path: any old persisted raw value
-// (`"multilingual_v3"`, `"english_unified"`, or anything else left over from
-// a pre-Parakeet install) normalizes to `.parakeetTDTv3` the same way it
-// always normalized deprecated/unknown values to the production default
-// before this migration.
+// ASR engine/model selection. Whisper profiles run whisper.cpp (GGUF) in
+// the SuperDictateWhisperHost helper process — Vulkan on the RX 6600 with
+// CPU fallback; Parakeet remains its own native Vulkan path.
 enum SpeechModelProfile: String, CaseIterable {
     case parakeetTDTv3 = "parakeet_tdt_v3"
+    case whisperRussian = "whisper_large_v3_turbo_russian"
+    case whisperRussianCodeSwitch = "whisper_large_v3_turbo_russian_codeswitch"
 
     static let productionDefault: SpeechModelProfile = .parakeetTDTv3
 
     var isProductionSupported: Bool {
-        self == .parakeetTDTv3
+        true
     }
 
     var productionProfile: SpeechModelProfile {
@@ -369,15 +365,23 @@ enum SpeechModelProfile: String, CaseIterable {
     }
 
     var displayName: String {
-        "Parakeet TDT 0.6B v3"
+        switch self {
+        case .parakeetTDTv3: return "Parakeet TDT 0.6B v3"
+        case .whisperRussian: return "Whisper Large v3 Turbo Russian"
+        case .whisperRussianCodeSwitch: return "Whisper Large v3 Turbo Russian Code-Switch"
+        }
     }
 
     var shortName: String {
-        "Parakeet TDT 0.6B v3"
+        displayName
     }
 
     var aboutModelText: String {
-        "parakeet.cpp · NVIDIA Parakeet TDT 0.6B v3 multilingual · GGUF q8_0"
+        switch self {
+        case .parakeetTDTv3: return "parakeet.cpp · NVIDIA Parakeet TDT 0.6B v3 multilingual · GGUF q8_0"
+        case .whisperRussian: return "whisper.cpp · OpenAI Whisper Large v3 Turbo · GGUF Q8_0 · Vulkan/CGPU · язык: русский"
+        case .whisperRussianCodeSwitch: return "whisper.cpp · OpenAI Whisper Large v3 Turbo · GGUF Q8_0 · Vulkan/CGPU · язык: авто (RU/EN)"
+        }
     }
 
     var setupReadyDetail: String {
@@ -385,15 +389,15 @@ enum SpeechModelProfile: String, CaseIterable {
     }
 
     var cacheResetDetail: String {
-        "Parakey will delete the local Parakeet TDT 0.6B v3 model cache, unload the current speech model, and download a fresh verified copy before dictation is available again."
+        "Parakey will delete the local \(shortName) model cache, unload the current speech model, and download a fresh verified copy before dictation is available again."
     }
 
     var estimatedDownloadBytes: Int64 {
-        PARAKEET_MODEL_SIZE_BYTES
+        self == .parakeetTDTv3 ? PARAKEET_MODEL_SIZE_BYTES : WHISPER_GGUF_SIZE_BYTES
     }
 
     var downloadSizeText: String {
-        "about 940 MB"
+        self == .parakeetTDTv3 ? "about 940 MB" : "about 874 MB"
     }
 }
 
@@ -982,4 +986,3 @@ func limitedRecentTranscripts(_ transcripts: [String], limit: RecentTranscriptLi
     guard transcripts.count > count else { return transcripts }
     return Array(transcripts.prefix(count))
 }
-

@@ -177,7 +177,12 @@ func lastKnownParakeetRuntimeStatusDescription(language: InterfaceLanguage) -> S
 }
 
 actor TranscriptionWorker {
-    private var engine: ParakeetEngine?
+    private enum LoadedEngine {
+        case parakeet(ParakeetEngine)
+        case whisperCpp(WhisperCppEngine)
+    }
+
+    private var engine: LoadedEngine?
     private var loadedProfile: SpeechModelProfile?
     private var loadedUseGPU: Bool?
     private(set) var ready = false
@@ -254,21 +259,56 @@ actor TranscriptionWorker {
             log("ASR: downloading + verifying + loading \(profile.shortName) weights…")
         }
         let t0 = Date()
-        let loaded = try await loadParakeetEngine(attemptVulkan: attemptVulkan, progressHandler: progressHandler)
-        engine = loaded.engine
+        let loaded: LoadedEngine
+        if profile == .parakeetTDTv3 {
+            let result = try await loadParakeetEngine(attemptVulkan: attemptVulkan, progressHandler: progressHandler)
+            loaded = .parakeet(result.engine)
+            runtimeStatus = result.status
+        } else {
+            let modelURL = try await downloadWhisperGGUFModelIfNeeded()
+            let language = profile == .whisperRussian ? "ru" : "auto"
+            var effectiveGPU = useGPU
+            var whisper: WhisperCppEngine
+            do {
+                whisper = try WhisperCppEngine(modelPath: modelURL.path, language: language, useGPU: useGPU)
+                _ = try await whisper.transcribe(samples: [Float](repeating: 0, count: Int(SAMPLE_RATE * 0.4)))
+            } catch {
+                // GPU init/warm-up failed — retry once on CPU before giving
+                // up (mirrors the parakeet §9.3 never-lose-dictation policy;
+                // the helper itself also retries CPU on context-init
+                // failure, this catches everything above that).
+                guard useGPU else { throw error }
+                log("ASR: whisper.cpp GPU engine failed to start (\(error.localizedDescription)) — retrying on CPU")
+                whisper = try WhisperCppEngine(modelPath: modelURL.path, language: language, useGPU: false)
+                _ = try await whisper.transcribe(samples: [Float](repeating: 0, count: Int(SAMPLE_RATE * 0.4)))
+                effectiveGPU = false
+            }
+            loaded = .whisperCpp(whisper)
+            runtimeStatus = effectiveGPU ? .vulkan(deviceDescription: "Vulkan") : .cpu
+        }
+        engine = loaded
         loadedProfile = profile
         loadedUseGPU = useGPU
-        runtimeStatus = loaded.status
         ready = true
         log("ASR: \(profile.shortName) ready in \(String(format: "%.2f", Date().timeIntervalSince(t0))) s")
-        log("ASR model: Parakeet TDT 0.6B v3 \(PARAKEET_MODEL_QUANTIZATION)")
-        log("ASR runtime: parakeet.cpp \(parakeetRuntimeVersion())")
+        log("ASR model: \(profile.displayName)")
+        if case .parakeet = loaded {
+            log("ASR runtime: parakeet.cpp \(parakeetRuntimeVersion())")
+        } else {
+            log("ASR runtime: whisper.cpp (GGUF)")
+        }
         log("ASR device requested: \(requestedGPU ? "Vulkan" : "CPU")")
-        let loadedDeviceIsVulkan = loaded.engine.device == .vulkan
-        log("ASR device selected: \(loadedDeviceIsVulkan ? "Vulkan" : "CPU")\(loaded.status == .cpuFallbackAfterVulkanError ? " (fallback after Vulkan error)" : "")")
+        if case .parakeet(let parakeet) = loaded {
+            let loadedDeviceIsVulkan = parakeet.device == .vulkan
+            log("ASR device selected: \(loadedDeviceIsVulkan ? "Vulkan" : "CPU")\(runtimeStatus == .cpuFallbackAfterVulkanError ? " (fallback after Vulkan error)" : "")")
+        } else if case .whisperCpp(let whisper) = loaded {
+            log("ASR device selected: \(whisper.usedGPU ? "Vulkan" : "CPU")")
+        }
         // Best-effort legacy cleanup, only after Parakeet has itself
         // succeeded (spec §4.3/§4.4) — never blocks readiness on failure.
-        removeLegacyWhisperModelFileIfPresent()
+        if profile == .parakeetTDTv3 {
+            removeLegacyWhisperModelFileIfPresent()
+        }
     }
 
     private func loadParakeetEngine(
@@ -359,10 +399,21 @@ actor TranscriptionWorker {
         }
 
         let engineCallStartedAt = ProcessInfo.processInfo.systemUptime
-        let isVulkanEngine = engine.device == .vulkan
+        let isVulkanEngine: Bool
         let result: ParakeetTranscriptionResult
         do {
-            result = try await engine.transcribe(samples: samples)
+            switch engine {
+            case .parakeet(let parakeet):
+                isVulkanEngine = parakeet.device == .vulkan
+                result = try await parakeet.transcribe(samples: samples)
+            case .whisperCpp(let whisper):
+                isVulkanEngine = whisper.usedGPU
+                let transcription = try await whisper.transcribe(samples: samples)
+                result = ParakeetTranscriptionResult(text: transcription.text,
+                                                     totalSeconds: transcription.processingSeconds,
+                                                     inferenceSeconds: transcription.processingSeconds,
+                                                     usedGPU: whisper.usedGPU)
+            }
         } catch where isVulkanEngine {
             // spec §9.3: a Vulkan engine that initialized fine but fails
             // DURING a real transcription — retain the captured PCM
@@ -374,29 +425,59 @@ actor TranscriptionWorker {
             log("ASR: Vulkan inference failed mid-session (\(error.localizedDescription)) — falling back to CPU and retrying this dictation once")
             vulkanFailedThisSession = true
             vulkanFailureReason = error.localizedDescription
-            await engine.shutdown()
-            let threadCount = Self.resolvedParakeetThreadCount()
-            let cpuEngine: ParakeetEngine
-            do {
-                guard let modelPath = try? await downloadParakeetModelIfNeeded() else {
-                    throw ParakeetEngineError.inferenceFailed("model path unavailable during mid-session CPU fallback")
+            if case .parakeet(let parakeet) = engine {
+                await parakeet.shutdown()
+                let threadCount = Self.resolvedParakeetThreadCount()
+                let cpuEngine: ParakeetEngine
+                do {
+                    guard let modelPath = try? await downloadParakeetModelIfNeeded() else {
+                        throw ParakeetEngineError.inferenceFailed("model path unavailable during mid-session CPU fallback")
+                    }
+                    cpuEngine = try ParakeetEngine(modelPath: modelPath.path, device: .cpu, threadCount: threadCount)
+                    try await cpuEngine.warmUp()
+                } catch {
+                    // The engine is now unusable and no CPU replacement could
+                    // be constructed either — leave `self.engine` nil so the
+                    // next `load()` call rebuilds from scratch, and surface the
+                    // ORIGINAL Vulkan failure (more informative than the
+                    // fallback-construction failure) to the caller.
+                    self.engine = nil
+                    ready = false
+                    throw error
                 }
-                cpuEngine = try ParakeetEngine(modelPath: modelPath.path, device: .cpu, threadCount: threadCount)
-                try await cpuEngine.warmUp()
-            } catch {
-                // The engine is now unusable and no CPU replacement could
-                // be constructed either — leave `self.engine` nil so the
-                // next `load()` call rebuilds from scratch, and surface the
-                // ORIGINAL Vulkan failure (more informative than the
-                // fallback-construction failure) to the caller.
-                self.engine = nil
-                ready = false
+                self.engine = .parakeet(cpuEngine)
+                loadedUseGPU = false
+                runtimeStatus = .cpuFallbackAfterVulkanError
+                result = try await cpuEngine.transcribe(samples: samples)
+            } else if case .whisperCpp(let deadEngine) = engine {
+                // Same §9.3 contract for the whisper.cpp helper: the Vulkan
+                // engine died mid-dictation — shut it down, rebuild a CPU
+                // helper, warm it, and retry THIS dictation once.
+                await deadEngine.shutdown()
+                let cpuEngine: WhisperCppEngine
+                do {
+                    guard let modelPath = try? await downloadWhisperGGUFModelIfNeeded() else {
+                        throw error
+                    }
+                    let language = (loadedProfile ?? .whisperRussian) == .whisperRussian ? "ru" : "auto"
+                    cpuEngine = try WhisperCppEngine(modelPath: modelPath.path, language: language, useGPU: false)
+                    _ = try await cpuEngine.transcribe(samples: [Float](repeating: 0, count: Int(SAMPLE_RATE * 0.4)))
+                } catch {
+                    self.engine = nil
+                    ready = false
+                    throw error
+                }
+                self.engine = .whisperCpp(cpuEngine)
+                loadedUseGPU = false
+                runtimeStatus = .cpuFallbackAfterVulkanError
+                let transcription = try await cpuEngine.transcribe(samples: samples)
+                result = ParakeetTranscriptionResult(text: transcription.text,
+                                                     totalSeconds: transcription.processingSeconds,
+                                                     inferenceSeconds: transcription.processingSeconds,
+                                                     usedGPU: false)
+            } else {
                 throw error
             }
-            self.engine = cpuEngine
-            loadedUseGPU = false
-            runtimeStatus = .cpuFallbackAfterVulkanError
-            result = try await cpuEngine.transcribe(samples: samples)
         }
         let engineCallCompletedAt = ProcessInfo.processInfo.systemUptime
         return TranscriptionWorkerResult(
@@ -434,7 +515,11 @@ actor TranscriptionWorker {
         defer { inFlight = false }
 
         let engineCallStartedAt = ProcessInfo.processInfo.systemUptime
-        let transcription = try await engine.transcribeWithTokens(samples: samples)
+        guard case .parakeet(let parakeet) = engine else {
+            throw NSError(domain: "Parakey", code: -5,
+                          userInfo: [NSLocalizedDescriptionKey: "Token timestamps are only available for Parakeet"])
+        }
+        let transcription = try await parakeet.transcribeWithTokens(samples: samples)
         let engineCallCompletedAt = ProcessInfo.processInfo.systemUptime
         return TokenTranscriptionWorkerResult(
             transcription: transcription,
@@ -458,7 +543,9 @@ actor TranscriptionWorker {
 
     func unload() async {
         if let engine {
-            await engine.shutdown()
+            if case .parakeet(let parakeet) = engine {
+                await parakeet.shutdown()
+            }
         }
         engine = nil
         loadedProfile = nil
@@ -675,4 +762,3 @@ private func assembleOverlapWindows(
                                          sampleRate: SAMPLE_RATE,
                                          boundaryOracles: oracles)
 }
-

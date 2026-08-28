@@ -73,6 +73,15 @@ cp "$BIN" "$STAGE_APP/Contents/MacOS/${APP_NAME}"
 cp "$ROOT_DIR/swift/Resources/parakey-menubar.png" "$STAGE_APP/Contents/Resources/"
 cp "$ROOT_DIR/swift/Resources/parakey-menubar@2x.png" "$STAGE_APP/Contents/Resources/"
 cp "$ROOT_DIR/icon/Parakey.icns" "$STAGE_APP/Contents/Resources/Parakey.icns"
+WHISPER_HOST_BIN="$BIN_DIR/SuperDictateWhisperHost"
+if [[ -x "$WHISPER_HOST_BIN" ]]; then
+    mkdir -p "$STAGE_APP/Contents/Helpers"
+    cp "$WHISPER_HOST_BIN" "$STAGE_APP/Contents/Helpers/SuperDictateWhisperHost"
+fi
+WHISPER_SHADER_SRC="$ROOT_DIR/swift/Sources/whisper_cpp/vulkan-shaders"
+if [[ -d "$WHISPER_SHADER_SRC" ]]; then
+    cp -R "$WHISPER_SHADER_SRC" "$STAGE_APP/Contents/Resources/whisper-vulkan-shaders"
+fi
 VULKAN_SHADER_SRC="$ROOT_DIR/swift/Sources/parakeet_cpp/upstream/ggml-vulkan/vulkan-shaders"
 if [[ -d "$VULKAN_SHADER_SRC" ]]; then
     cp -R "$VULKAN_SHADER_SRC" "$STAGE_APP/Contents/Resources/vulkan-shaders"

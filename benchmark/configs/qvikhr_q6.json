@@ -1,0 +1,11 @@
+{
+  "name": "qvikhr_q6",
+  "model": "benchmark/models/QVikhr-3-4B-Instruction-Q6_K.gguf",
+  "port": 8412,
+  "ctx": 4096,
+  "gpu_layers": 999,
+  "thinking_off": true,
+  "prompt": "correction.txt",
+  "max_tokens": {"correction": 512, "rewrite": 1024, "stress": 2048},
+  "extra_args": []
+}

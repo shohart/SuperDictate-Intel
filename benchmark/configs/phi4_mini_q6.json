@@ -1,0 +1,11 @@
+{
+  "name": "phi4_mini_q6",
+  "model": "benchmark/models/Phi-4-mini-instruct-Q6_K.gguf",
+  "port": 8420,
+  "ctx": 4096,
+  "gpu_layers": 999,
+  "thinking_off": false,
+  "prompt": "correction.txt",
+  "max_tokens": {"correction": 512, "rewrite": 1024, "stress": 2048},
+  "extra_args": []
+}

@@ -7,3 +7,9 @@ dist/
 .worktrees/
 .superpowers/sdd/
 icon/build/
+
+# Benchmark runtime and model files
+benchmark/runtime/
+benchmark/models/
+benchmark/results/raw/
+benchmark/logs/

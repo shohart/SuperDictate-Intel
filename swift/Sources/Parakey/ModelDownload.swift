@@ -817,8 +817,119 @@ func parakeetModelPath() -> URL {
     parakeetModelCacheDirectory().appendingPathComponent(PARAKEET_MODEL_FILENAME, isDirectory: false)
 }
 
-func speechModelCacheDirectory(for _: SpeechModelProfile) -> URL {
-    parakeetModelPath()
+/// Directory holding the whisper.cpp GGUF model cache.
+func whisperCppModelCacheDirectory() -> URL {
+    parakeetModelCacheDirectory()
+        .appendingPathComponent("whisper-cpp", isDirectory: true)
+}
+
+/// The single whisper.cpp GGUF file Parakey downloads and loads. Shared by
+/// both Whisper profiles — they differ only in the language forced at
+/// runtime ("ru" vs "auto"), not in weights.
+func whisperGGUFModelPath() -> URL {
+    whisperCppModelCacheDirectory()
+        .appendingPathComponent(WHISPER_GGUF_FILENAME, isDirectory: false)
+}
+
+func speechModelCacheDirectory(for profile: SpeechModelProfile) -> URL {
+    switch profile {
+    case .parakeetTDTv3:
+        return parakeetModelPath()
+    case .whisperRussian, .whisperRussianCodeSwitch:
+        return whisperCppModelCacheDirectory()
+    }
+}
+
+// MARK: - whisper.cpp model download + checksum verification
+//
+// Same download/verify/atomic-rename shape as the Parakeet single-file
+// flow above. Pin rationale (2026-08-27): whisper.cpp's OWN official model
+// distribution (ggerganov/whisper.cpp) — the native ggml quantization of
+// openai/whisper-large-v3-turbo, guaranteed loadable by this repo's
+// vendored whisper.cpp pin. (A third-party "GGUF" repo was tried first and
+// rejected on real hardware: transcribe.cpp-fork files fail whisper.cpp's
+// loader with "bad magic".) SHA-256 is the git-LFS content oid from the
+// pinned revision, i.e. computed from the actual file bytes.
+
+let WHISPER_GGUF_REPOSITORY = "ggerganov/whisper.cpp"
+let WHISPER_GGUF_REVISION = "5359861c739e955e79d9a303bcbc70fb988958b1"
+let WHISPER_GGUF_FILENAME = "ggml-large-v3-turbo-q8_0.bin"
+private let WHISPER_GGUF_URL = URL(
+    string: "https://huggingface.co/\(WHISPER_GGUF_REPOSITORY)/resolve/\(WHISPER_GGUF_REVISION)/\(WHISPER_GGUF_FILENAME)"
+)!
+let WHISPER_GGUF_SHA256 = "317eb69c11673c9de1e1f0d459b253999804ec71ac4c23c17ecf5fbe24e259a1"
+let WHISPER_GGUF_SIZE_BYTES: Int64 = 874_188_075
+
+enum WhisperGGUFDownloadError: LocalizedError {
+    case checksumMismatch(expected: String, actual: String)
+    case sizeMismatch(expected: Int64, actual: Int64)
+    case httpError(statusCode: Int)
+
+    var errorDescription: String? {
+        switch self {
+        case .checksumMismatch(let expected, let actual):
+            return "Downloaded Whisper GGUF checksum mismatch: expected \(expected), got \(actual)"
+        case .sizeMismatch(let expected, let actual):
+            return "Downloaded Whisper GGUF size mismatch: expected \(expected) bytes, got \(actual) bytes"
+        case .httpError(let statusCode):
+            return "Whisper GGUF download failed with HTTP \(statusCode)"
+        }
+    }
+}
+
+@discardableResult
+func downloadWhisperGGUFModelIfNeeded() async throws -> URL {
+    let destination = whisperGGUFModelPath()
+    if isPlainRegularFile(destination.path) {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: destination.path)
+        let actualSize = (attributes?[.size] as? Int64) ?? -1
+        if actualSize == WHISPER_GGUF_SIZE_BYTES,
+           (try? sha256Hex(ofFileAt: destination)) == WHISPER_GGUF_SHA256 {
+            return destination
+        }
+        log("ASR: cached Whisper GGUF failed size/checksum verification; redownloading")
+        try? FileManager.default.removeItem(at: destination)
+    }
+
+    try assertSufficientDiskSpaceForSpeechModelDownload(profile: .whisperRussian)
+
+    let destinationDirectory = whisperCppModelCacheDirectory()
+    try FileManager.default.createDirectory(at: destinationDirectory,
+                                            withIntermediateDirectories: true)
+
+    // Same-volume temp + verified atomic rename, exactly as the Parakeet
+    // download above (spec §4.2 items 5-8).
+    let (systemTempURL, response) = try await URLSession.shared.download(from: WHISPER_GGUF_URL)
+    guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+        try? FileManager.default.removeItem(at: systemTempURL)
+        let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+        throw WhisperGGUFDownloadError.httpError(statusCode: code)
+    }
+
+    let sameVolumeTempURL = destinationDirectory.appendingPathComponent(
+        ".\(WHISPER_GGUF_FILENAME).download-\(UUID().uuidString)", isDirectory: false
+    )
+    try FileManager.default.moveItem(at: systemTempURL, to: sameVolumeTempURL)
+
+    func cleanupTemp() {
+        try? FileManager.default.removeItem(at: sameVolumeTempURL)
+    }
+
+    let attributes = try? FileManager.default.attributesOfItem(atPath: sameVolumeTempURL.path)
+    let actualSize = (attributes?[.size] as? Int64) ?? -1
+    guard actualSize == WHISPER_GGUF_SIZE_BYTES else {
+        cleanupTemp()
+        throw WhisperGGUFDownloadError.sizeMismatch(expected: WHISPER_GGUF_SIZE_BYTES, actual: actualSize)
+    }
+
+    let actualHash = try sha256Hex(ofFileAt: sameVolumeTempURL)
+    guard actualHash == WHISPER_GGUF_SHA256 else {
+        cleanupTemp()
+        throw WhisperGGUFDownloadError.checksumMismatch(expected: WHISPER_GGUF_SHA256, actual: actualHash)
+    }
+
+    _ = try FileManager.default.replaceItemAt(destination, withItemAt: sameVolumeTempURL)
+    return destination
 }
 
 /// Legacy Whisper model cache file this migration leaves behind (spec §4.4).
@@ -878,7 +989,14 @@ func availableImportantDiskSpaceBytes(containing url: URL) -> Int64? {
 }
 
 func speechModelCacheExists(for profile: SpeechModelProfile) -> Bool {
-    FileManager.default.fileExists(atPath: speechModelCacheDirectory(for: profile).path)
+    switch profile {
+    case .parakeetTDTv3:
+        return FileManager.default.fileExists(atPath: speechModelCacheDirectory(for: profile).path)
+    case .whisperRussian, .whisperRussianCodeSwitch:
+        // The whisper.cpp cache is only ready when the GGUF file itself is
+        // present (the directory may survive a failed/interrupted download).
+        return isPlainRegularFile(whisperGGUFModelPath().path)
+    }
 }
 
 func assertSufficientDiskSpaceForSpeechModelDownload(profile: SpeechModelProfile) throws {
@@ -1197,4 +1315,3 @@ func mergedTranscriptCorrectionsForSync(base: [TranscriptCorrection],
     return TranscriptCorrectionSyncMergeResult(corrections: merged,
                                                conflictingSources: conflicts)
 }
-

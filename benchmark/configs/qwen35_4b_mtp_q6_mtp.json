@@ -1,0 +1,11 @@
+{
+  "name": "qwen35_4b_mtp_q6_mtp",
+  "model": "benchmark/models/Qwen3.5-4B-MTP-Q6_K.gguf",
+  "port": 8415,
+  "ctx": 4096,
+  "gpu_layers": 999,
+  "thinking_off": true,
+  "prompt": "correction.txt",
+  "max_tokens": {"correction": 512, "rewrite": 1024, "stress": 2048},
+  "extra_args": ["--spec-type", "draft-mtp"]
+}

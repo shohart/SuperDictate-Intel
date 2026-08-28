@@ -1,0 +1,11 @@
+{
+  "name": "yandexgpt_q4",
+  "model": "benchmark/models/YandexGPT-5-Lite-8B-instruct-Q4_K_M.gguf",
+  "port": 8416,
+  "ctx": 4096,
+  "gpu_layers": 999,
+  "thinking_off": false,
+  "prompt": "correction.txt",
+  "max_tokens": {"correction": 512, "rewrite": 1024, "stress": 2048},
+  "extra_args": []
+}
